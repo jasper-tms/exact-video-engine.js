@@ -595,6 +595,12 @@ class VideoEngine extends EventTarget {
     ctx.restore();
   }
 
+  // Release the decoder and all cached bitmaps. Call when done with the
+  // engine (e.g. closing the dialog that hosts it) — decoders are a limited
+  // browser resource, so discarded engines must not wait for garbage
+  // collection. The engine remains usable: load() creates a fresh decoder.
+  destroy() { this._teardown(); }
+
   _teardown() {
     this.ready = false;
     this.playing = false;
