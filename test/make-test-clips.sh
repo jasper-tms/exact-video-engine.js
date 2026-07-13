@@ -67,5 +67,16 @@ ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
 ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 -ss 0.2 \
     -c copy clips/counter-elst.mp4
 
+# A clip with a real mdat, for the startup-cost test: how many bytes must arrive
+# before the engine can show a frame? That question is meaningless against the
+# clips above -- they are a few KB, so any block size fetches the whole file and
+# a fat blocking read looks free. Random noise defeats the encoder (nothing to
+# predict), so 10 s of 720p lands in the tens of MB; -g 30 gives a keyframe per
+# second, so decoding a frame costs at most one second of video, not the file.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "nullsrc=s=640x360:d=8:r=30,geq=random(1)*255:128:128" \
+    -pix_fmt yuv420p -c:v libx264 -preset ultrafast -qp 26 -g 30 \
+    -movflags +faststart clips/startup.mp4
+
 echo "Wrote test clips:"
 ls clips

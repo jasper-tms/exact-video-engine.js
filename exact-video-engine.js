@@ -784,7 +784,13 @@ class ContainerIndex {
 // VideoEngine — WebCodecs. Authoritative: we decide which frame is on screen.
 // ==================================================================
 class VideoEngine extends EventTarget {
-  constructor(presentationCanvas) {
+  // options.windowAhead: how many frames to decode ahead of the playhead. The
+  // default (56, ≈2 s) is sized for playback, where read-ahead is what absorbs
+  // decode jitter. A host that mostly holds still — a frame-by-frame annotation
+  // tool, a thumbnail picker — is buying bandwidth and decode work it will not
+  // use, and can turn this down. It does not affect which frames are available,
+  // only how eagerly they are fetched: the frame you ask for is always decoded.
+  constructor(presentationCanvas, options = {}) {
     super();
     this.canvas = presentationCanvas;
     this.context = presentationCanvas.getContext('2d');
@@ -823,9 +829,11 @@ class VideoEngine extends EventTarget {
     // around the playhead. Decoding streams forward from a keyframe and only
     // restarts (reset + reconfigure + decode forward) on a backward seek.
     this._cache = new Map();          // displayIndex -> ImageBitmap
-    this._cacheBudget = 80;           // max resident decoded frames
     this._windowBack = 18;            // keep this many frames behind the playhead
-    this._windowAhead = 56;           // read-ahead target (≈2 s) to absorb decode jitter
+    this._windowAhead = Math.max(0, options.windowAhead ?? 56);   // read-ahead target (≈2 s)
+    // Resident decoded frames. Must cover the window on both sides, or the
+    // eviction pass would throw away frames the read-ahead just paid to decode.
+    this._cacheBudget = Math.max(80, this._windowBack + this._windowAhead + 8);
     // Cached bitmaps are for display only (frame-index accuracy is independent
     // of their resolution), so cap their long side: a 4K clip otherwise costs
     // ~33 MB/frame and the cache would blow past 1 GB. The canvas pane is never
@@ -965,14 +973,36 @@ class VideoEngine extends EventTarget {
     return ans;
   }
 
+  // The frames worth keeping sit around the playhead AND around whatever frame
+  // the decode driver is currently steering toward. Those are usually the same
+  // number: a seek moves the playhead and the target together, and playback
+  // walks both forward. They come apart when a host asks for a frame WITHOUT
+  // moving the playhead — ensureFrame(n) on its own, which is how a thumbnail or
+  // an annotation tool grabs a frame's pixels.
+  //
+  // Windowing on the playhead alone made that case impossible: the driver dutifully
+  // decoded toward the target, and every frame it produced arrived here, landed
+  // outside the playhead's window, and was dropped on the floor. ensureFrame then
+  // waited for a frame that was being decoded and discarded over and over, until
+  // it timed out. The bug needed a clip longer than the window (~64 frames) to show
+  // itself at all, so short test clips sailed straight past it.
+  _windowCenters() {
+    const current = this.currentFrame;
+    return (this._target === current) ? [current] : [current, this._target];
+  }
+
+  _insideWindow(displayIndex) {
+    return this._windowCenters().some((center) =>
+      displayIndex >= center - this._windowBack
+      && displayIndex <= center + this._windowAhead + 8);
+  }
+
   // A decoded frame arrived. Cache it (as an ImageBitmap, freeing the decoder's
-  // bounded frame pool) if it falls inside the playhead window; otherwise drop.
+  // bounded frame pool) if it falls inside a window we care about; otherwise drop.
   _absorb(frame) {
     const displayIndex = this._microsToDisplay.get(frame.timestamp);
-    const current = this.currentFrame;
     if (displayIndex === undefined
-        || displayIndex < current - this._windowBack
-        || displayIndex > current + this._windowAhead + 8
+        || !this._insideWindow(displayIndex)
         || this._cache.has(displayIndex)) {
       frame.close();
       return;
@@ -999,12 +1029,19 @@ class VideoEngine extends EventTarget {
 
   _evict() {
     if (this._cache.size <= this._cacheBudget) return;
-    const current = this.currentFrame;
     // Forward-biased: drop frames BEHIND the playhead first (forward playback
     // won't revisit them), farthest-behind first; only then frames far AHEAD.
     // This protects the read-ahead window we just paid to decode — a symmetric
     // distance metric would instead evict the about-to-be-shown read-ahead.
-    const rank = (k) => (k < current) ? 2e6 + (current - k) : (k - current);
+    //
+    // Ranked against the nearest window centre, for the same reason _absorb is:
+    // when a host has asked for a frame away from the playhead, that frame and
+    // its neighbours are the ones being decoded right now, and evicting them by
+    // distance-from-playhead would throw out the very thing we are waiting for.
+    const centers = this._windowCenters();
+    const distance = (k, center) =>
+      (k < center) ? 2e6 + (center - k) : (k - center);
+    const rank = (k) => Math.min(...centers.map((center) => distance(k, center)));
     const keys = [...this._cache.keys()].sort((a, b) => rank(b) - rank(a));
     while (this._cache.size > this._cacheBudget) {
       const key = keys.shift();
@@ -1048,7 +1085,14 @@ class VideoEngine extends EventTarget {
           if (this._videoDecoder.decodeQueueSize > 4) { await this._sleep(0); continue; }
           const k = this._fedThrough + 1;
           const s = this._samples[k];
-          await this._ensureBytes(s.offset, s.size);
+          // Until the target is on screen, every byte we fetch beyond the ones
+          // it depends on is a byte the viewer waits on for nothing. So read
+          // only as far as the target's own sample while it is outstanding, and
+          // switch to big background blocks once it has surfaced. On a slow link
+          // this is the difference between waiting for one keyframe and waiting
+          // for a fixed 4 MB block.
+          await this._ensureBytes(s.offset, s.size,
+            this._cache.has(target) ? 0 : this._bytesThrough(k, targetDecode));
           if (!this._videoDecoder || this._fedThrough !== k - 1) continue;  // restarted mid-read
           this._videoDecoder.decode(new EncodedVideoChunk({
             type: s.isSync ? 'key' : 'delta',
@@ -1098,14 +1142,39 @@ class VideoEngine extends EventTarget {
     this._fedThrough = keyframe - 1;
   }
 
+  // Encoded bytes from sample `from` through sample `through`, inclusive — what
+  // it costs to decode `through`, given a decode run that starts at `from`.
+  // Samples are contiguous in decode order, so this is just the span between
+  // them; it is what the urgent read below asks for.
+  _bytesThrough(from, through) {
+    const first = this._samples[from];
+    const last = this._samples[Math.max(from, through)];
+    return (last.offset + last.size) - first.offset;
+  }
+
   // Ensure the encoded bytes for [offset, offset+size) are in the read-ahead
   // buffer, fetching a larger block (covering many subsequent samples) on a miss.
-  async _ensureBytes(offset, size) {
+  //
+  // `wanted` is how far ahead this particular read is worth taking: pass 0 (the
+  // default) for background read-ahead, which takes a big block because the
+  // viewer is not waiting on it and one fat request beats twenty thin ones; pass
+  // a byte count while a frame is outstanding, and the block shrinks to just the
+  // samples that frame depends on. A fixed block here used to make the first
+  // frame of a clip wait on 4 MB when a single keyframe would have done.
+  //
+  // It is still a floor-and-ceiling, not an exact read: never less than this
+  // sample (or the slice below would run off the end of the buffer), never more
+  // than MAX_BLOCK, and never so small that a GOP costs one request per frame.
+  async _ensureBytes(offset, size, wanted = 0) {
     const buffer = this._byteBuffer;
     if (buffer && offset >= this._byteBufferStart
         && offset + size <= this._byteBufferStart + buffer.length) return;
-    const READ_AHEAD = 1 << 22;   // 4 MB
-    const end = Math.min(this._reader.size, offset + READ_AHEAD) - 1;
+    const MAX_BLOCK = 1 << 22;   // 4 MB
+    const MIN_BLOCK = 1 << 18;   // 256 KB — a round trip costs more than these bytes
+    const block = wanted > 0
+      ? Math.min(MAX_BLOCK, Math.max(size, Math.min(wanted, MAX_BLOCK), MIN_BLOCK))
+      : MAX_BLOCK;
+    const end = Math.min(this._reader.size, offset + block) - 1;
     this._byteBuffer = new Uint8Array(await this._reader.read(offset, end));
     this._byteBufferStart = offset;
   }
@@ -1737,6 +1806,9 @@ async function createBestEngine(source, options = {}) {
     // still falls back if WebCodecs cannot play the clip — there is no point
     // refusing to show a video the browser can play perfectly well.
     prefer = 'auto',
+    // Passed through to VideoEngine; ignored by the <video> element, which does
+    // its own buffering. See the VideoEngine constructor.
+    windowAhead,
     declaredFrameRate = 0,
     declaredNumFrames = 0,
     // How long the WebM index is allowed to take. Building it means reading the
@@ -1773,7 +1845,7 @@ async function createBestEngine(source, options = {}) {
 
   if (prefer !== 'native' && canvas && index && index.supportsWebCodecs
       && typeof VideoDecoder !== 'undefined') {
-    const engine = new VideoEngine(canvas);
+    const engine = new VideoEngine(canvas, { windowAhead });
     try {
       await engine.load(source, { index });
       return engine;

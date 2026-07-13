@@ -1,0 +1,115 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine startup-cost test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<style>#pane { width: 640px; height: 360px; }
+  #pane canvas { width: 100%; height: 100%; display: block; }</style>
+<div id="pane"><canvas></canvas></div>
+<script>
+// How many bytes must arrive before the engine can show a frame?
+//
+// Nothing else in the suite can see this. Every other test asserts on frame
+// numbers or pixels, all of which were perfectly correct while the engine was
+// blocking the first frame on a fixed 4 MB read: to decode frame 0 it needs one
+// keyframe, but _ensureBytes fetched a flat 4 MB block regardless. On a fast
+// link that is invisible. On a phone it was seconds of staring at nothing, and
+// it scaled with the clip's BITRATE, so the bigger the customer's video the
+// worse it got.
+//
+// Hence a test that counts bytes. It only means anything against a clip with a
+// real mdat (clips/startup.mp4, tens of MB of noise): against the few-KB clips
+// the rest of the suite uses, any block size fetches the whole file and a fat
+// blocking read looks free.
+//
+//   mode=first-frame   cost of showing frame 0 (the editor opening a clip)
+//   mode=keyframe-seek cost of jumping to a keyframe deep in the file. Must also
+//                      be cheap: a seek reads from the keyframe, so where the
+//                      keyframe sits in the file is irrelevant.
+//   mode=window-ahead  windowAhead: 0 vs the default. Proves the knob does
+//                      something -- a host that only ever holds still should be
+//                      able to stop paying for 2 s of read-ahead.
+const KEYFRAME_INTERVAL = 30;   // -g 30 in make-test-clips.sh
+
+// Every byte the engine reads goes through fetch(), so wrapping it counts them.
+let bytesFetched = 0;
+const originalFetch = window.fetch;
+window.fetch = async (...args) => {
+  const response = await originalFetch(...args);
+  const clone = response.clone();
+  const buffer = await clone.arrayBuffer();
+  bytesFetched += buffer.byteLength;
+  return response;
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const mode = params.get('mode');
+  const canvas = document.querySelector('canvas');
+  const url = 'clips/' + params.get('file');
+
+  // The index is a fixed cost every mode pays; measuring it separately keeps the
+  // budgets below about the FRAME, not about the moov.
+  const index = await ContainerIndex.fromSource(url);
+  const bytesForIndex = bytesFetched;
+
+  const result = { fileBytes: 0, bytesForIndex, indexedFrames: index.numFrames };
+
+  // How big is the clip? A budget test against a small file proves nothing, so
+  // the runner asserts this is genuinely larger than one block.
+  const head = await fetch(url, { headers: { Range: 'bytes=0-0' } });
+  const contentRange = head.headers.get('Content-Range');
+  result.fileBytes = contentRange ? parseInt(contentRange.split('/')[1], 10) : 0;
+
+  if (mode === 'window-ahead') {
+    // Same clip, same frame, two read-ahead settings. Let each engine idle after
+    // the frame lands so its background fill (if any) can run.
+    const costs = {};
+    for (const windowAhead of [0, 56]) {
+      bytesFetched = 0;
+      const engine = new VideoEngine(canvas, { windowAhead });
+      await engine.load(url, { index });
+      await engine.ensureFrame(0);
+      await sleep(1500);            // let read-ahead do whatever it is going to do
+      costs[windowAhead] = bytesFetched;
+      engine.destroy();
+    }
+    result.bytesIdleWindow0 = costs[0];
+    result.bytesIdleWindow56 = costs[56];
+    window.__result = result;
+    return;
+  }
+
+  const engine = new VideoEngine(canvas);
+
+  // load() paints frame 0, so the cost of the first frame is incurred INSIDE it.
+  // Counting from after load() would measure zero and pass against anything --
+  // which is exactly what it did the first time around.
+  bytesFetched = 0;
+  const startedAt = performance.now();
+  await engine.load(url, { index });
+
+  if (mode === 'first-frame') {
+    result.frame = 0;
+    result.bytesForFrame = bytesFetched;
+    result.secondsForFrame = (performance.now() - startedAt) / 1000;
+  } else {
+    // A keyframe well into the file: decoding it depends on nothing before it,
+    // so its cost must not scale with how far into the file it sits. Counted
+    // from a clean slate, since load() has already paid for frame 0.
+    const frame = Math.floor(engine.numFrames / KEYFRAME_INTERVAL / 2) * KEYFRAME_INTERVAL;
+    bytesFetched = 0;
+    const seekedAt = performance.now();
+    await engine.ensureFrame(frame);
+    result.frame = frame;
+    result.bytesForFrame = bytesFetched;
+    result.secondsForFrame = (performance.now() - seekedAt) / 1000;
+  }
+  result.decoded = Boolean(engine.bitmapForFrame(result.frame));
+  engine.destroy();
+  window.__result = result;
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>
