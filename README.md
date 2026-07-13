@@ -236,9 +236,9 @@ release: a [workflow](.github/workflows/release.yml) tags that commit `vX.Y.Z`
 and cuts a GitHub release from it.
 
 The pinned jsDelivr URLs in `demo.html` and this README's usage snippet are
-*derived* from `VERSION` by `sync_version.sh`, which `.githooks/pre-commit` runs
-for you, so they land in the same commit that changes `VERSION`. A release is
-then:
+*derived* from `VERSION` by `.githooks/sync_version.sh`, which
+`.githooks/pre-commit` runs for you, so they land in the same commit that
+changes `VERSION`. A release is then:
 
 ```sh
 echo 1.3.0 > VERSION
@@ -270,11 +270,11 @@ shadowing whatever global hooks you already have, silently and everywhere in
 this repo.
 
 If the hook never runs, nothing breaks — it only gets noisier. The release
-workflow re-derives the pins with `./sync_version.sh --check` and refuses to tag
-a commit that disagrees with `VERSION`, so the failure mode is a red CI run
-rather than a published tag whose demo page loads the previous release. (Tags
-are immutable and jsDelivr caches them forever, which is why that check exists
-at all.) To recover: run `./sync_version.sh`, commit, push.
+workflow re-derives the pins with `.githooks/sync_version.sh --check` and
+refuses to tag a commit that disagrees with `VERSION`, so the failure mode is a
+red CI run rather than a published tag whose demo page loads the previous
+release. (Tags are immutable and jsDelivr caches them forever, which is why that
+check exists at all.) To recover: run `.githooks/sync_version.sh`, commit, push.
 
 ## Tests
 

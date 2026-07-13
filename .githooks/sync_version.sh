@@ -7,23 +7,26 @@
 # usage snippet -- is derived from it here, and the pre-commit hook runs this so
 # the derivation cannot drift.
 #
-# Usage:
-#   ./sync_version.sh          rewrite the pins in place to match VERSION
-#   ./sync_version.sh --check  exit 1 if any pin disagrees with VERSION
+# Usage, from anywhere in the tree:
+#   .githooks/sync_version.sh          rewrite the pins in place to match VERSION
+#   .githooks/sync_version.sh --check  exit 1 if any pin disagrees with VERSION
 #
-# --check is what the release workflow runs before it tags. Tags are immutable
-# and jsDelivr caches them forever, so a tag placed on a commit whose demo page
-# still loads the PREVIOUS release is exactly the kind of thing nobody notices
-# until a consumer does. CI refuses to cut one.
+# Mostly it is not run by hand: the pre-commit hook next to it runs it so the
+# derivation cannot drift, and --check is what the release workflow runs before
+# it tags. Tags are immutable and jsDelivr caches them forever, so a tag placed
+# on a commit whose demo page still loads the PREVIOUS release is exactly the
+# kind of thing nobody notices until a consumer does. CI refuses to cut one.
 set -euo pipefail
-cd "$(dirname "$0")"
+
+# The files this rewrites live at the top of the tree, not next to this script.
+cd "$(dirname "$0")/.."
 
 CHECK=false
 case "${1:-}" in
     --check) CHECK=true ;;
-    -h|--help) sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     '') ;;
-    *) echo "usage: ./sync_version.sh [--check]" >&2; exit 1 ;;
+    *) echo "usage: .githooks/sync_version.sh [--check]" >&2; exit 1 ;;
 esac
 
 VERSION=$(tr -d '[:space:]' < VERSION)
@@ -65,6 +68,6 @@ done
 
 if [ "$CHECK" = true ] && [ "$stale_files" -gt 0 ]; then
     echo >&2
-    echo "Run ./sync_version.sh to bring them in line with VERSION, and commit the result." >&2
+    echo "Run .githooks/sync_version.sh to bring them in line with VERSION, and commit the result." >&2
     exit 1
 fi

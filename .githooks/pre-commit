@@ -33,7 +33,7 @@ fi
 # nothing to stage -- so get out before the guard below, which would otherwise
 # refuse a perfectly good commit (one that merely touches VERSION, e.g. adding
 # it) just because some unrelated work is in flight in demo.html or the README.
-if ./sync_version.sh --check >/dev/null 2>&1; then
+if .githooks/sync_version.sh --check >/dev/null 2>&1; then
     exit 0
 fi
 
@@ -49,7 +49,7 @@ for file in "${PINNED_FILES[@]}"; do
     fi
 done
 
-./sync_version.sh
+.githooks/sync_version.sh
 
 synced=()
 for file in "${PINNED_FILES[@]}"; do

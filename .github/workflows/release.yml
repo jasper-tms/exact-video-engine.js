@@ -29,7 +29,7 @@ jobs:
       # permanently -- so catch the commit where the hook did not run, before the
       # tag exists rather than after.
       - name: Check pinned CDN URLs match VERSION
-        run: ./sync_version.sh --check
+        run: .githooks/sync_version.sh --check
 
       - name: Create tag and GitHub Release
         uses: softprops/action-gh-release@v3
