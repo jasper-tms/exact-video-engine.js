@@ -147,6 +147,13 @@
   }
   button.badge:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
   button.badge::after { content: " ⇄"; opacity: 0.6; }
+  /* Nothing to toggle to when mp4box could not read the container: WebCodecs has
+     no demuxer to feed it, so native is the only engine. Drop the swap arrow
+     rather than advertise an action that does not exist — and keep the pill at
+     full opacity (unlike the generic disabled button) since it is still saying
+     something true and worth reading. */
+  button.badge:disabled { opacity: 1; cursor: default; }
+  button.badge:disabled::after { content: none; }
 
   /* Names the clip directly above the frame it labels. */
   #clip-header {
@@ -202,9 +209,12 @@
       <button id="play">Play</button>
       <button id="previous" title="Previous frame">&#9664;</button>
       <button id="next" title="Next frame">&#9654;</button>
-      <input id="scrubber" type="range" min="0" max="0" step="1" value="0">
       <span class="readout">
         frame <strong id="frame-readout">0</strong> / <span id="total-readout">0</span>
+      </span>
+      <input id="scrubber" type="range" min="0" max="0" step="1" value="0">
+      <span class="readout">
+        <strong id="time-readout">0:00.000</strong> / <span id="duration-readout">0:00.000</span>
       </span>
     </div>
 
@@ -228,6 +238,8 @@ const playButton = document.getElementById('play');
 const scrubber = document.getElementById('scrubber');
 const frameReadout = document.getElementById('frame-readout');
 const totalReadout = document.getElementById('total-readout');
+const timeReadout = document.getElementById('time-readout');
+const durationReadout = document.getElementById('duration-readout');
 
 let engine = null;
 let scrubbing = false;
@@ -239,6 +251,19 @@ let scrubbing = false;
 // only a preference: a clip WebCodecs cannot play still falls back.
 let prefer = new URLSearchParams(location.search).get('engine') || 'auto';
 let currentFile = null;
+// The index for the clip in the player, or null if mp4box could not read its
+// container. Kept because it decides whether the WebCodecs engine is reachable
+// at all — see showEngineBadge().
+let currentIndex = null;
+
+// Milliseconds, not the usual m:ss — a frame at 30 fps is 33 ms, so anything
+// coarser would sit unchanged while the frame counter next to it advances.
+function formatTime(seconds) {
+  if (!(seconds >= 0)) seconds = 0;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds - minutes * 60;
+  return `${minutes}:${rest.toFixed(3).padStart(6, '0')}`;
+}
 
 function setStatus(message, isError) {
   status.textContent = message || '';
@@ -263,6 +288,7 @@ async function load(file) {
   } catch (indexError) {
     containerIndex = null;
   }
+  currentIndex = containerIndex;
   showFormatBadge(file, containerIndex);
 
   try {
@@ -295,7 +321,12 @@ async function load(file) {
 
   scrubber.max = Math.max(0, engine.numFrames - 1);
   scrubber.value = 0;
-  totalReadout.textContent = engine.numFrames;
+  // The LAST INDEX, not the frame count. Frame indices are 0-based everywhere in
+  // this library, so a 30-frame clip ends at frame 29 — and printing "29 / 30"
+  // invites you to go looking for a frame 30 that does not exist.
+  totalReadout.textContent = Math.max(0, engine.numFrames - 1);
+  totalReadout.title = `${engine.numFrames} frames, numbered 0 to ${engine.numFrames - 1}`;
+  durationReadout.textContent = formatTime(engine.duration);
 
   showEngineBadge();
 
@@ -315,8 +346,17 @@ function showFormatBadge(file, containerIndex) {
   const dot = file.name.lastIndexOf('.');
   const extension = dot === -1 ? '?' : file.name.slice(dot).toLowerCase();
   const badge = document.getElementById('format-badge');
+  // Spelling out the consequence, not just the verdict: "mp4box failed" means
+  // nothing to a reader who does not already know that the container is where
+  // the per-frame timestamp table comes from. Note what is NOT lost in the
+  // failing case — the presented frame's timestamp is still exact, because
+  // requestVideoFrameCallback reports it; what is missing is the table needed to
+  // turn that timestamp into a frame index.
   badge.textContent = `Format ${extension} → mp4box `
-    + (containerIndex ? 'succeeded' : 'failed');
+    + (containerIndex
+      ? 'succeeded → frame indices and times are exact'
+      : 'failed → frame indices only correct for constant frame rate videos, '
+        + 'but times are exact');
   badge.className = 'badge ' + (containerIndex ? 'exact' : 'approximate');
   badge.title = containerIndex
     ? 'The container yielded a real per-frame timestamp table, so frame indices '
@@ -331,7 +371,17 @@ function showEngineBadge() {
   const badge = document.getElementById('engine-badge');
   const isNative = engine.tier.startsWith('native');
   badge.textContent = `Engine: ${isNative ? 'native' : 'webcodecs'}`;
-  badge.title = engine.tier + ' — click to play this clip through the other engine';
+
+  // With no container index there is no other engine to toggle to. WebCodecs is
+  // a decoder, not a demuxer: without mp4box nothing can turn this container
+  // into the encoded chunks it wants, so the native element is the only engine
+  // that can play the clip at all. Leaving the pill live would offer a switch
+  // that silently lands back where it started.
+  badge.disabled = !currentIndex;
+  badge.title = badge.disabled
+    ? engine.tier + ' — mp4box cannot read this container, and WebCodecs needs a '
+      + 'demuxer to feed it, so the native element is the only engine available'
+    : engine.tier + ' — click to play this clip through the other engine';
 }
 
 // The engine pill is a toggle: flip the preference and reload the same clip.
@@ -350,6 +400,7 @@ function tick(now) {
     engine.update(now);
     const frame = engine.currentFrame;
     frameReadout.textContent = frame;
+    timeReadout.textContent = formatTime(engine.currentTime);
     if (!scrubbing) scrubber.value = frame;
     playButton.textContent = engine.paused ? 'Play' : 'Pause';
   }
