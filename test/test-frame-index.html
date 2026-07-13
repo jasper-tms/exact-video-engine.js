@@ -1,0 +1,121 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine frame-index test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<!-- Sized to the clips' exact aspect (160x90) so nothing is letterboxed and the
+     bar's position in the rendering maps straight back to its position in the
+     source frame. -->
+<div id="pane" style="width: 160px; height: 90px">
+  <canvas id="engine-canvas"></canvas>
+</div>
+<video id="native-video" muted playsinline></video>
+<script>
+// Walks ?file=<clip> frame by frame through the engine named by ?mode=, and for
+// each frame records BOTH what the engine says is on screen and what is
+// actually on screen. The clips identify each frame by the position of a white
+// bar (frame n -> bar at x = 5n of 160), so "what is actually on screen" is
+// recoverable from the pixels with no trust in any clock.
+//
+//   mode=webcodecs        WebCodecs engine (decodes every frame itself)
+//   mode=native-index     <video> element + the container's real PTS table
+//   mode=native-declared  <video> element + an assumed constant frame rate,
+//                         i.e. what the fallback could do before it was given
+//                         the index. Expected to mismap the VFR clip; that
+//                         mismapping is what the index exists to fix.
+// Only used by mode=native-declared, which by definition has no container to
+// learn the clip's length or rate from and must be told (the clips it runs
+// against are 30 frames at a nominal 30 fps).
+const DECLARED_FRAME_RATE = 30;
+const DECLARED_NUM_FRAMES = 30;
+const BARS_ACROSS = 32;   // 160 px / 5 px per bar
+
+// The frame the pixels say is showing: find the bar (columns brighter than
+// half), take its centre, and convert that to a bar index. Reading the centre
+// rather than the brightest single column keeps a resampled or antialiased edge
+// from shifting the answer by one.
+function visibleFrame(canvas) {
+  const width = canvas.width, height = canvas.height;
+  const row = canvas.getContext('2d')
+    .getImageData(0, Math.floor(height / 2), width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < width; x++) {
+    if (row[x * 4] > 128) { sum += x; count += 1; }
+  }
+  if (!count) return -1;   // no bar found: nothing painted
+  return Math.floor((sum / count) / (width / BARS_ACROSS));
+}
+
+const probe = document.createElement('canvas');
+probe.width = 160;
+probe.height = 90;
+const probeContext = probe.getContext('2d');
+
+function nextPresentedFrame(video) {
+  if (!('requestVideoFrameCallback' in video)) {
+    return new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return new Promise((resolve) => video.requestVideoFrameCallback(() => resolve()));
+}
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const file = 'clips/' + params.get('file');
+  const mode = params.get('mode');
+  const video = document.getElementById('native-video');
+  const canvas = document.getElementById('engine-canvas');
+
+  // A Blob, so both engines read the same bytes and neither depends on the test
+  // server honouring Range requests.
+  const source = await (await fetch(file)).blob();
+
+  let engine;
+  if (mode === 'native-declared') {
+    // No index on purpose: stand in for a container mp4box cannot parse, where
+    // the host can only tell the engine a frame rate it got from elsewhere.
+    engine = new NativeVideoEngine(video);
+    await engine.load(source, {
+      frameRate: DECLARED_FRAME_RATE, numFrames: DECLARED_NUM_FRAMES,
+    });
+  } else {
+    engine = await createBestEngine(source, {
+      canvas, video,
+      prefer: (mode === 'native-index') ? 'native' : 'webcodecs',
+    });
+  }
+
+  const usingCanvas = engine.displayElement === canvas;
+  const rows = [];
+  for (let n = 0; n < engine.numFrames; n++) {
+    engine.seekToFrame(n);
+
+    if (usingCanvas) {
+      await engine.ensureFrame(n);
+      engine.update(performance.now());   // paints the frame at the playhead
+      probeContext.drawImage(canvas, 0, 0, probe.width, probe.height);
+    } else {
+      // Let the element settle on the seek, then wait for it to actually present
+      // a frame before believing what drawImage gives back.
+      await new Promise((resolve) => { video.onseeked = resolve; });
+      await nextPresentedFrame(video);
+      probeContext.drawImage(video, 0, 0, probe.width, probe.height);
+    }
+
+    rows.push({
+      asked: n,
+      // What the pixels show (ground truth) ...
+      visible: visibleFrame(probe),
+      // ... and what the engine claims is on screen.
+      reported: engine.currentFrame,
+    });
+  }
+
+  window.__result = {
+    tier: engine.tier,
+    frameIndexIsExact: engine.frameIndexIsExact,
+    numFrames: engine.numFrames,
+    rows,
+  };
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>

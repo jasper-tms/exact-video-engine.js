@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [ ! -f test/clips/rot270.mp4 ]; then
+if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ]; then
     bash test/make-test-clips.sh
 fi
 
@@ -14,4 +14,7 @@ SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null' EXIT
 sleep 1
 
-node test/rotation-test.mjs
+status=0
+node test/rotation-test.mjs || status=1
+node test/frame-index-test.mjs || status=1
+exit "$status"
