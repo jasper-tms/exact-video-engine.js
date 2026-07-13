@@ -194,6 +194,53 @@ change.
 Known consumers: [SportViewer](https://github.com/jasper-tms/SportViewer)
 (viewer.movim.ai) and the [movim.ai](https://movim.ai) sessions app.
 
+## Releasing
+
+`VERSION` holds the version and nothing else. Editing it on `main` is the whole
+release: a [workflow](.github/workflows/release.yml) tags that commit `vX.Y.Z`
+and cuts a GitHub release from it.
+
+The pinned jsDelivr URLs in `demo.html` and this README's usage snippet are
+*derived* from `VERSION` by `sync_version.sh`, which `.githooks/pre-commit` runs
+for you, so they land in the same commit that changes `VERSION`. A release is
+then:
+
+```sh
+echo 1.3.0 > VERSION
+git commit -am "Release v1.3.0"   # the hook repoints the pins, in this commit
+git push                          # the workflow tags v1.3.0 and releases it
+```
+
+The hook only wakes up for a commit that touches `VERSION`, and it refuses to
+run if `demo.html` or `README.md` have unstaged changes, rather than quietly
+sweeping them into the release commit.
+
+### Getting the hook to run
+
+Git does not run hooks out of the working tree — they live in `.git/hooks`,
+which is not part of the repository — so `.githooks/pre-commit` needs one of:
+
+- **Nothing at all**, if you use the
+  [shell-configs](https://github.com/jasper-tms/shell-configs) global hook
+  dispatcher: it discovers `.githooks/<hook-name>` in any repo of your own and
+  runs it.
+- Otherwise, once per clone:
+
+  ```sh
+  ln -s ../../.githooks/pre-commit .git/hooks/pre-commit
+  ```
+
+Do **not** point `core.hooksPath` at `.githooks`. It would work, but only by
+shadowing whatever global hooks you already have, silently and everywhere in
+this repo.
+
+If the hook never runs, nothing breaks — it only gets noisier. The release
+workflow re-derives the pins with `./sync_version.sh --check` and refuses to tag
+a commit that disagrees with `VERSION`, so the failure mode is a red CI run
+rather than a published tag whose demo page loads the previous release. (Tags
+are immutable and jsDelivr caches them forever, which is why that check exists
+at all.) To recover: run `./sync_version.sh`, commit, push.
+
 ## Tests
 
 `test/` needs `ffmpeg` on the PATH and Playwright (`npm install playwright`):

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# Keep the pinned CDN URLs in step with VERSION, inside the very commit that
+# changes VERSION, so that the tag the release workflow puts on that commit can
+# never name a version its own demo page does not load. See "Releasing" in the
+# README, including how this gets run at all -- git does not run hooks out of
+# the working tree by itself.
+#
+# Never running breaks nothing: the workflow re-derives the pins and refuses to
+# tag a commit whose demo page still loads the previous release. You just learn
+# it from a red CI run rather than from a commit that quietly did the right
+# thing.
+set -euo pipefail
+
+# Only a change to VERSION can move the pins. Every other commit is none of our
+# business, and the hook must stay invisible for those.
+git diff --cached --name-only | grep -qx VERSION || exit 0
+
+cd "$(git rev-parse --show-toplevel)"
+
+PINNED_FILES=(demo.html README.md)
+
+# sync_version.sh reads VERSION off disk, but `git commit` is free to be
+# committing something other than what is on disk. Rather than derive the pins
+# from a value that is not the one being committed, refuse.
+if ! git diff --quiet -- VERSION; then
+    echo "pre-commit: VERSION differs between the index and the working tree, so the" >&2
+    echo "version to pin to is ambiguous. Stage VERSION (or restore it), then commit." >&2
+    exit 1
+fi
+
+# If the pins already say what VERSION says, there is nothing to rewrite and
+# nothing to stage -- so get out before the guard below, which would otherwise
+# refuse a perfectly good commit (one that merely touches VERSION, e.g. adding
+# it) just because some unrelated work is in flight in demo.html or the README.
+if ./sync_version.sh --check >/dev/null 2>&1; then
+    exit 0
+fi
+
+# From here we are definitely rewriting the pinned files and staging them
+# wholesale. If one is already carrying unstaged edits, staging it would sweep
+# those into the release commit as well, which is the last commit anyone wants a
+# surprise in.
+for file in "${PINNED_FILES[@]}"; do
+    if ! git diff --quiet -- "$file"; then
+        echo "pre-commit: $file has unstaged changes, and syncing its version pin would" >&2
+        echo "stage them along with it. Stage or stash $file, then commit again." >&2
+        exit 1
+    fi
+done
+
+./sync_version.sh
+
+synced=()
+for file in "${PINNED_FILES[@]}"; do
+    git diff --quiet -- "$file" || synced+=("$file")
+done
+if [ "${#synced[@]}" -gt 0 ]; then
+    git add -- "${synced[@]}"
+    echo "pre-commit: pinned CDN URLs synced to v$(tr -d '[:space:]' < VERSION) in ${synced[*]}"
+fi

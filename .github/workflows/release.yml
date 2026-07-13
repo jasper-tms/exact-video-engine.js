@@ -1,0 +1,41 @@
+name: Tag and release
+
+# Editing VERSION on main is the whole release ritual. The pins in demo.html and
+# README.md are already in step with it (the pre-commit hook saw to that), so all
+# that is left is to put the tag on this commit and cut the release off it.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'VERSION'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Get version from VERSION
+        id: get_version
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> $GITHUB_OUTPUT
+
+      # A tag is immutable and jsDelivr caches it forever. If this commit's demo
+      # page still loads the previous release, tagging it publishes that mistake
+      # permanently -- so catch the commit where the hook did not run, before the
+      # tag exists rather than after.
+      - name: Check pinned CDN URLs match VERSION
+        run: ./sync_version.sh --check
+
+      - name: Create tag and GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: v${{ steps.get_version.outputs.version }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
