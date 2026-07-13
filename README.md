@@ -110,7 +110,7 @@ freeze the page.
      DataStream globals). WebM indexing is built in and needs nothing. -->
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch. -->
-<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v1.3.0/exact-video-engine.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v1.4.0/exact-video-engine.js"></script>
 
 <div id="pane" style="width: 640px; height: 360px">
   <canvas id="video-canvas"></canvas>
