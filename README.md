@@ -212,6 +212,17 @@ to make the fallback's exactness falsifiable:
   `mediaTime` 0.133 rather than 0. It passes only if the timeline calibration is
   genuinely finding that offset instead of getting away with a zero one.
 
+**Display** checks that the frame actually reaches the screen, which the frame
+index test cannot: it asserts only on frame *numbers*, and would pass just the
+same if the canvas were painting nothing. So this one loads a clip into a pane
+that is still `display: none` — a host that reveals its player only once the
+clip is ready — then reveals it and looks at the pixels: the backing store must
+match the pane, the image must have real spread (a flat wash has none), and the
+frame on screen must be the one that was asked for. Neither case calls
+`resizeCanvas()` after the reveal, on purpose; doing so would paper over a
+backing store that was mis-sized while the pane had no box, and the case would
+pass whether or not the bug was there.
+
 ## License
 
 MIT

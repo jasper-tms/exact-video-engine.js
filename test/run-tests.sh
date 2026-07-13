@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Generate test clips if needed, serve the repo root, and run the rotation
-# test. Requires ffmpeg, node, and Playwright (npm install playwright).
+# Generate test clips if needed, serve the repo root, and run every test.
+# Requires ffmpeg, node, and Playwright (npm install playwright).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -17,4 +17,5 @@ sleep 1
 status=0
 node test/rotation-test.mjs || status=1
 node test/frame-index-test.mjs || status=1
+node test/display-test.mjs || status=1
 exit "$status"

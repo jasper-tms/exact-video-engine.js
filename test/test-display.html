@@ -1,0 +1,126 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine display test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<style>
+  /* The pane starts with no layout box at all, which is the whole point: a host
+     that reveals its player only once the clip is ready (as the demo page does)
+     loads the engine into a pane that measures 0x0. */
+  #pane { width: 320px; height: 180px; }
+  #pane.hidden { display: none; }
+</style>
+<div id="pane" class="hidden">
+  <canvas id="engine-canvas"></canvas>
+</div>
+<script>
+// Checks that a frame actually reaches the screen, not just that the engine
+// reports the right number for it. The frame-index test asserts only on frame
+// indices, and would still pass if the canvas were painting a flat wash of
+// nothing — which is exactly the bug this test exists for:
+//
+//   The pane is display:none while the clip loads, so it measures 0x0. Sizing
+//   the canvas backing store to that (clamped up to 1x1, the obvious guard)
+//   stores the frame as a SINGLE PIXEL of its own average colour, which CSS
+//   then stretches across the pane once it is revealed. The result is a flat
+//   wash that looks like a decode failure but is a layout bug, and every
+//   frame-index assertion still passes while it happens.
+//
+// So: load hidden, reveal, and then look at the pixels.
+//
+//   mode=resize-while-hidden  host calls resizeCanvas() while the pane still has
+//                             no box and never again — what demo.html did, and
+//                             the exact shape of the reported bug
+//   mode=self-heal            host never calls resizeCanvas() at all; update()
+//                             must notice the pane gained a box and re-size the
+//                             backing store itself
+//
+// Neither mode calls resizeCanvas() after the reveal, and that is deliberate:
+// doing so repairs the canvas even in the broken engine, so a case that did
+// would pass either way and prove nothing.
+const TEST_FRAME = 7;     // not 0, so a stuck-on-first-frame canvas fails too
+const BARS_ACROSS = 32;   // the clips are 160px wide with a 5px bar per frame
+
+// The clips identify each frame by the position of a white bar, so the frame on
+// screen is recoverable from the pixels alone. Reading the bar's centre rather
+// than its brightest column keeps the canvas's rescaling from shifting the
+// answer by one.
+function visibleFrame(context, width, height) {
+  const row = context.getImageData(0, Math.floor(height / 2), width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < width; x++) {
+    if (row[x * 4] > 128) { sum += x; count += 1; }
+  }
+  if (!count) return -1;
+  return Math.floor((sum / count) / (width / BARS_ACROSS));
+}
+
+// Spread of the painted pixels. A correctly drawn frame is a white bar on
+// black, so this is large; the 1x1 bug produces a single flat colour stretched
+// edge to edge, so this is ~0. This is the assertion the old suite was missing.
+function pixelSpread(context, width, height) {
+  const pixels = context.getImageData(0, 0, width, height).data;
+  let sum = 0, sumOfSquares = 0, count = 0;
+  for (let i = 0; i < pixels.length; i += 4) {
+    const value = pixels[i];
+    sum += value;
+    sumOfSquares += value * value;
+    count += 1;
+  }
+  const mean = sum / count;
+  return Math.sqrt(Math.max(0, sumOfSquares / count - mean * mean));
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const mode = params.get('mode');
+  const pane = document.getElementById('pane');
+  const canvas = document.getElementById('engine-canvas');
+
+  const source = await (await fetch('clips/' + params.get('file'))).blob();
+
+  // Loaded while the pane is still display:none — the condition that broke it.
+  const engine = await createBestEngine(source, { canvas, prefer: 'webcodecs' });
+  const measuredWhileHidden = [canvas.width, canvas.height];
+
+  engine.seekToFrame(TEST_FRAME);
+  await engine.ensureFrame(TEST_FRAME);
+  engine.update(performance.now());
+
+  // Sizing the canvas to a pane that has no box yet must not leave it stuck at
+  // that size once the pane gets one.
+  if (mode === 'resize-while-hidden') engine.resizeCanvas();
+
+  pane.classList.remove('hidden');
+
+  // Two ticks: one for update() to notice the pane now has a box, one for the
+  // repaint to land. A host runs update() from its rAF loop, so this is not a
+  // special favour to the test.
+  for (let tick = 0; tick < 2; tick++) {
+    await nextAnimationFrame();
+    engine.update(performance.now());
+  }
+
+  const context = canvas.getContext('2d');
+  const devicePixelRatio = window.devicePixelRatio || 1;
+  window.__result = {
+    tier: engine.tier,
+    // What the backing store was while the pane had no box. Whatever the engine
+    // does here, it must not end up stuck at it.
+    measuredWhileHidden,
+    backingStore: [canvas.width, canvas.height],
+    expectedBackingStore: [
+      Math.round(pane.clientWidth * devicePixelRatio),
+      Math.round(pane.clientHeight * devicePixelRatio),
+    ],
+    pixelSpread: pixelSpread(context, canvas.width, canvas.height),
+    visible: visibleFrame(context, canvas.width, canvas.height),
+    askedFor: TEST_FRAME,
+  };
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>
