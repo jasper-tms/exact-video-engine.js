@@ -110,7 +110,7 @@ freeze the page.
      DataStream globals). WebM indexing is built in and needs nothing. -->
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch. -->
-<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v1.6.1/exact-video-engine.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v1.7.0/exact-video-engine.js"></script>
 
 <div id="pane" style="width: 640px; height: 360px">
   <canvas id="video-canvas"></canvas>
@@ -172,10 +172,12 @@ plays through.
 | `displayElement` | The canvas or `<video>` the engine presents into. |
 | `tier` | What this engine got, e.g. `webcodecs` or `native (container index, presented clock)`. Useful for a dev label. |
 | `frameIndexIsExact` | Whether frame numbers are exact, or only as good as an assumed constant frame rate. A tool that must not mislabel a frame should check this and say so. |
+| `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when no index / no decoder configuration (WebM). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. |
+| `failed` | `VideoEngine` only: true once the `VideoDecoder` has reported an unrecoverable error. |
 | `destroy()` | Release resources when done (decoders are a limited browser resource). |
 | `resizeCanvas()` | Re-size the canvas backing store to its parent and repaint (`VideoEngine`); a no-op on `NativeVideoEngine`, where CSS `object-fit` handles it. `update()` already does this every tick, so you rarely need to call it — a pane that gains its size *after* the clip loads (a host that reveals the player only once it is ready) is handled without you having to get the timing right. |
 | event `loaded` | Fired when `load()` completes. |
-| event `errormessage` | `detail.message`: human-readable error string, or null to clear. |
+| event `errormessage` | `detail.message`: human-readable error string, or null to clear. When the `VideoDecoder` dies mid-stream the detail also carries `fatal: true` plus diagnostics (`errorName`, `codec`, `frame`). A fatal error means this engine will never produce another frame for the clip — some decoders pass `isConfigSupported()` and decode frame 0 but die once sustained decoding starts (WebKit with 10-bit HEVC), which is after `load()` resolved and therefore past `createBestEngine`'s load-time fallback. A host that can fall back should respond by rebuilding with `createBestEngine(source, { prefer: 'native' })`; the `<video>` element typically plays the same clip fine. |
 
 `VideoEngine` additionally has `bitmapForFrame(n)`, the decoded `ImageBitmap`
 for a frame (coded orientation, possibly downscaled for display — apply

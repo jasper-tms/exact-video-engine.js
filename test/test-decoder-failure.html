@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine decoder-failure test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<canvas id="pane" width="300" height="150"></canvas>
+<script>
+// The dishonest-yes decoder: isConfigSupported() says yes, frame 0 decodes,
+// and the decoder dies only once sustained decoding starts (WebKit does this
+// with 10-bit HEVC). That is after load() resolved, so createBestEngine's
+// load-time fallback cannot catch it — the HOST has to, which it can only do
+// if the engine (a) marks the failure fatal on the errormessage event and
+// (b) makes waiters fail fast instead of sitting out the 5-second decode
+// timeout. This test drives both promises of that contract.
+//
+// No real clip reproduces the failure in Chromium (its decoder is honest
+// here), so after a normal load the test invokes _decoderFailed() directly —
+// the exact entry point the real VideoDecoder error callback uses; only the
+// trigger is simulated.
+async function run() {
+  const canvas = document.getElementById('pane');
+  const source = await (await fetch('clips/hd.mp4')).blob();
+
+  const engine = await createBestEngine(source, { canvas, prefer: 'webcodecs' });
+  if (engine.tier !== 'webcodecs') {
+    throw new Error(`wanted the webcodecs engine, got '${engine.tier}'`);
+  }
+
+  let fatalDetail = null;
+  engine.addEventListener('errormessage', (event) => {
+    if (event.detail && event.detail.fatal) fatalDetail = event.detail;
+  });
+
+  engine.playhead = 0.5;   // an arbitrary mid-clip moment, so frame is not 0
+  engine._decoderFailed(new DOMException('simulated decoder death', 'EncodingError'));
+
+  // hd.mp4 is 150 frames of 1080p — far more than the byte-budgeted cache
+  // holds — so a frame near the end cannot already be resident and ensureFrame
+  // must wait on a decoder that will never deliver. It has to reject from the
+  // failed flag (milliseconds), not the 5-second decode timeout.
+  const startedAt = performance.now();
+  let ensureError = null;
+  try {
+    await engine.ensureFrame(engine.numFrames - 5);
+  } catch (e) {
+    ensureError = String(e && e.message || e);
+  }
+  const ensureMs = performance.now() - startedAt;
+
+  window.__result = {
+    failedFlag: engine.failed === true,
+    fatalDetail: fatalDetail && {
+      fatal: fatalDetail.fatal,
+      message: fatalDetail.message,
+      errorName: fatalDetail.errorName,
+      codec: fatalDetail.codec,
+      frame: fatalDetail.frame,
+    },
+    codecString: engine.codecString,
+    ensureError, ensureMs,
+  };
+  engine.destroy();
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>

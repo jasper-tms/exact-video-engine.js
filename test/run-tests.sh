@@ -26,4 +26,5 @@ node test/display-test.mjs || status=1
 node test/offscreen-test.mjs || status=1
 node test/startup-test.mjs || status=1
 node test/memory-test.mjs || status=1
+node test/decoder-failure-test.mjs || status=1
 exit "$status"

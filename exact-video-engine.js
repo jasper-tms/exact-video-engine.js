@@ -870,6 +870,9 @@ class VideoEngine extends EventTarget {
     this._reader = null;
     this._videoDecoder = null;
     this._decoderConfig = null;
+    // True once the VideoDecoder has reported an unrecoverable error (see
+    // _decoderFailed); cleared by load()/_teardown().
+    this.failed = false;
     this._timescale = 1;
 
     // Upright display geometry, taken from the container index: the track's
@@ -948,6 +951,11 @@ class VideoEngine extends EventTarget {
   get displayElement() { return this.canvas; }
   // What this engine got, for dev labels and host-side diagnostics.
   get tier() { return 'webcodecs'; }
+  // The clip's codec string as the container declares it (e.g.
+  // 'hvc1.2.4.L123.b0'), for hosts that want to predict format trouble —
+  // say, flagging 10-bit profiles for server-side conversion. Null until
+  // load() has adopted an index.
+  get codecString() { return this._decoderConfig ? this._decoderConfig.codec : null; }
   // The engine decodes each frame itself, so its frame indices are exact by
   // construction — there is no browser presentation to be uncertain about.
   get frameIndexIsExact() { return true; }
@@ -1084,12 +1092,33 @@ class VideoEngine extends EventTarget {
   _configureDecoder() {
     this._videoDecoder = new VideoDecoder({
       output: (frame) => this._absorb(frame),
-      error: (e) => { console.error('VideoDecoder error:', e);
-                      this._showError(e.message || String(e)); },
+      error: (e) => this._decoderFailed(e),
     });
     this._videoDecoder.configure(this._decoderConfig);
     this._runKeyframe = -1;
     this._fedThrough = -1;
+  }
+
+  // The VideoDecoder error callback fires only for unrecoverable failures (the
+  // decoder is closed once it does). The treacherous case is a browser whose
+  // isConfigSupported() said yes and whose decoder survived frame 0 but dies
+  // once sustained decoding starts — seen on WebKit with 10-bit HEVC — which
+  // is AFTER load() resolved, so createBestEngine's load-time fallback cannot
+  // catch it. Mark the engine failed so waiters (ensureFrame) fail fast
+  // instead of timing out, and tell the host it is fatal: a host holding a
+  // <video> element should rebuild with prefer: 'native', which typically
+  // plays the same clip fine.
+  _decoderFailed(e) {
+    console.error('VideoDecoder error:', e);
+    this.failed = true;
+    const detail = {
+      message: e && e.message ? e.message : String(e),
+      fatal: true,
+      errorName: (e && e.name) || null,
+      codec: this._decoderConfig ? this._decoderConfig.codec : null,
+      frame: this.currentFrame,
+    };
+    this.dispatchEvent(new CustomEvent('errormessage', { detail }));
   }
 
   // Largest keyframe decode index <= decodeIndex (binary search).
@@ -1356,6 +1385,11 @@ class VideoEngine extends EventTarget {
     this._request(frameIndex);
     const startedAt = performance.now();
     while (!this._cache.has(frameIndex)) {
+      // A dead decoder will never produce this frame; fail now, not at the
+      // timeout. This is also what lets load() (frame 0 goes through here)
+      // reject promptly when the decoder dies during load, so
+      // createBestEngine's fallback fires without a 5-second stall.
+      if (this.failed) throw new Error('decoder failed');
       await this._sleep(8);
       if (performance.now() - startedAt > 5000) throw new Error('decode timed out');
     }
@@ -1490,6 +1524,7 @@ class VideoEngine extends EventTarget {
   _teardown() {
     this.ready = false;
     this.playing = false;
+    this.failed = false;
     if (this._videoDecoder) {
       try { this._videoDecoder.close(); } catch (e) { /* already closed */ }
       this._videoDecoder = null;
@@ -1646,6 +1681,12 @@ class NativeVideoEngine extends EventTarget {
     const index = this._index ? 'container index' : 'declared frame rate';
     const clock = this.hasPresentedFrameClock ? 'presented clock' : 'currentTime clock';
     return `native (${index}, ${clock})`;
+  }
+  // Same contract as VideoEngine.codecString. Null when no index is available
+  // or the index carries no decoder configuration (WebM's does not).
+  get codecString() {
+    return (this._index && this._index.decoderConfig)
+      ? this._index.decoderConfig.codec : null;
   }
   // True only when frame indices come from the container's real timestamps.
   // With a declared frame rate they are exact for constant-frame-rate clips and
