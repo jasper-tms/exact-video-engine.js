@@ -11,6 +11,11 @@
 // decodes from. That is why ContainerIndex is built even when WebCodecs is not
 // in play.
 //
+// counter-vfr.webm: the same claim for a container mp4box cannot parse. WebM is
+// where the constant-frame-rate fallback used to be the only option, and this
+// clip is the one it gets wrong; passing here means the engine's own Matroska
+// scan really did read the frame timestamps out of the clusters.
+//
 // counter-elst.mp4: the element's timeline does not always start at zero. This
 // clip's first frame reports mediaTime 0.133, so an engine that assumed the two
 // timelines coincided would report every frame number shifted. Passing here
@@ -42,6 +47,24 @@ const CASES = [
 
   { file: 'counter-elst.mp4', mode: 'webcodecs', firstBar: 10, expectExact: true },
   { file: 'counter-elst.mp4', mode: 'native-index', firstBar: 10, expectExact: true },
+
+  // WebM, which mp4box cannot parse at all: these run on the engine's own
+  // Matroska cluster scan. Same story as the MP4 pair above — the VFR clip is
+  // mismapped by an assumed frame rate and exact once the real timestamps are
+  // read out of the container.
+  { file: 'counter-cfr.webm', mode: 'native-index', firstBar: 0, expectExact: true },
+  { file: 'counter-vfr.webm', mode: 'native-index', firstBar: 0, expectExact: true },
+  { file: 'counter-vfr.webm', mode: 'native-declared', firstBar: 0, expectExact: false },
+  // Asking for WebCodecs on a WebM: the index has timestamps but no sample table
+  // to decode from, so the ladder must fall back to the <video> element and keep
+  // the index — exact frames, native tier. (If this ever reports the webcodecs
+  // tier, the gate on supportsWebCodecs has stopped working.)
+  { file: 'counter-vfr.webm', mode: 'webcodecs', firstBar: 0, expectExact: true },
+  // Indexing a WebM costs a pass over the whole file, so the engine puts a
+  // deadline on it. Give it none and it must land softly on the declared frame
+  // rate — mismapping the VFR clip exactly as native-declared does, and playing
+  // it rather than failing.
+  { file: 'counter-vfr.webm', mode: 'native-timeout', firstBar: 0, expectExact: false },
 ];
 
 const browser = await chromium.launch();

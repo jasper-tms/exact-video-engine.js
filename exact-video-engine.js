@@ -30,17 +30,21 @@
 // is not the timestamps — requestVideoFrameCallback's `mediaTime` IS the
 // presented frame's exact presentation timestamp — but the mapping from a
 // timestamp to a frame *index*, which needs the table of every frame's PTS. A
-// <video> element never exposes that table. mp4box can build it from the moov
-// alone, without decoding a single frame, so we build it whenever we can and
-// hand it to whichever engine ends up playing (see ContainerIndex). That is
-// what makes the <video> path frame-exact on variable-frame-rate clips rather
-// than merely close.
+// <video> element never exposes that table, so we read it out of the container
+// ourselves, without decoding a single frame: from the moov for MP4 (mp4box),
+// and by scanning the clusters for WebM. Either way the same table goes to
+// whichever engine ends up playing (see ContainerIndex). That is what makes the
+// <video> path frame-exact on variable-frame-rate clips rather than merely
+// close.
 //
 // createBestEngine() picks the best available combination for a given clip and
 // browser, degrading in this order:
 //
 //   1. container index + WebCodecs   exact index, exact decode, owned clock
+//                                    (MP4 only: WebM's index carries timestamps
+//                                    but no sample table to decode from)
 //   2. container index + <video>     exact index, browser decode + presentation
+//                                    (MP4 and WebM)
 //   3. declared frame rate + <video> exact for constant-frame-rate clips only
 //   4. no requestVideoFrameCallback  currentTime * frameRate; last resort
 //
@@ -49,11 +53,12 @@
 // results as ImageBitmaps, and evict distant GOPs, so memory stays flat
 // regardless of clip length (handles multi-minute clips).
 //
-// Classic (non-module) script defining six globals — UrlRangeReader,
+// Classic (non-module) script whose host-facing globals are UrlRangeReader,
 // FileRangeReader, ContainerIndex, VideoEngine, NativeVideoEngine, and
-// createBestEngine — so both module and non-module host pages can use it.
-// mp4box.js (the `MP4Box` / `DataStream` globals) should be loaded first; if it
-// is absent, only step 3/4 above remain available.
+// createBestEngine, so both module and non-module host pages can use it.
+// mp4box.js (the `MP4Box` / `DataStream` globals) should be loaded first to
+// index MP4s; WebM indexing is built in and needs nothing. Without mp4box an MP4
+// falls to step 3/4, while a WebM still gets step 2.
 //
 // Neither engine touches the host page's DOM beyond the canvas or <video> it is
 // given. Errors surface as an 'errormessage' CustomEvent whose detail.message
@@ -102,6 +107,385 @@ function createRangeReader(source) {
 }
 
 // ==================================================================
+// Matroska/WebM frame table — the second way to get real timestamps.
+//
+// mp4box only speaks ISOBMFF, so a WebM clip used to land on the assumed
+// constant frame rate, and got silently wrong frame numbers whenever that
+// assumption was wrong. It does not have to: Matroska stores every frame's
+// presentation timestamp in plain sight (a cluster's Timestamp plus each
+// block's signed 16-bit offset from it), so the table can be read without
+// decoding a single frame — the same trick as the moov, just a different box
+// layout.
+//
+// The one real difference is cost. Matroska has no central sample table: the
+// timestamps live next to the frames, scattered across every cluster, and Cues
+// indexes only keyframes. So there is no way to build the table without a
+// sequential pass over the whole file. We read only element headers and skip
+// every block's payload, so this is I/O plus a little arithmetic, never a
+// decode — but the bytes still have to go past us. That is fast for a local
+// File (disk speed) and as slow as the network for a URL, which is why the pass
+// takes a deadline and the engine gives it one (see createBestEngine's
+// indexTimeoutMilliseconds).
+//
+// Timestamps here are quantized by TimestampScale — 1 ms by default, so a 60fps
+// clip's frames land on 0, 17, 33, 50 ms rather than exact sixtieths. That is
+// not a loss of exactness for our purpose: the browser's own demuxer computes
+// the `mediaTime` it reports from these very integers, so our table and its
+// clock agree by construction, which is the only thing frame mapping needs.
+// ==================================================================
+
+// Element IDs, stored with their EBML length marker, exactly as they appear in
+// the file (so `0xA3`, not `0x23`).
+const EBML_ID = {
+  header: 0x1A45DFA3,
+  segment: 0x18538067,
+  seekHead: 0x114D9B74,
+  info: 0x1549A966,
+  timestampScale: 0x2AD7B1,
+  tracks: 0x1654AE6B,
+  trackEntry: 0xAE,
+  trackNumber: 0xD7,
+  trackType: 0x83,
+  defaultDuration: 0x23E383,
+  video: 0xE0,
+  pixelWidth: 0xB0,
+  pixelHeight: 0xBA,
+  cluster: 0x1F43B675,
+  clusterTimestamp: 0xE7,
+  simpleBlock: 0xA3,
+  blockGroup: 0xA0,
+  block: 0xA1,
+  cues: 0x1C53BB6B,
+  chapters: 0x1043A770,
+  tags: 0x1254C367,
+  attachments: 0x1941A469,
+};
+
+// The elements that live directly under the Segment. A cluster written with an
+// unknown size (streamed files do this) ends where the next one of these
+// begins, so this set is how we find the end of it.
+const EBML_SEGMENT_LEVEL_IDS = new Set([
+  EBML_ID.seekHead, EBML_ID.info, EBML_ID.tracks, EBML_ID.cluster,
+  EBML_ID.cues, EBML_ID.chapters, EBML_ID.tags, EBML_ID.attachments,
+]);
+
+const MATROSKA_TRACK_TYPE_VIDEO = 1;
+
+// Thrown when the pass runs out of its time (or byte) budget. Named so a caller
+// can tell "this clip is too big to index in the time you gave me" (fall back to
+// the declared frame rate, nothing is wrong) from "this file is malformed".
+class IndexBudgetExceededError extends Error {
+  constructor(message) { super(message); this.name = 'IndexBudgetExceededError'; }
+}
+
+// A forward-only byte cursor over a range reader, holding one chunk at a time.
+// Skipping a block's payload costs nothing: it moves the position, and the next
+// read that needs bytes refetches from wherever the position now is.
+class SequentialByteCursor {
+  constructor(reader, options = {}) {
+    this.reader = reader;
+    this.size = reader.size;
+    this.position = 0;
+    this.buffer = new Uint8Array(0);
+    this.bufferStart = 0;
+    this.chunkBytes = options.chunkBytes || (1 << 20);   // 1 MB
+    // Called before every refill: where the budget is checked and the event loop
+    // is let breathe, so a long pass cannot freeze the host page.
+    this.beforeRefill = options.beforeRefill || null;
+  }
+
+  get atEnd() { return this.position >= this.size; }
+
+  _buffered() {
+    const count = this.bufferStart + this.buffer.length - this.position;
+    return count > 0 ? count : 0;
+  }
+
+  // Guarantee `count` bytes are readable at the cursor.
+  async ensure(count) {
+    if (this._buffered() >= count) return;
+    if (this.beforeRefill) await this.beforeRefill();
+    const start = this.position;
+    const end = Math.min(this.size, start + Math.max(count, this.chunkBytes));
+    if (end - start < count) throw new Error('unexpected end of file');
+    this.buffer = new Uint8Array(await this.reader.read(start, end - 1));
+    this.bufferStart = start;
+    if (this.buffer.length < count) throw new Error('unexpected end of file');
+  }
+
+  // Byte at `offset` from the cursor. Only valid for bytes ensure() has covered.
+  peek(offset) { return this.buffer[this.position - this.bufferStart + offset]; }
+  advance(count) { this.position += count; }
+}
+
+// An element ID: the leading-zero count of the first byte gives its length (1-4
+// bytes) and the marker bits stay in the value.
+async function readEbmlId(cursor) {
+  await cursor.ensure(1);
+  const first = cursor.peek(0);
+  if (first === 0) throw new Error('invalid EBML element id');
+  let length = 1;
+  for (let mask = 0x80; !(first & mask); mask >>= 1) length++;
+  if (length > 4) throw new Error('invalid EBML element id');
+  await cursor.ensure(length);
+  let value = 0;
+  for (let i = 0; i < length; i++) value = value * 256 + cursor.peek(i);
+  cursor.advance(length);
+  return value;
+}
+
+// A variable-length integer: same length encoding as an ID, but the marker bit
+// is stripped from the value. An all-ones value means "unknown size" (a master
+// element whose length the writer did not know), reported as null.
+async function readEbmlVariableInt(cursor) {
+  await cursor.ensure(1);
+  const first = cursor.peek(0);
+  if (first === 0) throw new Error('invalid EBML variable-length integer');
+  let length = 1;
+  for (let mask = 0x80; !(first & mask); mask >>= 1) length++;
+  await cursor.ensure(length);
+  let value = first & (0xFF >> length);
+  let allOnes = value === (0xFF >> length);
+  for (let i = 1; i < length; i++) {
+    const byte = cursor.peek(i);
+    if (byte !== 0xFF) allOnes = false;
+    value = value * 256 + byte;
+  }
+  cursor.advance(length);
+  return allOnes ? null : value;
+}
+
+async function readEbmlUnsigned(cursor, byteCount) {
+  await cursor.ensure(byteCount);
+  let value = 0;
+  for (let i = 0; i < byteCount; i++) value = value * 256 + cursor.peek(i);
+  cursor.advance(byteCount);
+  return value;
+}
+
+// Read the timestamps of every frame of the file's first video track.
+//
+// options.timeoutMilliseconds  give up after this long (Infinity: never)
+// options.maxBytes             refuse a file bigger than this (Infinity: any)
+//
+// Returns {presentationTimes (seconds, file order), defaultFrameDuration,
+// videoWidth, videoHeight}. Throws IndexBudgetExceededError when it runs out of
+// budget, and a plain Error when the file is not one we can read.
+async function readMatroskaFrameTable(reader, options = {}) {
+  const timeoutMilliseconds = (options.timeoutMilliseconds === undefined)
+    ? Infinity : options.timeoutMilliseconds;
+  const maxBytes = (options.maxBytes === undefined) ? Infinity : options.maxBytes;
+  if (reader.size > maxBytes) {
+    throw new IndexBudgetExceededError(
+      `WebM is ${reader.size} bytes; indexing it means reading all of them, and `
+      + `the caller's limit is ${maxBytes}`);
+  }
+  if (!(timeoutMilliseconds > 0)) {
+    throw new IndexBudgetExceededError('no time allowed to index this WebM');
+  }
+
+  const startedAt = performance.now();
+  let lastYieldedAt = startedAt;
+  const state = {
+    timestampScaleSeconds: 1e6 / 1e9,   // TimestampScale defaults to 1 ms
+    videoTrackNumber: null,
+    defaultFrameDuration: 0,
+    videoWidth: 0,
+    videoHeight: 0,
+    clusterTimestamp: 0,
+    presentationTimes: [],
+  };
+
+  const cursor = new SequentialByteCursor(reader, {
+    beforeRefill: async () => {
+      const now = performance.now();
+      if (now - startedAt > timeoutMilliseconds) {
+        throw new IndexBudgetExceededError(
+          `indexing this WebM did not finish within ${timeoutMilliseconds} ms `
+          + `(read ${cursor.position} of ${reader.size} bytes)`);
+      }
+      // Hand the event loop a turn every so often. Awaiting the read itself
+      // usually does this, but a fast local File can resolve quickly enough to
+      // starve rendering for the length of the pass.
+      if (now - lastYieldedAt > 16) {
+        lastYieldedAt = now;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    },
+  });
+
+  if (await readEbmlId(cursor) !== EBML_ID.header) {
+    throw new Error('not an EBML file');
+  }
+  const headerSize = await readEbmlVariableInt(cursor);
+  if (headerSize === null) throw new Error('EBML header has no size');
+  cursor.advance(headerSize);
+
+  while (!cursor.atEnd) {
+    const id = await readEbmlId(cursor);
+    const size = await readEbmlVariableInt(cursor);
+    const contentStart = cursor.position;
+    if (id === EBML_ID.segment) {
+      const end = (size === null) ? Infinity : contentStart + size;
+      await readMatroskaSegment(cursor, end, state);
+      if (size === null) break;   // an unknown-size Segment runs to the end
+    }
+    if (size === null) throw new Error('unknown-size element outside a Segment');
+    cursor.position = contentStart + size;
+  }
+
+  if (!state.presentationTimes.length) {
+    throw new Error('no video frames found in this WebM');
+  }
+  return state;
+}
+
+async function readMatroskaSegment(cursor, end, state) {
+  while (cursor.position < end && !cursor.atEnd) {
+    const id = await readEbmlId(cursor);
+    const size = await readEbmlVariableInt(cursor);
+    const contentStart = cursor.position;
+    const contentEnd = (size === null) ? Infinity : contentStart + size;
+
+    if (id === EBML_ID.info) await readMatroskaInfo(cursor, contentEnd, state);
+    else if (id === EBML_ID.tracks) await readMatroskaTracks(cursor, contentEnd, state);
+    else if (id === EBML_ID.cluster) await readMatroskaCluster(cursor, contentEnd, state);
+
+    if (size === null) {
+      // Only a cluster may have an unknown size here, and reading it leaves the
+      // cursor on whatever element ended it.
+      if (id !== EBML_ID.cluster) throw new Error('unknown-size element in Segment');
+    } else {
+      cursor.position = contentEnd;   // skip whatever we did not care about
+    }
+  }
+}
+
+async function readMatroskaInfo(cursor, end, state) {
+  while (cursor.position < end && !cursor.atEnd) {
+    const id = await readEbmlId(cursor);
+    const size = await readEbmlVariableInt(cursor);
+    if (size === null) throw new Error('unknown-size element in Info');
+    const contentStart = cursor.position;
+    if (id === EBML_ID.timestampScale) {
+      // Nanoseconds per timestamp tick.
+      state.timestampScaleSeconds = (await readEbmlUnsigned(cursor, size)) / 1e9;
+    }
+    cursor.position = contentStart + size;
+  }
+}
+
+async function readMatroskaTracks(cursor, end, state) {
+  while (cursor.position < end && !cursor.atEnd) {
+    const id = await readEbmlId(cursor);
+    const size = await readEbmlVariableInt(cursor);
+    if (size === null) throw new Error('unknown-size element in Tracks');
+    const contentStart = cursor.position;
+    if (id === EBML_ID.trackEntry && state.videoTrackNumber === null) {
+      await readMatroskaTrackEntry(cursor, contentStart + size, state);
+    }
+    cursor.position = contentStart + size;
+  }
+}
+
+// Take the first video track, and only if it is a video track: a WebM whose
+// first TrackEntry is audio must not have its audio packets counted as frames.
+async function readMatroskaTrackEntry(cursor, end, state) {
+  let trackNumber = null, trackType = null;
+  let defaultDuration = 0, width = 0, height = 0;
+
+  while (cursor.position < end && !cursor.atEnd) {
+    const id = await readEbmlId(cursor);
+    const size = await readEbmlVariableInt(cursor);
+    if (size === null) throw new Error('unknown-size element in TrackEntry');
+    const contentStart = cursor.position;
+
+    if (id === EBML_ID.trackNumber) trackNumber = await readEbmlUnsigned(cursor, size);
+    else if (id === EBML_ID.trackType) trackType = await readEbmlUnsigned(cursor, size);
+    else if (id === EBML_ID.defaultDuration) {
+      defaultDuration = (await readEbmlUnsigned(cursor, size)) / 1e9;   // ns
+    } else if (id === EBML_ID.video) {
+      const videoEnd = contentStart + size;
+      while (cursor.position < videoEnd && !cursor.atEnd) {
+        const videoId = await readEbmlId(cursor);
+        const videoSize = await readEbmlVariableInt(cursor);
+        if (videoSize === null) throw new Error('unknown-size element in Video');
+        const videoContentStart = cursor.position;
+        if (videoId === EBML_ID.pixelWidth) width = await readEbmlUnsigned(cursor, videoSize);
+        else if (videoId === EBML_ID.pixelHeight) height = await readEbmlUnsigned(cursor, videoSize);
+        cursor.position = videoContentStart + videoSize;
+      }
+    }
+    cursor.position = contentStart + size;
+  }
+
+  if (trackType !== MATROSKA_TRACK_TYPE_VIDEO || trackNumber === null) return;
+  state.videoTrackNumber = trackNumber;
+  state.defaultFrameDuration = defaultDuration;
+  state.videoWidth = width;
+  state.videoHeight = height;
+}
+
+async function readMatroskaCluster(cursor, end, state) {
+  state.clusterTimestamp = 0;
+  while (cursor.position < end && !cursor.atEnd) {
+    const idStart = cursor.position;
+    const id = await readEbmlId(cursor);
+    // An unknown-size cluster ends where the next Segment-level element starts:
+    // put that element back for our caller to read.
+    if (end === Infinity && EBML_SEGMENT_LEVEL_IDS.has(id)) {
+      cursor.position = idStart;
+      return;
+    }
+    const size = await readEbmlVariableInt(cursor);
+    if (size === null) throw new Error('unknown-size element in Cluster');
+    const contentStart = cursor.position;
+
+    if (id === EBML_ID.clusterTimestamp) {
+      state.clusterTimestamp = await readEbmlUnsigned(cursor, size);
+    } else if (id === EBML_ID.simpleBlock) {
+      await readMatroskaBlock(cursor, state);
+    } else if (id === EBML_ID.blockGroup) {
+      // A BlockGroup wraps a Block plus its references; the Block's header is
+      // laid out exactly like a SimpleBlock's, and only its timestamp interests
+      // us (keyframe flags do not: this index never feeds a decoder).
+      const groupEnd = contentStart + size;
+      while (cursor.position < groupEnd && !cursor.atEnd) {
+        const childId = await readEbmlId(cursor);
+        const childSize = await readEbmlVariableInt(cursor);
+        if (childSize === null) throw new Error('unknown-size element in BlockGroup');
+        const childStart = cursor.position;
+        if (childId === EBML_ID.block) await readMatroskaBlock(cursor, state);
+        cursor.position = childStart + childSize;
+      }
+    }
+    cursor.position = contentStart + size;
+  }
+}
+
+// A block header: track number (variable-length), then the frame's timestamp as
+// a signed 16-bit offset from its cluster's, then flags. The payload after it is
+// the encoded frame, which we never read.
+async function readMatroskaBlock(cursor, state) {
+  const trackNumber = await readEbmlVariableInt(cursor);
+  await cursor.ensure(3);
+  const relative = ((cursor.peek(0) << 8) | cursor.peek(1)) << 16 >> 16;   // signed
+  const flags = cursor.peek(2);
+  cursor.advance(3);
+
+  if (state.videoTrackNumber === null) throw new Error('WebM cluster before Tracks');
+  if (trackNumber !== state.videoTrackNumber) return;   // audio, subtitles, ...
+  // Lacing packs several frames into one block under a single timestamp, so
+  // their individual times would have to be invented from DefaultDuration. It is
+  // an audio feature and essentially never used for video; refuse rather than
+  // hand back timestamps we made up.
+  if (flags & 0x06) throw new Error('this WebM laces its video blocks');
+
+  state.presentationTimes.push(
+    (state.clusterTimestamp + relative) * state.timestampScaleSeconds);
+}
+
+// ==================================================================
 // ContainerIndex — everything the moov tells us, with nothing decoded.
 //
 // This is the piece both engines want and neither can get from a <video>
@@ -112,14 +496,24 @@ function createRangeReader(source) {
 // no WebCodecs at all, which is exactly what makes the <video> fallback
 // frame-exact rather than fps-guessing.
 //
-// Limited to ISOBMFF (mp4/m4v/mov), because that is what mp4box parses. A WebM
-// or Ogg clip will fail here, and the <video> element will still play it — just
-// without an exact index. That is the intended degradation, not a bug.
+// Two containers, two ways in, one table out. ISOBMFF (mp4/m4v/mov) goes
+// through mp4box, which reads the moov and hands back a full sample table:
+// timestamps, byte ranges, keyframes, decoder configuration — everything, from a
+// few range requests. WebM/Matroska goes through readMatroskaFrameTable above,
+// which streams the file to collect the timestamps alone. So a WebM index is
+// deliberately a lesser thing: it carries the per-frame PTS table (which is what
+// makes the <video> path exact, and the whole point of the exercise) but no
+// sample table and no decoder configuration, so WebCodecs cannot decode from it.
+// `supportsWebCodecs` is how the ladder in createBestEngine tells them apart.
+//
+// Anything else (Ogg, HLS) still fails here, and the <video> element still plays
+// it without an exact index. That is the intended degradation, not a bug.
 // ==================================================================
 class ContainerIndex {
   constructor(reader) {
     this.reader = reader;
     this.timescale = 1;
+    this.containerFormat = null;     // 'isobmff' | 'matroska'
 
     // Decode-order sample table (no frame bytes): {offset, size, isSync, cts,
     // duration}. The byte ranges the decoder will later fetch on demand.
@@ -140,19 +534,37 @@ class ContainerIndex {
     this.duration = 0;               // seconds (sum of real frame durations)
   }
 
-  static async load(reader) {
-    if (typeof MP4Box === 'undefined') throw new Error('mp4box.js is not loaded');
+  // Only an ISOBMFF index has what a VideoDecoder needs (the byte ranges of
+  // every sample, and the codec's configuration). A WebM index has timestamps
+  // and nothing else, so it can make the <video> element exact but cannot feed
+  // the WebCodecs engine.
+  get supportsWebCodecs() { return !!(this.samples && this.decoderConfig); }
+
+  // options.timeoutMilliseconds / options.maxBytes bound the WebM pass (see
+  // readMatroskaFrameTable); they are ignored for ISOBMFF, which is a handful of
+  // range reads however long the clip is.
+  static async load(reader, options = {}) {
     const index = new ContainerIndex(reader);
-    await index._demux(reader);
+    if (await ContainerIndex._isMatroska(reader)) await index._demuxMatroska(reader, options);
+    else await index._demuxIsobmff(reader);
     return index;
   }
 
   // Build an index straight from a source, for hosts that want the frame table
   // without instantiating an engine.
-  static async fromSource(source) {
+  static async fromSource(source, options = {}) {
     const reader = createRangeReader(source);
     await reader.init();
-    return await ContainerIndex.load(reader);
+    return await ContainerIndex.load(reader, options);
+  }
+
+  // WebM and MP4 are told apart by their first bytes, not by a file extension or
+  // a MIME type: the source may be a Blob with neither.
+  static async _isMatroska(reader) {
+    if (reader.size < 4) return false;
+    const magic = new Uint8Array(await reader.read(0, 3));
+    return magic[0] === 0x1A && magic[1] === 0x45
+      && magic[2] === 0xDF && magic[3] === 0xA3;   // EBML
   }
 
   // Largest display frame whose presentation time is <= t (binary search over
@@ -210,7 +622,8 @@ class ContainerIndex {
     return (start + end) / 2;
   }
 
-  async _demux(reader) {
+  async _demuxIsobmff(reader) {
+    if (typeof MP4Box === 'undefined') throw new Error('mp4box.js is not loaded');
     const file = MP4Box.createFile(false);   // false: discard mdat bytes
     let info = null, demuxError = null;
     file.onReady = (i) => { info = i; };
@@ -255,6 +668,46 @@ class ContainerIndex {
     this.videoHeight = swapAxes ? videoTrack.video.width : videoTrack.video.height;
 
     this._buildTables(file.getTrackSamplesInfo(videoTrack.id));
+    this.containerFormat = 'isobmff';
+  }
+
+  // WebM: the timestamps and nothing else (see readMatroskaFrameTable). The
+  // fields a decoder would need — samples, keyframeDecodeIndices,
+  // decoderConfig — stay null, and supportsWebCodecs reports false because of it.
+  async _demuxMatroska(reader, options) {
+    const table = await readMatroskaFrameTable(reader, options);
+    this.containerFormat = 'matroska';
+    this.videoWidth = table.videoWidth;
+    this.videoHeight = table.videoHeight;
+    // Matroska carries no display rotation matrix (the element applies none
+    // either, so the two agree).
+    this.rotation = 0;
+
+    // Blocks are written in decode order, and a Matroska block's timestamp is
+    // already a *presentation* time, so with B-frames the times can arrive out
+    // of order. Sorting gives display order — the same normalization the
+    // ISOBMFF path does by sorting on composition time.
+    const times = table.presentationTimes.slice().sort((a, b) => a - b);
+    const n = times.length;
+    const firstTime = times[0];
+
+    this.presentationTimes = new Float64Array(n);
+    this.frameDurations = new Float64Array(n);
+    for (let d = 0; d < n; d++) this.presentationTimes[d] = times[d] - firstTime;
+    // Matroska stores no per-frame duration, so a frame lasts until the next one
+    // starts. The last frame has no next one: fall back to the track's declared
+    // DefaultDuration, then to the previous frame's, then to a nominal 30fps.
+    for (let d = 0; d < n - 1; d++) {
+      this.frameDurations[d] = this.presentationTimes[d + 1] - this.presentationTimes[d];
+    }
+    if (n) {
+      this.frameDurations[n - 1] = table.defaultFrameDuration
+        || (n > 1 ? this.frameDurations[n - 2] : 1 / 30);
+    }
+
+    this.numFrames = n;
+    this.duration = n
+      ? this.presentationTimes[n - 1] + this.frameDurations[n - 1] : 0;
   }
 
   _codecDescription(file, trackId) {
@@ -442,6 +895,14 @@ class VideoEngine extends EventTarget {
     try {
       const index = options.index
         || await ContainerIndex.fromSource(source);
+      if (!index.supportsWebCodecs) {
+        // A WebM index: exact timestamps, but no sample table and no decoder
+        // configuration, so there is nothing here to decode from. The clip is
+        // fine — it belongs on NativeVideoEngine, which the same index makes
+        // frame-exact anyway.
+        throw new Error(`this ${index.containerFormat} container carries no `
+          + 'sample table for WebCodecs to decode from');
+      }
       this._adoptIndex(index);
 
       const support = await VideoDecoder.isConfigSupported(this._decoderConfig);
@@ -853,10 +1314,11 @@ class VideoEngine extends EventTarget {
 // 2. The container index, when we have one. `mediaTime` is an exact timestamp,
 //    but turning a timestamp into a frame *index* needs the table of every
 //    frame's PTS, which a <video> element never exposes. Given a ContainerIndex
-//    we binary-search it and the index is exact on variable-frame-rate clips.
-//    Without one we fall back to `mediaTime * framesPerSecond`, which is exact
-//    only if the clip really is constant-frame-rate — the accepted trade for
-//    playing containers mp4box cannot parse.
+//    we binary-search it and the index is exact on variable-frame-rate clips —
+//    MP4 and WebM alike, which is the whole reason both are indexed. Without one
+//    (a container we cannot read at all, or a WebM whose indexing pass ran out
+//    of time) we fall back to `mediaTime * framesPerSecond`, which is exact only
+//    if the clip really is constant-frame-rate.
 // ==================================================================
 class NativeVideoEngine extends EventTarget {
   constructor(videoElement) {
@@ -1277,6 +1739,15 @@ async function createBestEngine(source, options = {}) {
     prefer = 'auto',
     declaredFrameRate = 0,
     declaredNumFrames = 0,
+    // How long the WebM index is allowed to take. Building it means reading the
+    // whole file (Matroska keeps no central sample table), which is quick from
+    // disk and as slow as the network from a URL — so it gets a deadline, and a
+    // clip that blows through it falls back to the declared frame rate rather
+    // than making the host wait. Infinity to let it run as long as it needs;
+    // indexMaxBytes refuses outsized files before reading a byte of them.
+    // Neither touches the MP4 path, which is a few range reads either way.
+    indexTimeoutMilliseconds = 10000,
+    indexMaxBytes = Infinity,
     // A caller that has already built the index for this source passes it here,
     // so the moov is not parsed twice. Passing null means "already tried, not
     // available" — which is different from leaving it out, which means "build it
@@ -1286,17 +1757,22 @@ async function createBestEngine(source, options = {}) {
   } = options;
 
   let index = (providedIndex !== undefined) ? providedIndex : null;
-  if (providedIndex === undefined && typeof MP4Box !== 'undefined') {
+  if (providedIndex === undefined) {
     try {
-      index = await ContainerIndex.fromSource(source);
+      index = await ContainerIndex.fromSource(source, {
+        timeoutMilliseconds: indexTimeoutMilliseconds,
+        maxBytes: indexMaxBytes,
+      });
     } catch (err) {
       console.warn('exact-video-engine: could not index this container (not '
-        + 'ISOBMFF?). The <video> element may still play it, but frame indices '
-        + 'will come from the declared frame rate.', err);
+        + 'ISOBMFF or WebM, mp4box.js not loaded, or the WebM pass ran out of '
+        + 'time). The <video> element may still play it, but frame indices will '
+        + 'come from the declared frame rate.', err);
     }
   }
 
-  if (prefer !== 'native' && canvas && index && typeof VideoDecoder !== 'undefined') {
+  if (prefer !== 'native' && canvas && index && index.supportsWebCodecs
+      && typeof VideoDecoder !== 'undefined') {
     const engine = new VideoEngine(canvas);
     try {
       await engine.load(source, { index });

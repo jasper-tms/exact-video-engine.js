@@ -23,6 +23,12 @@
 //                         i.e. what the fallback could do before it was given
 //                         the index. Expected to mismap the VFR clip; that
 //                         mismapping is what the index exists to fix.
+//   mode=native-timeout   the full ladder, but with no time allowed to index the
+//                         container. Indexing a WebM means reading the whole
+//                         file, so a long clip on a slow link can cost more than
+//                         it is worth; the engine must then degrade to the
+//                         declared frame rate rather than fail or hang. Same
+//                         outcome as native-declared — that is the point.
 // Only used by mode=native-declared, which by definition has no container to
 // learn the clip's length or rate from and must be told (the clips it runs
 // against are 30 frames at a nominal 30 fps).
@@ -74,11 +80,18 @@ async function run() {
 
   let engine;
   if (mode === 'native-declared') {
-    // No index on purpose: stand in for a container mp4box cannot parse, where
+    // No index on purpose: stand in for a container we cannot read at all, where
     // the host can only tell the engine a frame rate it got from elsewhere.
     engine = new NativeVideoEngine(video);
     await engine.load(source, {
       frameRate: DECLARED_FRAME_RATE, numFrames: DECLARED_NUM_FRAMES,
+    });
+  } else if (mode === 'native-timeout') {
+    engine = await createBestEngine(source, {
+      canvas, video,
+      indexTimeoutMilliseconds: 0,   // the WebM pass never gets off the ground
+      declaredFrameRate: DECLARED_FRAME_RATE,
+      declaredNumFrames: DECLARED_NUM_FRAMES,
     });
   } else {
     engine = await createBestEngine(source, {

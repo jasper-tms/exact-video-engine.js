@@ -5,7 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ]; then
+if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
+        || [ ! -f test/clips/counter-vfr.webm ]; then
     bash test/make-test-clips.sh
 fi
 

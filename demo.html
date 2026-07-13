@@ -147,8 +147,9 @@
   }
   button.badge:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
   button.badge::after { content: " ⇄"; opacity: 0.6; }
-  /* Nothing to toggle to when mp4box could not read the container: WebCodecs has
-     no demuxer to feed it, so native is the only engine. Drop the swap arrow
+  /* Nothing to toggle to when the container yields no sample table (WebM, or one
+     we could not read at all): WebCodecs has nothing to decode from, so native is
+     the only engine. Drop the swap arrow
      rather than advertise an action that does not exist — and keep the pill at
      full opacity (unlike the generic disabled button) since it is still saying
      something true and worth reading. */
@@ -278,13 +279,15 @@ async function load(file) {
   if (engine) { engine.destroy(); engine = null; }
 
   // Build the container index here rather than letting createBestEngine do it,
-  // so we can report whether mp4box could read this container at all — the thing
+  // so we can report whether this container could be read at all — the thing
   // that decides whether frame indices are exact or merely assumed. Passing the
-  // result (index, or null for "tried and failed") keeps the moov from being
-  // parsed twice.
+  // result (index, or null for "tried and failed") keeps it from being built
+  // twice. The time budget is ours to choose because we are the caller now:
+  // ContainerIndex left to itself will read a WebM of any size for as long as it
+  // takes, which is right for a script and wrong for a page with a user waiting.
   let containerIndex = null;
   try {
-    containerIndex = await ContainerIndex.fromSource(file);
+    containerIndex = await ContainerIndex.fromSource(file, { timeoutMilliseconds: 10000 });
   } catch (indexError) {
     containerIndex = null;
   }
@@ -338,31 +341,37 @@ async function load(file) {
   playButton.textContent = 'Play';
 }
 
-// Whether mp4box could read this container. That is the fork in the road: it
-// yields the real per-frame timestamp table, so it decides whether frame indices
-// are exact or fall back to an assumed constant frame rate — and it is also the
-// gate on WebCodecs, which cannot play anything without a demuxer.
+// Whether the container could be indexed. That is the fork in the road: the index
+// is the real per-frame timestamp table, so it decides whether frame indices are
+// exact or fall back to an assumed constant frame rate. MP4 is indexed by mp4box
+// (from the moov) and WebM by the engine's own cluster scan — but only the MP4
+// index carries the sample table WebCodecs needs, so it is also the gate on the
+// WebCodecs engine.
 function showFormatBadge(file, containerIndex) {
   const dot = file.name.lastIndexOf('.');
   const extension = dot === -1 ? '?' : file.name.slice(dot).toLowerCase();
   const badge = document.getElementById('format-badge');
-  // Spelling out the consequence, not just the verdict: "mp4box failed" means
+  // Spelling out the consequence, not just the verdict: "could not index" means
   // nothing to a reader who does not already know that the container is where
   // the per-frame timestamp table comes from. Note what is NOT lost in the
   // failing case — the presented frame's timestamp is still exact, because
   // requestVideoFrameCallback reports it; what is missing is the table needed to
   // turn that timestamp into a frame index.
-  badge.textContent = `Format ${extension} → mp4box `
+  badge.textContent = `Format ${extension} → `
     + (containerIndex
-      ? 'succeeded → frame indices and times are exact'
-      : 'failed → frame indices only correct for constant frame rate videos, '
-        + 'but times are exact');
+      ? 'indexed → frame indices and times are exact'
+      : 'could not index → frame indices only correct for constant frame rate '
+        + 'videos, but times are exact');
   badge.className = 'badge ' + (containerIndex ? 'exact' : 'approximate');
   badge.title = containerIndex
-    ? 'The container yielded a real per-frame timestamp table, so frame indices '
-      + 'are exact even on a variable-frame-rate clip.'
-    : 'mp4box reads ISOBMFF (mp4/mov) only. The <video> element may still play '
-      + 'this clip, but frame indices come from an assumed constant frame rate.';
+    ? `Read the real per-frame timestamp table out of this ${containerIndex.containerFormat}`
+      + ' container, so frame indices are exact even on a variable-frame-rate clip.'
+      + (containerIndex.supportsWebCodecs ? '' : ' WebM carries no sample table for '
+        + 'WebCodecs to decode from, so the <video> element plays it — with exact '
+        + 'frame numbers all the same.')
+    : 'Only MP4 (mp4box) and WebM (built-in) can be indexed, and a WebM index has '
+      + 'a time budget it may run out of. The <video> element may still play this '
+      + 'clip, but frame indices come from an assumed constant frame rate.';
 }
 
 // Names the engine actually in use — not the one requested, since a request is
@@ -372,15 +381,19 @@ function showEngineBadge() {
   const isNative = engine.tier.startsWith('native');
   badge.textContent = `Engine: ${isNative ? 'native' : 'webcodecs'}`;
 
-  // With no container index there is no other engine to toggle to. WebCodecs is
-  // a decoder, not a demuxer: without mp4box nothing can turn this container
-  // into the encoded chunks it wants, so the native element is the only engine
-  // that can play the clip at all. Leaving the pill live would offer a switch
+  // Without an index that WebCodecs can decode from there is no other engine to
+  // toggle to. WebCodecs is a decoder, not a demuxer: something has to hand it
+  // the encoded chunks, which means a sample table — and only the MP4 index has
+  // one (a WebM index is timestamps and nothing else). So for a WebM, and for
+  // any container we could not index at all, the native element is the only
+  // engine that can play the clip. Leaving the pill live would offer a switch
   // that silently lands back where it started.
-  badge.disabled = !currentIndex;
-  badge.title = badge.disabled
-    ? engine.tier + ' — mp4box cannot read this container, and WebCodecs needs a '
-      + 'demuxer to feed it, so the native element is the only engine available'
+  const canDecodeHere = !!(currentIndex && currentIndex.supportsWebCodecs);
+  badge.disabled = !canDecodeHere;
+  badge.title = !canDecodeHere
+    ? engine.tier + ' — WebCodecs needs a demuxed sample table to decode from and '
+      + 'this container has none to give, so the native element is the only engine '
+      + 'available'
     : engine.tier + ' — click to play this clip through the other engine';
 }
 

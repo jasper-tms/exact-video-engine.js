@@ -47,35 +47,67 @@ frame's timestamp, without which a timestamp cannot be turned into a frame
 *index* — so the usual fallback multiplies by an assumed constant frame rate and
 quietly mismaps every variable-frame-rate clip.
 
-That table can be built from the container's `moov` alone: no decoding, no
-`VideoDecoder`, a few range requests. `ContainerIndex` builds it, and it is
-handed to whichever engine ends up playing. Given it, the `<video>` path
-binary-searches `mediaTime` into an exact frame index and is frame-exact on
-variable-frame-rate clips.
+That table can be read straight out of the container, with nothing decoded.
+`ContainerIndex` builds it — from the `moov` for MP4 (mp4box.js, a few range
+requests), and by scanning the clusters for WebM (see below) — and it is handed
+to whichever engine ends up playing. Given it, the `<video>` path binary-searches
+`mediaTime` into an exact frame index and is frame-exact on variable-frame-rate
+clips.
 
 `createBestEngine()` picks the best combination available for a given clip and
 browser:
 
 | | Index from | Presentation | Frame index |
 | --- | --- | --- | --- |
-| 1. WebCodecs | container | engine-owned canvas | exact |
-| 2. `<video>` + index | container | browser | exact |
+| 1. WebCodecs | container (MP4) | engine-owned canvas | exact |
+| 2. `<video>` + index | container (MP4 or WebM) | browser | exact |
 | 3. `<video>` + declared rate | assumed frame rate | browser | exact only if constant-frame-rate |
 | 4. no `requestVideoFrameCallback` | assumed frame rate | browser | `currentTime * frameRate`; last resort |
 
 Step 2 is the one that usually does not exist. It covers browsers without
 WebCodecs (Safari before 16.4, older Firefox), codecs the platform decoder
-rejects, and any host that needs audio or the battery-friendly hardware overlay
-path — none of which now have to settle for guessing at frame numbers.
+rejects, WebM (whose index carries timestamps but no sample table for WebCodecs
+to decode from), and any host that needs audio or the battery-friendly hardware
+overlay path — none of which now have to settle for guessing at frame numbers.
 
-Step 3 is where a container mp4box cannot parse lands (WebM, Ogg, HLS): the
-element still plays it, and `frameIndexIsExact` tells you the indices are only
-as good as the frame rate you declared.
+Step 3 is where a container we cannot index lands (Ogg, HLS, or a WebM whose
+indexing pass ran out of time): the element still plays it, and
+`frameIndexIsExact` tells you the indices are only as good as the frame rate you
+declared.
+
+### WebM
+
+mp4box only speaks ISOBMFF, so WebM used to land on step 3 and get silently
+wrong frame numbers on any clip that was not really constant-frame-rate. It does
+not have to: Matroska stores every frame's presentation timestamp in plain sight
+(a cluster's timestamp plus each block's signed 16-bit offset from it), so the
+engine reads them itself, skipping every block's payload. No decoding, no
+dependency.
+
+The catch is that Matroska keeps no central sample table — the timestamps live
+next to the frames, and `Cues` indexes only keyframes — so there is no way to
+build the table without a sequential pass over the whole file. That is disk-speed
+for a local `File` and network-speed for a URL, so the pass takes a deadline:
+
+```js
+const engine = await createBestEngine(source, {
+  canvas, video,
+  indexTimeoutMilliseconds: 10000,   // default; Infinity to let it always finish
+  indexMaxBytes: Infinity,           // refuse outsized files before reading them
+});
+```
+
+A clip that blows through the budget falls back to the declared frame rate
+(step 3) rather than making the host wait — `frameIndexIsExact` goes false and
+says so. Neither option affects MP4, which is a handful of range reads however
+long the clip is. The pass yields to the event loop as it goes, so it cannot
+freeze the page.
 
 ## Usage
 
 ```html
-<!-- mp4box.js must be loaded first (provides the MP4Box/DataStream globals). -->
+<!-- mp4box.js must be loaded first to index MP4s (it provides the MP4Box and
+     DataStream globals). WebM indexing is built in and needs nothing. -->
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch. -->
 <script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v1.2.1/exact-video-engine.js"></script>
@@ -164,9 +196,12 @@ for hosts that know the clip's rate from elsewhere (a sidecar file, say) when no
 container index is available. It is ignored when an index is present, which is
 strictly better.
 
-Also exported: `ContainerIndex` (`ContainerIndex.fromSource(source)` builds the
-frame table on its own, for hosts that want the timestamps without an engine),
-and `UrlRangeReader` / `FileRangeReader`, the random-access byte readers.
+Also exported: `ContainerIndex` (`ContainerIndex.fromSource(source, {timeoutMilliseconds,
+maxBytes})` builds the frame table on its own, for hosts that want the timestamps
+without an engine — it sniffs MP4 vs WebM from the bytes, and reports which it
+found in `containerFormat` and whether the result is rich enough to decode from
+in `supportsWebCodecs`), and `UrlRangeReader` / `FileRangeReader`, the
+random-access byte readers.
 
 ### Notes on the fallback's exactness
 
@@ -253,7 +288,7 @@ bash test/run-tests.sh
 engine and a native `<video>` element and compares where an asymmetric marker
 lands.
 
-**Frame index** walks every frame of three clips through each engine and checks
+**Frame index** walks every frame of five clips through each engine and checks
 that asking for frame `n` both puts frame `n` on screen and reports frame `n`
 back. Ground truth is the pixels: each frame identifies itself by the position
 of a white bar, so nothing is taken on trust from a clock. The clips are chosen
@@ -263,6 +298,11 @@ to make the fallback's exactness falsifiable:
   30 frames when it can only assume a constant frame rate — and, worse, keeps
   reporting the frame you asked for while showing a different one. With the
   container index it gets all 30 right.
+- `counter-vfr.webm` is the same 30 frames in a container mp4box cannot parse, so
+  it exercises the engine's own Matroska scan: mismapped 25 of 30 by an assumed
+  frame rate, exact once the cluster timestamps are read. Running it with
+  `indexTimeoutMilliseconds: 0` also pins the bail-out — no time to index means
+  falling back to the declared rate, not failing.
 - `counter-elst.mp4` carries an edit list, so its first frame presents at
   `mediaTime` 0.133 rather than 0. It passes only if the timeline calibration is
   genuinely finding that offset instead of getting away with a zero one.

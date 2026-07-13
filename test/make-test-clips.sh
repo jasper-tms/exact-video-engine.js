@@ -45,6 +45,18 @@ ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
     -fps_mode passthrough -video_track_timescale 1000 \
     -pix_fmt yuv420p -c:v libx264 -qp 0 -g 10 clips/counter-vfr.mp4
 
+# The same 30 frames again, in WebM. mp4box cannot parse this container at all,
+# so these clips are what prove the engine's own Matroska cluster scan: without
+# it counter-vfr.webm can only be mapped by an assumed constant frame rate, which
+# is wrong for it. VP9 lossless, so the bars stay exactly where they were drawn.
+ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
+    -pix_fmt yuv420p -c:v libvpx-vp9 -lossless 1 -g 10 clips/counter-cfr.webm
+
+ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
+    -vf "settb=1/1000,setpts='33*N + 33*floor(N/5)'" \
+    -fps_mode passthrough \
+    -pix_fmt yuv420p -c:v libvpx-vp9 -lossless 1 -g 10 clips/counter-vfr.webm
+
 # A clip carrying an edit list, so the element's timeline does NOT start at zero
 # (its first frame reports mediaTime 0.133, not 0). Output-side -ss with stream
 # copy writes the elst; the cut snaps forward to the next keyframe, which with
