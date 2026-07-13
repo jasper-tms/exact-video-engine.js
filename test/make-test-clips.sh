@@ -78,5 +78,16 @@ ffmpeg -y -loglevel error -f lavfi \
     -pix_fmt yuv420p -c:v libx264 -preset ultrafast -qp 26 -g 30 \
     -movflags +faststart clips/startup.mp4
 
+# A few MB, and its moov at the END (no +faststart) -- the shape of a real phone
+# clip, and the one the byte budgets above are blind to. Opening it is a chain of
+# dependent reads, and on a bucket 400 ms away the round trips ARE the load time
+# however few bytes they carry: a 2.6 MB clip took eight of them, and four
+# seconds, while every byte budget passed. Small enough that the engine should
+# stop chasing ranges and just take the file.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "nullsrc=s=320x180:d=5:r=30,geq=random(1)*255:128:128" \
+    -pix_fmt yuv420p -c:v libx264 -preset ultrafast -qp 34 -g 30 \
+    clips/midsize.mp4
+
 echo "Wrote test clips:"
 ls clips

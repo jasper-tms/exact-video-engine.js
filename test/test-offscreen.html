@@ -7,7 +7,7 @@
 // A host with no pane at all: it wants pixels, not playback. It builds a canvas
 // with document.createElement, never puts it in the document, loads a clip, and
 // pulls frames out with bitmapForFrame(). Generating a thumbnail from a video
-// the user is uploading is the real case (movim-website does exactly this).
+// the user is uploading is the real case.
 //
 // The bug: _syncCanvasSize() read clientWidth off canvas.parentElement, which is
 // null for a canvas that was never appended to anything. The TypeError came out

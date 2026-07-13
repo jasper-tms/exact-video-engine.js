@@ -12,6 +12,27 @@
 import { chromium } from 'playwright';
 
 const FILE = 'startup.mp4';
+// A few MB with its moov at the end: a phone clip, and the case the byte budgets
+// are blind to. Opening one from a cloud bucket took EIGHT serialized range
+// requests -- the first asking for 1 byte, the second for 4 -- and with 400 ms of
+// round-trip time that was four seconds of empty pane for a clip smaller than
+// most photos. Every byte budget passed throughout: bytes were never the problem.
+const SMALL_FILE = 'midsize.mp4';
+
+// A round trip is the unit of cost against a distant origin, and these are
+// chained: each read's offset comes from the last one's bytes, so they cannot be
+// issued in parallel and the latencies add up. One read to take the head (which
+// carries the size and the magic number for free), one for the rest.
+const SMALL_REQUEST_BUDGET = 2;
+// A big clip cannot be swallowed whole, so it pays for the head (size and magic
+// number included) and the frame, with one spare for a moov at the end. Set to
+// what the engine actually needs and no more: at 4 this passed against the very
+// chain it was written to shorten.
+const LARGE_REQUEST_BUDGET = 3;
+// The whole-file shortcut has to stay a SHORTCUT. If this fixture ever grows
+// past the engine's threshold the test would silently start measuring the range
+// path instead, and pass for the wrong reason.
+const SMALL_FIXTURE_MAX_BYTES = 8 << 20;
 
 // One keyframe of 640x360 noise, plus slack. The old engine spent 4 MB + the
 // index here; anything near that means the flat block is back.
@@ -40,7 +61,7 @@ function report(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'} startup ${name}: ${detail}`);
 }
 
-async function measure(mode) {
+async function measure(mode, file = FILE) {
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.log('pageerror:', e.message));
   const client = await page.context().newCDPSession(page);
@@ -50,7 +71,7 @@ async function measure(mode) {
     uploadThroughput: DOWNLOAD_BITS_PER_SECOND / 8,
     latency: LATENCY_MS,
   });
-  await page.goto(`http://localhost:8798/test/test-startup.html?file=${FILE}&mode=${mode}`);
+  await page.goto(`http://localhost:8798/test/test-startup.html?file=${file}&mode=${mode}`);
   await page.waitForFunction(() => window.__result || window.__err, { timeout: 180000 })
     .catch(() => {});
   const { result, err } = await page.evaluate(
@@ -102,6 +123,34 @@ try {
     + (quiet ? '' : ' — read-ahead ran anyway, so the option did nothing'));
 } catch (error) {
   report('window-ahead', false, String(error.message || error));
+}
+
+// Round trips, which is the cost no byte budget above can see. Not throttled and
+// not timed: latency is the point, and asserting on wall clock against localhost
+// would just measure the machine. Count the requests instead — that number is
+// what a distant bucket multiplies by its round-trip time.
+for (const [name, file, budget] of [
+  ['round-trips small', SMALL_FILE, SMALL_REQUEST_BUDGET],
+  ['round-trips large', FILE, LARGE_REQUEST_BUDGET],
+]) {
+  try {
+    const result = await measure('round-trips', file);
+    const isSmall = file === SMALL_FILE;
+    if (isSmall && result.fileBytes > SMALL_FIXTURE_MAX_BYTES) {
+      report(name, false, `${file} is ${megabytes(result.fileBytes)}, past the `
+        + 'engine\'s whole-file threshold, so this no longer tests the shortcut '
+        + '(regenerate test/clips)');
+      continue;
+    }
+    const withinBudget = result.requestsForFrame <= budget;
+    report(name, withinBudget && result.decoded,
+      `opening ${file} (${megabytes(result.fileBytes)}) took `
+      + `${result.requestsForFrame} request(s) and ${megabytes(result.bytesForFrame)} `
+      + `(budget ${budget})`
+      + (result.decoded ? '' : ' — FRAME NOT DECODED'));
+  } catch (error) {
+    report(name, false, String(error.message || error));
+  }
 }
 
 await browser.close();

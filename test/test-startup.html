@@ -31,11 +31,16 @@
 //                      able to stop paying for 2 s of read-ahead.
 const KEYFRAME_INTERVAL = 30;   // -g 30 in make-test-clips.sh
 
-// Every byte the engine reads goes through fetch(), so wrapping it counts them.
+// Every byte the engine reads goes through fetch(), so wrapping it counts them --
+// and counts the REQUESTS too, which is the other half of what a load costs and
+// the half a localhost test cannot feel. Each range read is a round trip; against
+// a real bucket that is ~400 ms whether it carries one byte or a megabyte.
 let bytesFetched = 0;
+let requestsMade = 0;
 const originalFetch = window.fetch;
 window.fetch = async (...args) => {
   const response = await originalFetch(...args);
+  requestsMade += 1;
   const clone = response.clone();
   const buffer = await clone.arrayBuffer();
   bytesFetched += buffer.byteLength;
@@ -49,6 +54,25 @@ async function run() {
   const mode = params.get('mode');
   const canvas = document.querySelector('canvas');
   const url = 'clips/' + params.get('file');
+
+  if (mode === 'round-trips') {
+    // Runs FIRST, before anything else touches this URL: it counts requests, and
+    // a request the browser answers from its own HTTP cache is a request this
+    // test would never see. Nothing is prebuilt and nothing is throttled -- the
+    // question is only how many times opening the clip goes to the server, which
+    // no byte budget can answer and which is the whole cost against a distant
+    // bucket.
+    const engine = new VideoEngine(canvas);
+    await engine.load(url);
+    window.__result = {
+      requestsForFrame: requestsMade,
+      bytesForFrame: bytesFetched,
+      fileBytes: engine._reader ? engine._reader.size : 0,
+      decoded: Boolean(engine.bitmapForFrame(0)),
+    };
+    engine.destroy();
+    return;
+  }
 
   // The index is a fixed cost every mode pays; measuring it separately keeps the
   // budgets below about the FRAME, not about the moov.

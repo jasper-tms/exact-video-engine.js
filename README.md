@@ -191,6 +191,21 @@ nothing, and you take frames from `bitmapForFrame(n)` after `ensureFrame(n)`.
 `createBestEngine` reported as an unplayable clip and fell back to `<video>`
 for.)
 
+### Opening a clip
+
+Opening a clip is a chain of *dependent* reads — learn the size, sniff the
+container, find the moov, read the frame — so they cannot be issued in parallel
+and their latencies add up. Against a bucket a few hundred milliseconds away
+(Firebase Storage, Cloud Storage), those round trips are the load time, whatever
+few bytes they carry.
+
+So the first read is speculative and generous: one 256 KB range read answers the
+file's size (every `206` names it in `Content-Range`), its magic number, and — for
+a faststart MP4 — its whole `moov`. And a clip small enough to be worth having
+outright (under 8 MB) is fetched outright rather than groped through one range at
+a time, since anything scrubbing it will read most of it anyway. Opening a
+typical few-MB clip costs **two** requests; a large one, two or three.
+
 ### Read-ahead
 
 `VideoEngine` decodes a window around the playhead so that playback and short
@@ -353,13 +368,22 @@ a thumbnail grab does, and asserts on the tier as well as the pixels: falling
 back to `<video>` still produces a correct-looking thumbnail, so a test that only
 looked at the image would not notice the WebCodecs path having quietly broken.
 
-**Startup** counts the bytes and seconds between opening a clip and having a
-frame, over a throttled link, against a 37 MB fixture. No correctness test can
-see this — the frames were exactly right while the engine was blocking the first
-one on a 4 MB read, which is invisible on localhost and seconds of blank pane on
-a phone. It also pins `windowAhead: 0` down to an absolute byte budget, since an
-engine that ignores the option entirely can still be caught out "using less than
-the default" by timing luck.
+**Startup** counts what opening a clip costs, in the two currencies that are not
+frame numbers.
+
+*Bytes and seconds*, over a throttled link, against a 37 MB fixture: the frames
+were exactly right while the engine was blocking the first one on a 4 MB read,
+which is invisible on localhost and seconds of blank pane on a phone. It also
+pins `windowAhead: 0` down to an absolute byte budget, since an engine that
+ignores the option entirely can still be caught out "using less than the default"
+by timing luck.
+
+*Round trips*, which no byte budget can see and which localhost charges nothing
+for. A 2.6 MB clip served from a cloud bucket took eight serialized range requests
+to open — the first asking for 1 byte, the second for 4 — and at 400 ms of
+round-trip time that was four seconds of empty pane while every byte budget
+passed. The test counts requests rather than timing them, because latency is the
+point and a stopwatch against localhost would only measure the machine.
 
 ## License
 
