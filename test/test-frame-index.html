@@ -3,10 +3,10 @@
 <title>exact-video-engine frame-index test</title>
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <script src="/exact-video-engine.js"></script>
-<!-- Sized to the clips' exact aspect (160x90) so nothing is letterboxed and the
+<!-- Sized to the clips' exact aspect (150x90) so nothing is letterboxed and the
      bar's position in the rendering maps straight back to its position in the
      source frame. -->
-<div id="pane" style="width: 160px; height: 90px">
+<div id="pane" style="width: 150px; height: 90px">
   <canvas id="engine-canvas"></canvas>
 </div>
 <video id="native-video" muted playsinline></video>
@@ -14,7 +14,7 @@
 // Walks ?file=<clip> frame by frame through the engine named by ?mode=, and for
 // each frame records BOTH what the engine says is on screen and what is
 // actually on screen. The clips identify each frame by the position of a white
-// bar (frame n -> bar at x = 5n of 160), so "what is actually on screen" is
+// bar (frame n -> bar at x = 5n of 150), so "what is actually on screen" is
 // recoverable from the pixels with no trust in any clock.
 //
 //   mode=webcodecs        WebCodecs engine (decodes every frame itself)
@@ -28,7 +28,10 @@
 // against are 30 frames at a nominal 30 fps).
 const DECLARED_FRAME_RATE = 30;
 const DECLARED_NUM_FRAMES = 30;
-const BARS_ACROSS = 32;   // 160 px / 5 px per bar
+// The clips are drawn 5 px per bar across 150 px, i.e. exactly one bar slot per
+// frame, so every column of the image belongs to some frame and the last frame's
+// bar reaches the right edge.
+const BARS_ACROSS = 30;
 
 // The frame the pixels say is showing: find the bar (columns brighter than
 // half), take its centre, and convert that to a bar index. Reading the centre
@@ -47,7 +50,7 @@ function visibleFrame(canvas) {
 }
 
 const probe = document.createElement('canvas');
-probe.width = 160;
+probe.width = 150;
 probe.height = 90;
 const probeContext = probe.getContext('2d');
 

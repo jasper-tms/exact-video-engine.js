@@ -7,7 +7,10 @@
   /* The pane starts with no layout box at all, which is the whole point: a host
      that reveals its player only once the clip is ready (as the demo page does)
      loads the engine into a pane that measures 0x0. */
-  #pane { width: 320px; height: 180px; }
+  /* The counter clips' aspect (150x90), doubled: the engine letterboxes, so a
+     pane of any other aspect would inset the frame and move the bar away from
+     where visibleFrame() below expects to read it. */
+  #pane { width: 300px; height: 180px; }
   #pane.hidden { display: none; }
 </style>
 <div id="pane" class="hidden">
@@ -39,7 +42,7 @@
 // doing so repairs the canvas even in the broken engine, so a case that did
 // would pass either way and prove nothing.
 const TEST_FRAME = 7;     // not 0, so a stuck-on-first-frame canvas fails too
-const BARS_ACROSS = 32;   // the clips are 160px wide with a 5px bar per frame
+const BARS_ACROSS = 30;   // the clips are 150px wide with a 5px bar per frame
 
 // The clips identify each frame by the position of a white bar, so the frame on
 // screen is recoverable from the pixels alone. Reading the bar's centre rather

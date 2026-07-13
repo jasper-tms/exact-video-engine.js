@@ -10,6 +10,10 @@
 # white bar (frame n puts a 5-pixel bar at x = 5n, on black). The index is read
 # back from the bar's position rather than a pixel value, so it survives the
 # browser's YUV-to-RGB conversion exactly, which a brightness code would not.
+# The frame is 150 pixels wide so that the 30 frames tile it exactly, one bar
+# slot each: frame 0's bar sits flush against the left edge and frame 29's flush
+# against the right, and no column of the image belongs to no frame. Keep the
+# width at 5 * the frame count if either ever changes.
 # Two versions of the same 30 frames:
 #   counter-cfr.mp4  constant 30 fps
 #   counter-vfr.mp4  variable: 33 ms per frame, but every 5th frame is held for
@@ -30,7 +34,7 @@ done
 
 # -qp 0 (lossless) so the bar's edges stay exactly where they were drawn.
 ffmpeg -y -loglevel error -f lavfi \
-    -i "color=c=black:s=160x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+    -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
     -pix_fmt yuv420p -c:v libx264 -qp 0 -g 10 clips/counter-cfr.mp4
 
 # settb pins the timebase to milliseconds so the setpts expression below is in
