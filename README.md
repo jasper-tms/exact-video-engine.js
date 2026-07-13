@@ -252,14 +252,24 @@ sweeping them into the release commit.
 
 ### Getting the hook to run
 
-Git does not run hooks out of the working tree — they live in `.git/hooks`,
-which is not part of the repository — so `.githooks/pre-commit` needs one of:
+Git never runs hooks out of the working tree. They live in `.git/hooks`, which
+is not part of the repository and is not cloned — deliberately, so that cloning
+a repo cannot make it execute code on your next commit. A checked-in
+`.githooks/pre-commit` therefore does nothing on its own, and needs one of:
 
-- **Nothing at all**, if you use the
-  [shell-configs](https://github.com/jasper-tms/shell-configs) global hook
-  dispatcher: it discovers `.githooks/<hook-name>` in any repo of your own and
-  runs it.
-- Otherwise, once per clone:
+- **Nothing**, if you use the [shell-configs](https://github.com/jasper-tms/shell-configs)
+  global hook dispatcher *and* this repo's `origin` is an account you listed in
+  its `git-hooks/trusted-remotes`. The dispatcher finds `.githooks/<hook-name>`
+  by itself.
+- **One command**, if you use that dispatcher but this repo is not one of yours
+  (you cloned or forked it, so `jasper-tms` is not in your trusted list). The
+  dispatcher will otherwise skip the hook and say so on stderr:
+
+  ```sh
+  git config hooks.allowRepoHooks true
+  ```
+
+- **A symlink**, if you do not use that dispatcher at all:
 
   ```sh
   ln -s ../../.githooks/pre-commit .git/hooks/pre-commit
@@ -267,7 +277,7 @@ which is not part of the repository — so `.githooks/pre-commit` needs one of:
 
 Do **not** point `core.hooksPath` at `.githooks`. It would work, but only by
 shadowing whatever global hooks you already have, silently and everywhere in
-this repo.
+this repo — which is exactly the failure the dispatcher exists to avoid.
 
 If the hook never runs, nothing breaks — it only gets noisier. The release
 workflow re-derives the pins with `.githooks/sync_version.sh --check` and
