@@ -38,6 +38,14 @@ const MINIMUM_FIXTURE_WIDTH = 1920;
 // Playback has to actually get somewhere: an engine that decoded nothing holds
 // no memory and would sail through any budget.
 const MINIMUM_FRAMES_PLAYED = 30;
+// And it has to get somewhere ON SCREEN. Four seconds of playback presents well
+// over a hundred frames; anything near zero is a frozen picture.
+const MINIMUM_FRAMES_PRESENTED = 30;
+// A host with no read-ahead at all (a scrubbing tool, say). The engine must
+// still paint every frame it plays, which means the decode driver has to cope
+// with a target that is not out of the decoder yet -- the case a deep read-ahead
+// hides, and the one the byte budget walks into on a big clip.
+const NO_READ_AHEAD = 0;
 
 const browser = await chromium.launch();
 let failures = 0;
@@ -47,10 +55,20 @@ function report(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'} memory ${name}: ${detail}`);
 }
 
-async function measure(file, cacheBytes) {
+async function measure(file, options = {}) {
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.log('pageerror:', e.message));
-  const query = cacheBytes ? `&cacheBytes=${cacheBytes}` : '';
+  // The engine reports a dead decode driver by console.error and then quietly
+  // holds the last frame, so a test that only reads the engine's own numbers
+  // sees a healthy playhead over a frozen picture. Watch the console too.
+  const driverErrors = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error' && /decode driver/.test(message.text())) {
+      driverErrors.push(message.text());
+    }
+  });
+  const query = Object.entries(options)
+    .map(([key, value]) => `&${key}=${value}`).join('');
   await page.goto(`http://localhost:8798/test/test-memory.html?file=${file}${query}`);
   await page.waitForFunction(() => window.__result || window.__err, { timeout: 120000 })
     .catch(() => {});
@@ -58,7 +76,7 @@ async function measure(file, cacheBytes) {
     () => ({ result: window.__result, err: window.__err }));
   await page.close();
   if (err || !result) throw new Error(err || 'no result (timed out)');
-  return result;
+  return { ...result, driverErrors };
 }
 
 const megabytes = (bytes) => `${(bytes / (1 << 20)).toFixed(0)} MB`;
@@ -70,15 +88,33 @@ function overBudget(result, budget) {
   return result.peakBytes > budget + oneFrame;
 }
 
+// Playback means the PICTURE moved, which is a different question from whether
+// the playhead moved. When the frame the playhead is on has not been decoded,
+// the engine holds the last one it painted -- so a driver that has died leaves
+// the playhead, the frame counter and the scrubber all running perfectly over a
+// still image. Count the frames that actually reached the canvas.
 function playedProperly(result) {
-  return result.frameShown && result.playedToFrame >= MINIMUM_FRAMES_PLAYED;
+  return result.frameShown
+    && result.playedToFrame >= MINIMUM_FRAMES_PLAYED
+    && result.framesPresented >= MINIMUM_FRAMES_PRESENTED
+    && result.driverErrors.length === 0;
+}
+
+function playbackDetail(result) {
+  if (result.driverErrors.length) return ` — DECODE DRIVER DIED: ${result.driverErrors[0]}`;
+  if (result.framesPresented < MINIMUM_FRAMES_PRESENTED) {
+    return ` — PICTURE FROZE: only ${result.framesPresented} distinct frames `
+      + `reached the canvas while the playhead ran to frame ${result.playedToFrame}`;
+  }
+  if (result.playedToFrame < MINIMUM_FRAMES_PLAYED) return ' — PLAYBACK DID NOT RUN';
+  return '';
 }
 
 // The regression itself: big frames, default settings, and the memory the engine
 // holds while playing them. This is the number that took the iPhone decoder down.
 try {
   const name = '1080p stays inside the budget';
-  const result = await measure(LARGE_FILE, undefined);
+  const result = await measure(LARGE_FILE);
   if (result.videoWidth < MINIMUM_FIXTURE_WIDTH) {
     report(name, false, `${LARGE_FILE} is only ${result.videoWidth}px wide; a `
       + 'memory budget against small frames proves nothing (regenerate test/clips)');
@@ -88,9 +124,9 @@ try {
       `playing ${result.videoWidth}x${result.videoHeight} held at most `
       + `${megabytes(result.peakBytes)} in ${result.peakFrames} frames `
       + `(budget ${megabytes(DEFAULT_CACHE_BYTES)}), window ${result.windowBack} `
-      + `back / ${result.windowAhead} ahead, reached frame ${result.playedToFrame} `
-      + `of ${result.numFrames}`
-      + (playedProperly(result) ? '' : ' — PLAYBACK STALLED'));
+      + `back / ${result.windowAhead} ahead, painted ${result.framesPresented} `
+      + `frames through frame ${result.playedToFrame} of ${result.numFrames}`
+      + playbackDetail(result));
   }
 } catch (error) {
   report('1080p stays inside the budget', false, String(error.message || error));
@@ -101,7 +137,7 @@ try {
 // window to nothing, and then 360p playback would stutter for no reason.
 try {
   const name = 'small frames keep full read-ahead';
-  const result = await measure(SMALL_FILE, undefined);
+  const result = await measure(SMALL_FILE);
   const kept = result.windowAhead === DEFAULT_WINDOW_AHEAD;
   const ok = kept && !overBudget(result, DEFAULT_CACHE_BYTES) && playedProperly(result);
   report(name, ok,
@@ -118,7 +154,7 @@ try {
 // the memory goes.
 try {
   const name = 'host lowers the ceiling';
-  const result = await measure(SMALL_FILE, CUSTOM_CACHE_BYTES);
+  const result = await measure(SMALL_FILE, { cacheBytes: CUSTOM_CACHE_BYTES });
   const cut = result.windowAhead < DEFAULT_WINDOW_AHEAD;
   const ok = cut && !overBudget(result, CUSTOM_CACHE_BYTES) && playedProperly(result);
   report(name, ok,
@@ -126,9 +162,29 @@ try {
     + `${megabytes(result.peakBytes)} in ${result.peakFrames} frames, read-ahead `
     + `cut to ${result.windowAhead}`
     + (cut ? '' : ' — the option did nothing')
-    + (playedProperly(result) ? '' : ' — PLAYBACK STALLED'));
+    + playbackDetail(result));
 } catch (error) {
   report('host lowers the ceiling', false, String(error.message || error));
+}
+
+// The case the whole suite was blind to. Every other test hands the engine a
+// deep read-ahead, so the frame it wants has long since come out of the decoder
+// by the time it is asked for. Take the read-ahead away and the driver meets the
+// frame it is waiting on still inside the decoder -- and it used to answer that
+// by flushing, which leaves the decoder demanding a key frame, so the next delta
+// sample threw and killed the driver. The picture then froze while the playhead,
+// the frame counter and the scrubber all kept running: correct-looking numbers
+// over a still image, which is why nothing here caught it.
+try {
+  const name = 'no read-ahead still paints frames';
+  const result = await measure(LARGE_FILE, { windowAhead: NO_READ_AHEAD });
+  report(name, playedProperly(result),
+    `windowAhead 0 painted ${result.framesPresented} frames through frame `
+    + `${result.playedToFrame} of ${result.numFrames}, worst lag `
+    + `${result.worstLag} frames`
+    + playbackDetail(result));
+} catch (error) {
+  report('no read-ahead still paints frames', false, String(error.message || error));
 }
 
 await browser.close();

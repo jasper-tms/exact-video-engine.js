@@ -832,6 +832,12 @@ const WINDOW_SLACK = 8;
 // that cannot hold the frame being decoded plus its neighbours would evict its
 // own read-ahead and thrash.
 const MINIMUM_WINDOW_FRAMES = 4;
+// How far past a frame we keep feeding the decoder before concluding the frame
+// is not going to come out. Decoders hold frames back to settle display order,
+// so a frame we asked for can legitimately lag the samples we fed by a few — but
+// only a few. Past this, it is not in the pipeline: it was decoded earlier and
+// evicted, and it has to be decoded again rather than waited for.
+const REORDER_DEPTH = 16;
 
 // ==================================================================
 // VideoEngine — WebCodecs. Authoritative: we decide which frame is on screen.
@@ -886,6 +892,11 @@ class VideoEngine extends EventTarget {
     // around the playhead. Decoding streams forward from a keyframe and only
     // restarts (reset + reconfigure + decode forward) on a backward seek.
     this._cache = new Map();          // displayIndex -> ImageBitmap
+    // Frames the decoder has emitted whose ImageBitmap is still being made
+    // (createImageBitmap is async). They are on their way into the cache, so the
+    // driver must not read their absence from _cache as "never decoded" and go
+    // decode them all over again.
+    this._pending = new Set();        // displayIndex
     // What the host would LIKE to hold: frames behind the playhead (a backward
     // scrub is then free) and ahead of it (playback doesn't stall on the
     // decoder). These are wishes, not the budget — _sizeWindows() cuts them to
@@ -915,6 +926,7 @@ class VideoEngine extends EventTarget {
     this._displayCapPixels = 1920;
     this._runKeyframe = -1;           // decode index the current decode run began at
     this._fedThrough = -1;            // highest decode index fed to the decoder
+    this._drained = false;            // flushed: the decoder now demands a key frame
     this._target = 0;                 // display frame the driver is steering toward
     this._driving = false;            // a _drive() loop is active
     this._restartTarget = -1;         // circuit-breaker: target of the last restart
@@ -1135,12 +1147,17 @@ class VideoEngine extends EventTarget {
     if (width !== frame.displayWidth || height !== frame.displayHeight) {
       options = { resizeWidth: width, resizeHeight: height, resizeQuality: 'medium' };
     }
+    this._pending.add(displayIndex);
     createImageBitmap(frame, options).then((bitmap) => {
       frame.close();
+      this._pending.delete(displayIndex);
       if (cacheRef !== this._cache || cacheRef.has(displayIndex)) { bitmap.close(); return; }
       cacheRef.set(displayIndex, bitmap);
       this._evict();
-    }).catch(() => { try { frame.close(); } catch (e) { /* already closed */ } });
+    }).catch(() => {
+      this._pending.delete(displayIndex);
+      try { frame.close(); } catch (e) { /* already closed */ }
+    });
   }
 
   _evict() {
@@ -1188,14 +1205,40 @@ class VideoEngine extends EventTarget {
         // frames ahead of the target (so playback doesn't stall every frame).
         const aheadFrame = Math.min(this.numFrames - 1, target + this._windowAhead);
         const decodeGoal = Math.max(targetDecode, this._displayToDecode[aheadFrame]);
+        const lastSample = this._samples.length - 1;
+        // Decoded, or decoded and still becoming an ImageBitmap. Either way it is
+        // coming, and re-decoding it would be wasted work.
+        const haveTarget = this._cache.has(target) || this._pending.has(target);
 
         // Hard restart when the target lives in a different GOP than the current
-        // run. Backward seeks within the same GOP are handled below (after a
-        // flush confirms the frame was evicted, not merely pending).
+        // run. Backward seeks within the same GOP are handled below.
         if (this._runKeyframe !== keyframe) this._restartRun(keyframe);
 
         // Need more frames decoded? Feed the next sample (in decode order).
-        if (this._fedThrough < decodeGoal) {
+        //
+        // Past the read-ahead goal, keep feeding while the target itself has not
+        // surfaced. A decoder holds a frame back until enough LATER samples have
+        // arrived to settle the display order (B-frames), so more samples -- not
+        // a flush -- are what shake it loose. Flushing here instead would empty
+        // the decoder and leave it demanding a key frame, which the next delta
+        // sample is not: it throws, and the driver dies with the picture frozen
+        // on whatever frame was last painted. That was survivable only while the
+        // read-ahead was so deep the target always surfaced before we reached
+        // the goal; it is the ordinary case once the byte budget cuts the window
+        // on a big clip.
+        //
+        // Bounded by REORDER_DEPTH: a decoder holds only a few frames back, so
+        // once we are well past the target with nothing to show for it, the frame
+        // is not in the pipeline at all -- it came out earlier and was evicted
+        // (a backward seek), and feeding forward would read to the end of the
+        // clip to find something that is behind us.
+        const stillComing = !haveTarget
+          && this._fedThrough < lastSample
+          && this._fedThrough < targetDecode + REORDER_DEPTH;
+        if (this._fedThrough < decodeGoal || stillComing) {
+          // A drained decoder accepts nothing but a key frame, and the next
+          // sample in decode order is a delta. Begin the run again.
+          if (this._drained) { this._restartRun(keyframe); continue; }
           // Keep few chunks in flight so few decoded frames (which may be 4K)
           // coexist before we downscale + cache them.
           if (this._videoDecoder.decodeQueueSize > 4) { await this._sleep(0); continue; }
@@ -1220,26 +1263,30 @@ class VideoEngine extends EventTarget {
           continue;
         }
 
-        // Fed through the goal. If the target hasn't surfaced yet, it may be
-        // stuck in the decoder's reorder buffer — flush to force it out.
-        if (!this._cache.has(target) && this._target === target) {
-          await this._videoDecoder.flush();
-          if (this._target !== target) continue;       // playhead moved; re-evaluate
-          if (!this._cache.has(target)) {
-            // Fed every dependency and flushed, yet the target never cached. It
-            // was decoded earlier and evicted (a backward seek beyond the
-            // window): re-decode from the keyframe. Guard against an impossible
-            // target so a bad frame can't spin the loop forever.
-            if (this._restartTarget === target && ++this._restartCount > 2) {
-              console.warn(`VideoEngine: cannot decode frame ${target}; holding`);
-              this._stalledFrame = target;
-              this._driving = false;
-              return;
-            }
-            if (this._restartTarget !== target) { this._restartTarget = target; this._restartCount = 0; }
-            this._restartRun(keyframe);
-            continue;
+        if (!haveTarget && this._target === target) {
+          // The clip has no sample left to feed and the target still has not come
+          // out: it is held in the pipeline with nothing later to release it. Only
+          // here is a flush the right instrument -- it drains what is held. The run
+          // is over afterwards (the decoder now wants a key frame), so forget it:
+          // anything further restarts from a keyframe.
+          if (this._fedThrough >= lastSample && !this._drained) {
+            await this._videoDecoder.flush();
+            this._drained = true;
+            if (this._target !== target) continue;     // playhead moved; re-evaluate
+            if (this._cache.has(target) || this._pending.has(target)) continue;
           }
+          // The target was decoded earlier and evicted (a backward seek beyond
+          // the window), so decode it again from its keyframe. Guard against an
+          // impossible target so a bad frame can't spin the loop forever.
+          if (this._restartTarget === target && ++this._restartCount > 2) {
+            console.warn(`VideoEngine: cannot decode frame ${target}; holding`);
+            this._stalledFrame = target;
+            this._driving = false;
+            return;
+          }
+          if (this._restartTarget !== target) { this._restartTarget = target; this._restartCount = 0; }
+          this._restartRun(keyframe);
+          continue;
         }
 
         // Target is shown and read-ahead is satisfied: idle until next request.
@@ -1256,6 +1303,7 @@ class VideoEngine extends EventTarget {
     this._videoDecoder.configure(this._decoderConfig);
     this._runKeyframe = keyframe;
     this._fedThrough = keyframe - 1;
+    this._drained = false;
   }
 
   // Encoded bytes from sample `from` through sample `through`, inclusive — what
@@ -1451,9 +1499,11 @@ class VideoEngine extends EventTarget {
     // of populating the new clip's cache.
     for (const bitmap of this._cache.values()) bitmap.close();
     this._cache = new Map();
+    this._pending.clear();
     this._driving = false;
     this._runKeyframe = -1;
     this._fedThrough = -1;
+    this._drained = false;
     this._restartTarget = -1;
     this._restartCount = 0;
     this._stalledFrame = -1;

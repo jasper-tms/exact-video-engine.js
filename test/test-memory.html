@@ -44,14 +44,24 @@ async function run() {
   const params = new URLSearchParams(location.search);
   const canvas = document.querySelector('canvas');
   const url = 'clips/' + params.get('file');
-  const cacheBytes = params.get('cacheBytes')
-    ? Number(params.get('cacheBytes')) : undefined;
+  const options = {};
+  if (params.get('cacheBytes')) options.cacheBytes = Number(params.get('cacheBytes'));
+  if (params.get('windowAhead')) options.windowAhead = Number(params.get('windowAhead'));
 
-  const engine = new VideoEngine(canvas, cacheBytes ? { cacheBytes } : {});
+  const engine = new VideoEngine(canvas, options);
   await engine.load(url);
 
   let peakBytes = residentBytes(engine);
   let peakFrames = engine._cache.size;
+
+  // What reached the SCREEN, which is not the same question as what the cache
+  // held. The engine holds the last painted frame whenever the frame the
+  // playhead is on has not been decoded yet, so an engine whose read-ahead is
+  // too thin to keep up paints one frame and then never changes -- while the
+  // playhead, the frame counter and the scrubber all keep advancing, and every
+  // byte budget passes. Count the distinct frames actually presented.
+  const shown = new Set();
+  let worstLag = 0;   // how far the picture fell behind the playhead, in frames
 
   // Drive the engine the way a host does: tick it, let the playhead advance in
   // real time, and sample the cache on every tick. Sampling only at the end
@@ -63,6 +73,8 @@ async function run() {
     engine.update(performance.now());
     const bytes = residentBytes(engine);
     if (bytes > peakBytes) { peakBytes = bytes; peakFrames = engine._cache.size; }
+    shown.add(engine._shownFrame);
+    worstLag = Math.max(worstLag, engine.currentFrame - engine._shownFrame);
     await sleep(TICK_MILLISECONDS);
   }
   engine.pause();
@@ -75,6 +87,8 @@ async function run() {
     playedToFrame: engine.currentFrame,
     numFrames: engine.numFrames,
     frameShown: Boolean(engine.bitmapForFrame(engine.currentFrame)),
+    framesPresented: shown.size,
+    worstLag,
     videoWidth: engine.videoWidth,
     videoHeight: engine.videoHeight,
     windowAhead: engine._windowAhead,
