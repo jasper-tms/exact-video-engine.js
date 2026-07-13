@@ -191,6 +191,26 @@ nothing, and you take frames from `bitmapForFrame(n)` after `ensureFrame(n)`.
 `createBestEngine` reported as an unplayable clip and fell back to `<video>`
 for.)
 
+### Read-ahead
+
+`VideoEngine` decodes a window around the playhead so that playback and short
+seeks come out of memory. The frame you actually asked for is never held up by
+it: `load()` and `ensureFrame(n)` fetch what that one frame needs and resolve,
+and the window fills behind them.
+
+A host that only ever holds still — an offscreen thumbnail grab, a page that
+shows one frame — is paying for read-ahead it will never look at, and can turn
+it down:
+
+```js
+const engine = await createBestEngine(source, { canvas, video, windowAhead: 0 });
+new VideoEngine(canvas, { windowAhead: 0 });   // same option, engine directly
+```
+
+The default (56 frames, about two seconds) is what you want for anything that
+plays. `windowAhead: 0` still decodes the frame you asked for; it just stops
+there.
+
 `NativeVideoEngine` additionally has `setFrameRate(framesPerSecond, numFrames)`,
 for hosts that know the clip's rate from elsewhere (a sidecar file, say) when no
 container index is available. It is ignored when an index is present, which is
@@ -327,6 +347,19 @@ frame on screen must be the one that was asked for. Neither case calls
 `resizeCanvas()` after the reveal, on purpose; doing so would paper over a
 backing store that was mis-sized while the pane had no box, and the case would
 pass whether or not the bug was there.
+
+**Offscreen** runs a clip through a canvas that is not in the document, the way
+a thumbnail grab does, and asserts on the tier as well as the pixels: falling
+back to `<video>` still produces a correct-looking thumbnail, so a test that only
+looked at the image would not notice the WebCodecs path having quietly broken.
+
+**Startup** counts the bytes and seconds between opening a clip and having a
+frame, over a throttled link, against a 37 MB fixture. No correctness test can
+see this — the frames were exactly right while the engine was blocking the first
+one on a 4 MB read, which is invisible on localhost and seconds of blank pane on
+a phone. It also pins `windowAhead: 0` down to an absolute byte budget, since an
+engine that ignores the option entirely can still be caught out "using less than
+the default" by timing luck.
 
 ## License
 
