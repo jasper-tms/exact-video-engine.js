@@ -726,7 +726,17 @@ class VideoEngine extends EventTarget {
   resizeCanvas() { this._syncCanvasSize(); }
 
   _syncCanvasSize() {
+    // No pane at all: the canvas is not in a document tree. That is a real way
+    // to use this engine — a host that only wants pixels (bitmapForFrame) and
+    // never shows the canvas, e.g. generating a thumbnail during an upload — so
+    // it is not an error, it is the 0x0 case below with nothing to measure.
+    // Reading clientWidth off the null parent instead would throw out of
+    // load(), which createBestEngine catches and reports as "WebCodecs cannot
+    // play this clip": a silent, permanent fallback to the <video> element for
+    // every offscreen host, on every clip.
     const pane = this.canvas.parentElement;
+    if (!pane) return;
+
     const dpr = window.devicePixelRatio || 1;
     const width = Math.round(pane.clientWidth * dpr);
     const height = Math.round(pane.clientHeight * dpr);
@@ -737,6 +747,9 @@ class VideoEngine extends EventTarget {
     // 1x1 here (the obvious clamp) would quietly replace the frame with a single
     // pixel of its average colour, which CSS then stretches across the pane: a
     // flat wash that looks like a decode failure but is a layout bug.
+    //
+    // Both early returns self-heal: update() calls this every animation frame,
+    // so a canvas that later gains a parent, or a box, starts painting then.
     if (!width || !height) return;
 
     if (this.canvas.width === width && this.canvas.height === height) return;

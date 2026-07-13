@@ -151,6 +151,14 @@ for a frame (coded orientation, possibly downscaled for display — apply
 cannot hand back a frame you can name. Hosts that need pixels should check
 `frameIndexIsExact` first.
 
+This is also how you use `VideoEngine` with no UI at all — to pull a thumbnail
+out of a video someone is uploading, say. Hand it a canvas that is not in the
+document; with no pane to size itself to, it leaves the canvas alone and paints
+nothing, and you take frames from `bitmapForFrame(n)` after `ensureFrame(n)`.
+(Before v1.2.1 a canvas with no parent element threw out of `load()`, which
+`createBestEngine` reported as an unplayable clip and fell back to `<video>`
+for.)
+
 `NativeVideoEngine` additionally has `setFrameRate(framesPerSecond, numFrames)`,
 for hosts that know the clip's rate from elsewhere (a sidecar file, say) when no
 container index is available. It is ignored when an index is present, which is

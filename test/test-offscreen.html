@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine offscreen test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<script>
+// A host with no pane at all: it wants pixels, not playback. It builds a canvas
+// with document.createElement, never puts it in the document, loads a clip, and
+// pulls frames out with bitmapForFrame(). Generating a thumbnail from a video
+// the user is uploading is the real case (movim-website does exactly this).
+//
+// The bug: _syncCanvasSize() read clientWidth off canvas.parentElement, which is
+// null for a canvas that was never appended to anything. The TypeError came out
+// of load(), and createBestEngine catches load() failures and treats them as
+// "WebCodecs cannot play this clip" — so every offscreen host silently and
+// permanently fell back to the <video> element, on every clip.
+//
+// What made it invisible: the fallback still WORKS. The <video> element decodes
+// the clip, the host gets its thumbnail, the pixels are right. The only symptom
+// is that the good engine was never used, which nothing observable reports. So
+// this test asserts on the TIER as well as on the pixels — a pixels-only test
+// passes against the bug.
+//
+//   mode=no-parent     canvas never appended to anything (parentElement is null)
+//   mode=detached      canvas inside a detached div: parentElement exists but
+//                      measures 0x0. The workaround a host stumbles into, and
+//                      the case that must keep working.
+const TEST_FRAME = 7;     // not 0, so a stuck-on-first-frame engine fails too
+const BARS_ACROSS = 30;   // the clips are 150px wide with a 5px bar per frame
+
+// Frame n of the counter clips is a white bar at x = 5n, so the frame a bitmap
+// holds is recoverable from its pixels alone.
+function frameInBitmap(bitmap) {
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const context = canvas.getContext('2d');
+  context.drawImage(bitmap, 0, 0);
+  const row = context.getImageData(0, Math.floor(bitmap.height / 2), bitmap.width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < bitmap.width; x++) {
+    if (row[x * 4] > 128) { sum += x; count += 1; }
+  }
+  if (!count) return -1;
+  return Math.floor((sum / count) / (bitmap.width / BARS_ACROSS));
+}
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const mode = params.get('mode');
+
+  const canvas = document.createElement('canvas');
+  if (mode === 'detached') document.createElement('div').appendChild(canvas);
+
+  const source = await (await fetch('clips/' + params.get('file'))).blob();
+
+  // prefer: 'webcodecs' is a preference, not a demand — createBestEngine falls
+  // back to the <video> element when the WebCodecs engine cannot load. That is
+  // what silently swallowed the crash, so the tier below is the real assertion.
+  const engine = await createBestEngine(source, { canvas, prefer: 'webcodecs' });
+  await engine.ensureFrame(TEST_FRAME);
+
+  const bitmap = engine.bitmapForFrame ? engine.bitmapForFrame(TEST_FRAME) : null;
+  window.__result = {
+    tier: engine.tier,
+    hasBitmap: Boolean(bitmap),
+    frameInBitmap: bitmap ? frameInBitmap(bitmap) : -1,
+    askedFor: TEST_FRAME,
+    // The engine has no pane to size to, so it must leave the canvas alone
+    // rather than paint into it.
+    canvasSize: [canvas.width, canvas.height],
+  };
+  engine.destroy();
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>
