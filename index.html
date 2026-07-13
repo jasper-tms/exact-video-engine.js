@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>exact-video-engine.js — demo</title>
+
+<!-- Loaded exactly the way the real consumers (SportViewer, movim.ai) load it:
+     mp4box.js first, so the MP4Box/DataStream globals exist, then the engine
+     from a PINNED release tag. Never reference @main — jsDelivr caches branch
+     refs for hours, so the page would change behavior at unpredictable times
+     with no commit anywhere. -->
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v1.0.1/exact-video-engine.js"></script>
+
+<style>
+  :root {
+    --background: #12141a;
+    --panel: #1b1f28;
+    --line: #2c3240;
+    --text: #e8eaf0;
+    --muted: #949bab;
+    --accent: #5aa9ff;
+    --exact: #34c98b;
+    --approximate: #e0a13a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    padding: 32px 20px 48px;
+    background: var(--background);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+  .subtitle { margin: 0 0 24px; color: var(--muted); font-size: 14px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+
+  /* Drop target: the whole page accepts a drop, and this is the visible hint. */
+  #dropzone {
+    border: 2px dashed var(--line);
+    border-radius: 12px;
+    padding: 48px 24px;
+    text-align: center;
+    transition: border-color 120ms, background 120ms;
+  }
+  #dropzone.dragover { border-color: var(--accent); background: #1a2333; }
+  #dropzone p { margin: 0 0 16px; color: var(--muted); }
+
+  button {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 16px;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  #player { display: none; }
+  #player.loaded { display: block; }
+
+  /* The engine sizes its canvas backing store to this pane, and letterboxes
+     inside it. The <video> is styled to match with object-fit: contain. */
+  #pane {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  #pane canvas, #pane video {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+  /* Tabular figures so the frame counter does not jitter as digits change. */
+  .readout {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .readout strong { color: var(--text); font-weight: 600; }
+  input[type=range] { flex: 1; min-width: 160px; accent-color: var(--accent); }
+
+  .badges { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .badge {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--muted);
+  }
+  .badge.exact { border-color: var(--exact); color: var(--exact); }
+  .badge.approximate { border-color: var(--approximate); color: var(--approximate); }
+
+  #status { margin-top: 16px; font-size: 14px; color: var(--muted); min-height: 21px; }
+  #status.error { color: #ff8080; }
+</style>
+</head>
+<body>
+<main>
+  <h1>exact-video-engine.js</h1>
+  <p class="subtitle">
+    Frame-perfect playback. Drop a video below to see which engine it gets and
+    whether its frame indices are exact.
+  </p>
+
+  <div id="dropzone">
+    <p>Drop a video here</p>
+    <button id="browse">Browse&hellip;</button>
+    <input id="file-input" type="file" accept="video/*" hidden>
+  </div>
+
+  <div id="player">
+    <div id="pane">
+      <canvas id="engine-canvas"></canvas>
+      <video id="native-video" muted playsinline></video>
+    </div>
+
+    <div class="controls">
+      <button id="play">Play</button>
+      <button id="previous" title="Previous frame">&#9664;&#9612;</button>
+      <button id="next" title="Next frame">&#9612;&#9654;</button>
+      <input id="scrubber" type="range" min="0" max="0" step="1" value="0">
+      <span class="readout">
+        frame <strong id="frame-readout">0</strong> / <span id="total-readout">0</span>
+      </span>
+    </div>
+
+    <div class="badges">
+      <span class="badge" id="engine-badge"></span>
+      <span class="badge" id="exact-badge"></span>
+      <span class="badge" id="file-badge"></span>
+    </div>
+  </div>
+
+  <div id="status"></div>
+</main>
+
+<script>
+const canvas = document.getElementById('engine-canvas');
+const video = document.getElementById('native-video');
+const dropzone = document.getElementById('dropzone');
+const player = document.getElementById('player');
+const status = document.getElementById('status');
+const playButton = document.getElementById('play');
+const scrubber = document.getElementById('scrubber');
+const frameReadout = document.getElementById('frame-readout');
+const totalReadout = document.getElementById('total-readout');
+
+let engine = null;
+let scrubbing = false;
+
+// ?engine=native forces the <video> fallback, ?engine=webcodecs forces WebCodecs
+// (both still fall back if the clip cannot be played that way). Without it the
+// engine picks, which on a modern desktop browser always means WebCodecs — so
+// this is the only way to see the fallback tiers the library exists to provide.
+const prefer = new URLSearchParams(location.search).get('engine') || 'auto';
+
+function setStatus(message, isError) {
+  status.textContent = message || '';
+  status.classList.toggle('error', !!isError);
+}
+
+async function load(file) {
+  setStatus('Loading ' + file.name + '…');
+  // Decoders are a limited browser resource, so hand back the previous engine's
+  // before building another.
+  if (engine) { engine.destroy(); engine = null; }
+
+  try {
+    engine = await createBestEngine(file, { canvas, video, prefer });
+  } catch (error) {
+    player.classList.remove('loaded');
+    setStatus('Could not play this file: ' + error.message, true);
+    return;
+  }
+
+  // The engine plays into one of the two elements; show that one.
+  for (const element of [canvas, video]) {
+    element.style.display = (element === engine.displayElement) ? '' : 'none';
+  }
+  engine.loop = true;
+  engine.resizeCanvas();
+
+  scrubber.max = Math.max(0, engine.numFrames - 1);
+  scrubber.value = 0;
+  totalReadout.textContent = engine.numFrames;
+
+  document.getElementById('engine-badge').textContent = engine.tier;
+  const exactBadge = document.getElementById('exact-badge');
+  exactBadge.textContent = engine.frameIndexIsExact
+    ? 'frame indices exact'
+    : 'frame indices assume a constant frame rate';
+  exactBadge.className = 'badge ' + (engine.frameIndexIsExact ? 'exact' : 'approximate');
+  document.getElementById('file-badge').textContent =
+    `${file.name} — ${engine.videoWidth}×${engine.videoHeight}`;
+
+  player.classList.add('loaded');
+  setStatus('');
+  playButton.textContent = 'Play';
+}
+
+// One rAF loop for the life of the page. VideoEngine advances its playhead and
+// paints inside update(); NativeVideoEngine's update() is a no-op (the element
+// runs its own clock), so calling it unconditionally is safe and is the whole
+// point of the two engines sharing a surface.
+function tick(now) {
+  if (engine && engine.ready) {
+    engine.update(now);
+    const frame = engine.currentFrame;
+    frameReadout.textContent = frame;
+    if (!scrubbing) scrubber.value = frame;
+    playButton.textContent = engine.paused ? 'Play' : 'Pause';
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+playButton.addEventListener('click', () => {
+  if (!engine) return;
+  engine.paused ? engine.play() : engine.pause();
+});
+document.getElementById('previous').addEventListener('click', () => {
+  if (!engine) return;
+  engine.pause();
+  engine.seekToFrame(engine.currentFrame - 1);
+});
+document.getElementById('next').addEventListener('click', () => {
+  if (!engine) return;
+  engine.pause();
+  engine.seekToFrame(engine.currentFrame + 1);
+});
+scrubber.addEventListener('pointerdown', () => { scrubbing = true; });
+scrubber.addEventListener('pointerup', () => { scrubbing = false; });
+scrubber.addEventListener('input', () => {
+  if (!engine) return;
+  engine.pause();
+  engine.seekToFrame(parseInt(scrubber.value, 10));
+});
+
+// Browse
+const fileInput = document.getElementById('file-input');
+document.getElementById('browse').addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) load(fileInput.files[0]);
+});
+
+// Drag and drop, anywhere on the page. dragover must be cancelled or the browser
+// navigates away to the dropped file instead of handing it to us.
+for (const type of ['dragenter', 'dragover']) {
+  document.addEventListener(type, (event) => {
+    event.preventDefault();
+    dropzone.classList.add('dragover');
+  });
+}
+document.addEventListener('dragleave', (event) => {
+  if (event.relatedTarget === null) dropzone.classList.remove('dragover');
+});
+document.addEventListener('drop', (event) => {
+  event.preventDefault();
+  dropzone.classList.remove('dragover');
+  const file = event.dataTransfer.files[0];
+  if (file) load(file);
+});
+
+window.addEventListener('resize', () => { if (engine) engine.resizeCanvas(); });
+</script>
+</body>
+</html>
