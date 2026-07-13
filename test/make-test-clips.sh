@@ -89,5 +89,16 @@ ffmpeg -y -loglevel error -f lavfi \
     -pix_fmt yuv420p -c:v libx264 -preset ultrafast -qp 34 -g 30 \
     clips/midsize.mp4
 
+# 1080p, for the cache-memory test: a decoded frame is width x height x 4 bytes,
+# so how much memory the frame cache holds is decided by the clip, not by the
+# frame count. Every other clip here has small frames, which is precisely why a
+# cache budgeted in frames looked harmless for so long -- at 320x180 a 82-frame
+# window is 19 MB, and at 1080p the same window is 680 MB and takes the decoder
+# down with it on a phone. A smooth synthetic pattern (not noise) so 5 seconds of
+# 1080p stays a few MB on disk; the pixels are irrelevant here, the SIZE is not.
+ffmpeg -y -loglevel error -f lavfi -i "testsrc2=s=1920x1080:d=5:r=30" \
+    -pix_fmt yuv420p -c:v libx264 -preset ultrafast -qp 30 -g 30 \
+    -movflags +faststart clips/hd.mp4
+
 echo "Wrote test clips:"
 ls clips

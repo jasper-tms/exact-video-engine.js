@@ -6,7 +6,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
-        || [ ! -f test/clips/counter-vfr.webm ] || [ ! -f test/clips/startup.mp4 ]; then
+        || [ ! -f test/clips/counter-vfr.webm ] || [ ! -f test/clips/startup.mp4 ] \
+        || [ ! -f test/clips/midsize.mp4 ] || [ ! -f test/clips/hd.mp4 ]; then
     bash test/make-test-clips.sh
 fi
 
@@ -24,4 +25,5 @@ node test/frame-index-test.mjs || status=1
 node test/display-test.mjs || status=1
 node test/offscreen-test.mjs || status=1
 node test/startup-test.mjs || status=1
+node test/memory-test.mjs || status=1
 exit "$status"

@@ -110,7 +110,7 @@ freeze the page.
      DataStream globals). WebM indexing is built in and needs nothing. -->
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch. -->
-<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v1.5.1/exact-video-engine.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v1.6.0/exact-video-engine.js"></script>
 
 <div id="pane" style="width: 640px; height: 360px">
   <canvas id="video-canvas"></canvas>
@@ -225,6 +225,32 @@ new VideoEngine(canvas, { windowAhead: 0 });   // same option, engine directly
 The default (56 frames, about two seconds) is what you want for anything that
 plays. `windowAhead: 0` still decodes the frame you asked for; it just stops
 there.
+
+### Memory
+
+A decoded frame costs width × height × 4 bytes, so a window counted in *frames*
+costs whatever the clip's resolution decides — the same 56-frame read-ahead is
+tens of megabytes of 360p and hundreds of megabytes of 1080p. That is not merely
+wasteful on a phone: iOS decodes into a bounded pool of surfaces, and an engine
+holding hundreds of megabytes of decoded frames exhausts it, at which point
+WebKit kills the decode session outright (`VideoDecoder` reports *"Decoder
+failure"*, a second or two into playback, on big clips only).
+
+So the ceiling is **bytes**, and the window is whatever fits under it:
+
+```js
+new VideoEngine(canvas, { cacheBytes: 32 << 20 });   // default: 96 MB
+```
+
+At the default, a 360p clip keeps the full 56-frame read-ahead, while a 1080p
+clip holds about a dozen frames — enough to play without stalling, and far
+enough under the ceiling to leave the decoder its surfaces. Frames cached for
+display are also downscaled to 1920 on the long side, so a 4K clip costs the
+same per frame as a 1080p one (`bitmapForFrame()` hands back that bitmap, in
+coded orientation — see the API note above).
+
+Lowering `cacheBytes` shrinks read-ahead first and history second; it never
+changes which frames are *available*, only how many are held in memory at once.
 
 `NativeVideoEngine` additionally has `setFrameRate(framesPerSecond, numFrames)`,
 for hosts that know the clip's rate from elsewhere (a sidecar file, say) when no
@@ -384,6 +410,17 @@ to open — the first asking for 1 byte, the second for 4 — and at 400 ms of
 round-trip time that was four seconds of empty pane while every byte budget
 passed. The test counts requests rather than timing them, because latency is the
 point and a stopwatch against localhost would only measure the machine.
+
+**Memory** plays a 1080p clip and watches the high-water mark of decoded frames
+held in the cache. This is a third currency again: bytes off the network are not
+bytes held in memory, and the frames are correct at any window size, so every
+other test above passed while a frame-counted cache was holding **649 MB** of a
+1080p clip — enough to exhaust an iPhone's decoder surfaces and take the decode
+session down mid-playback. It needs a big-framed fixture to mean anything (the
+suite's other clips are 360p and smaller, where the old budget stayed under the
+new ceiling by accident), and it checks the ceiling in both directions: small
+frames must still get the full read-ahead, and a host that lowers `cacheBytes`
+must actually see it shrink.
 
 ## License
 

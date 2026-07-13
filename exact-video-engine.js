@@ -824,6 +824,15 @@ class ContainerIndex {
   }
 }
 
+// Frames the cache holds beyond the read-ahead window's far edge. Decoded
+// frames arrive a little past the target while the playhead is still catching
+// up, and evicting them the moment they land would mean decoding them twice.
+const WINDOW_SLACK = 8;
+// Never shrink the window below this, whatever the byte budget says: a cache
+// that cannot hold the frame being decoded plus its neighbours would evict its
+// own read-ahead and thrash.
+const MINIMUM_WINDOW_FRAMES = 4;
+
 // ==================================================================
 // VideoEngine — WebCodecs. Authoritative: we decide which frame is on screen.
 // ==================================================================
@@ -834,6 +843,10 @@ class VideoEngine extends EventTarget {
   // tool, a thumbnail picker — is buying bandwidth and decode work it will not
   // use, and can turn this down. It does not affect which frames are available,
   // only how eagerly they are fetched: the frame you ask for is always decoded.
+  //
+  // options.cacheBytes: the memory ceiling for decoded frames (default 96 MB).
+  // This, not windowAhead, is what bounds the engine's memory — the window is
+  // cut to fit it, so a 4K clip caches few frames and a 360p clip caches many.
   constructor(presentationCanvas, options = {}) {
     super();
     this.canvas = presentationCanvas;
@@ -873,15 +886,31 @@ class VideoEngine extends EventTarget {
     // around the playhead. Decoding streams forward from a keyframe and only
     // restarts (reset + reconfigure + decode forward) on a backward seek.
     this._cache = new Map();          // displayIndex -> ImageBitmap
-    this._windowBack = 18;            // keep this many frames behind the playhead
-    this._windowAhead = Math.max(0, options.windowAhead ?? 56);   // read-ahead target (≈2 s)
-    // Resident decoded frames. Must cover the window on both sides, or the
-    // eviction pass would throw away frames the read-ahead just paid to decode.
-    this._cacheBudget = Math.max(80, this._windowBack + this._windowAhead + 8);
+    // What the host would LIKE to hold: frames behind the playhead (a backward
+    // scrub is then free) and ahead of it (playback doesn't stall on the
+    // decoder). These are wishes, not the budget — _sizeWindows() cuts them to
+    // what the clip's resolution can afford once the index says how big a frame
+    // is. windowAhead: 0 means "no read-ahead at all", and stays 0.
+    this._wantedWindowBack = 18;
+    this._wantedWindowAhead = Math.max(0, options.windowAhead ?? 56);   // ≈2 s
+    // A decoded frame's memory is width x height x 4, so a frame-counted cache
+    // costs whatever the clip decides: 82 frames of 360p is 75 MB and 82 frames
+    // of 1080p is 680 MB. On a phone the second one exhausts the surface pool
+    // the decoder draws from and WebKit kills the decode session mid-playback
+    // ("Decoder failure"), which is why the cache is sized in BYTES and the
+    // window in frames falls out of it. The default is deliberately well under
+    // iOS Safari's few-hundred-MB ceiling for image memory, which the
+    // presentation canvas and the decoder's own frame pool also draw against.
+    this._cacheBytes = Math.max(8 << 20, options.cacheBytes ?? (96 << 20));
+    // Filled in by _sizeWindows() from _cacheBytes and the clip's frame size.
+    this._windowBack = this._wantedWindowBack;
+    this._windowAhead = this._wantedWindowAhead;
+    this._windowSlack = WINDOW_SLACK;
+    this._cacheBudget = this._windowBack + 1 + this._windowAhead + WINDOW_SLACK;
     // Cached bitmaps are for display only (frame-index accuracy is independent
-    // of their resolution), so cap their long side: a 4K clip otherwise costs
-    // ~33 MB/frame and the cache would blow past 1 GB. The canvas pane is never
-    // bigger than the screen, so this is invisible. 1080p and smaller keep full
+    // of their resolution), so cap their long side: a 4K frame is 33 MB and the
+    // whole byte budget would buy three of them. The canvas pane is never bigger
+    // than the screen, so this is invisible. 1080p and smaller keep full
     // resolution (no downscale).
     this._displayCapPixels = 1920;
     this._runKeyframe = -1;           // decode index the current decode run began at
@@ -992,6 +1021,51 @@ class VideoEngine extends EventTarget {
     this.rotation = index.rotation;
     this.videoWidth = index.videoWidth;
     this.videoHeight = index.videoHeight;
+    this._sizeWindows();
+  }
+
+  // The size a cached bitmap of this clip's frames comes out at, after the
+  // display cap. _absorb downscales to exactly this, so the byte budget below
+  // and the memory actually held are the same arithmetic.
+  _cachedBitmapSize(width, height) {
+    const scale = Math.min(1, this._displayCapPixels / Math.max(width, height));
+    return [Math.max(1, Math.round(width * scale)),
+            Math.max(1, Math.round(height * scale))];
+  }
+
+  // Turn the byte budget into a frame window, now that the index has said how
+  // big a frame is. The clip's resolution — not the host — decides how many
+  // frames fit: at 96 MB that is ~330 frames of 360p but only ~11 of 1080p.
+  _sizeWindows() {
+    const [width, height] = this._cachedBitmapSize(this.videoWidth, this.videoHeight);
+    const bytesPerFrame = Math.max(1, width * height * 4);
+    const affordable = Math.max(MINIMUM_WINDOW_FRAMES,
+      Math.floor(this._cacheBytes / bytesPerFrame));
+
+    // Frames resident at once: the ones behind, the centre frame, the ones
+    // ahead, and the slack _insideWindow admits past the far edge.
+    let back = this._wantedWindowBack;
+    let ahead = this._wantedWindowAhead;
+    let slack = WINDOW_SLACK;
+
+    if (back + 1 + ahead + slack > affordable) {
+      // Everything except the centre frame is negotiable. Read-ahead is bought
+      // first — without it playback stalls on the decoder every frame, whereas a
+      // short history only costs a re-decode on a backward scrub — and this only
+      // ever shrinks the window, so a host that asked for no read-ahead (or a
+      // narrow one) keeps what it asked for.
+      const spendable = Math.max(0, affordable - 1);
+      slack = Math.min(slack, Math.floor(spendable / 3));
+      const forWindow = spendable - slack;
+      back = Math.min(back, Math.floor(forWindow / 4));
+      ahead = Math.min(ahead, forWindow - back);
+    }
+    this._windowBack = back;
+    this._windowAhead = ahead;
+    this._windowSlack = slack;
+    // Must cover the window on both sides, or the eviction pass would throw away
+    // frames the read-ahead just paid to decode.
+    this._cacheBudget = back + 1 + ahead + slack;
   }
 
   // ---- decode (streaming, frame-windowed) ---------------------------------
@@ -1038,7 +1112,7 @@ class VideoEngine extends EventTarget {
   _insideWindow(displayIndex) {
     return this._windowCenters().some((center) =>
       displayIndex >= center - this._windowBack
-      && displayIndex <= center + this._windowAhead + 8);
+      && displayIndex <= center + this._windowAhead + this._windowSlack);
   }
 
   // A decoded frame arrived. Cache it (as an ImageBitmap, freeing the decoder's
@@ -1052,16 +1126,14 @@ class VideoEngine extends EventTarget {
       return;
     }
     const cacheRef = this._cache;   // detect a teardown/reload mid-conversion
-    // Downscale oversized frames (e.g. 4K) when caching — display only.
+    // Downscale oversized frames (e.g. 4K) when caching — display only. Same
+    // arithmetic _sizeWindows() budgeted against, so what lands in the cache is
+    // the size it was told to expect.
     let options;
-    const longSide = Math.max(frame.displayWidth, frame.displayHeight);
-    if (longSide > this._displayCapPixels) {
-      const scale = this._displayCapPixels / longSide;
-      options = {
-        resizeWidth: Math.max(1, Math.round(frame.displayWidth * scale)),
-        resizeHeight: Math.max(1, Math.round(frame.displayHeight * scale)),
-        resizeQuality: 'medium',
-      };
+    const [width, height] =
+      this._cachedBitmapSize(frame.displayWidth, frame.displayHeight);
+    if (width !== frame.displayWidth || height !== frame.displayHeight) {
+      options = { resizeWidth: width, resizeHeight: height, resizeQuality: 'medium' };
     }
     createImageBitmap(frame, options).then((bitmap) => {
       frame.close();

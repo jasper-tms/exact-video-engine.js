@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine cache-memory test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<style>#pane { width: 640px; height: 360px; }
+  #pane canvas { width: 100%; height: 100%; display: block; }</style>
+<div id="pane"><canvas></canvas></div>
+<script>
+// How much memory does the engine hold in decoded frames while playing?
+//
+// A decoded frame costs width x height x 4 bytes, so a cache budgeted in FRAMES
+// costs whatever the clip's resolution decides: the same 82-frame window is
+// 75 MB of 360p and 680 MB of 1080p. Desktop swallows that; a phone does not.
+// On iOS the decoder draws its output from a bounded surface pool, and a cache
+// that large exhausts it -- WebKit then kills the decode session with "Decoder
+// failure", a second or two INTO playback, once the read-ahead window has
+// filled. Small clips played fine, which is what made it look like a codec
+// problem rather than a memory one.
+//
+// So: play a real 1080p clip and watch what the cache actually holds. Every
+// other test in the suite passes at any window size -- the frames are correct
+// either way -- and the byte-counting startup test measures bytes off the
+// NETWORK, not bytes held in memory. Only this one can see it.
+//
+//   mode=peak  play the clip through and report the high-water mark of resident
+//              decoded-frame bytes, plus the window the engine sized itself to.
+const TICK_MILLISECONDS = 16;    // a stand-in for the host's rAF loop
+const PLAY_SECONDS = 4;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// What the cache is holding right now, by the same arithmetic the browser pays:
+// four bytes per pixel of every resident bitmap.
+function residentBytes(engine) {
+  let bytes = 0;
+  for (const bitmap of engine._cache.values()) {
+    bytes += bitmap.width * bitmap.height * 4;
+  }
+  return bytes;
+}
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const canvas = document.querySelector('canvas');
+  const url = 'clips/' + params.get('file');
+  const cacheBytes = params.get('cacheBytes')
+    ? Number(params.get('cacheBytes')) : undefined;
+
+  const engine = new VideoEngine(canvas, cacheBytes ? { cacheBytes } : {});
+  await engine.load(url);
+
+  let peakBytes = residentBytes(engine);
+  let peakFrames = engine._cache.size;
+
+  // Drive the engine the way a host does: tick it, let the playhead advance in
+  // real time, and sample the cache on every tick. Sampling only at the end
+  // would miss the peak -- eviction is continuous, and the high-water mark is
+  // what the decoder's surface pool has to survive.
+  engine.play();
+  const startedAt = performance.now();
+  while ((performance.now() - startedAt) / 1000 < PLAY_SECONDS) {
+    engine.update(performance.now());
+    const bytes = residentBytes(engine);
+    if (bytes > peakBytes) { peakBytes = bytes; peakFrames = engine._cache.size; }
+    await sleep(TICK_MILLISECONDS);
+  }
+  engine.pause();
+
+  window.__result = {
+    peakBytes,
+    peakFrames,
+    // A cache that holds nothing would pass any byte budget, so the runner
+    // checks that playback actually got somewhere and frames were resident.
+    playedToFrame: engine.currentFrame,
+    numFrames: engine.numFrames,
+    frameShown: Boolean(engine.bitmapForFrame(engine.currentFrame)),
+    videoWidth: engine.videoWidth,
+    videoHeight: engine.videoHeight,
+    windowAhead: engine._windowAhead,
+    windowBack: engine._windowBack,
+    cacheBudgetFrames: engine._cacheBudget,
+  };
+  engine.destroy();
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>
