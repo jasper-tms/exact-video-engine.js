@@ -681,6 +681,11 @@ class VideoEngine extends EventTarget {
   // playhead, drives decoding of the surrounding window, and paints the frame.
   update(now) {
     if (!this.ready) return;
+    // The pane can get its size, or change it, after the clip was loaded — a host
+    // that reveals the player only once the clip is ready, a CSS transition, a
+    // flex reflow. Nothing announces that, so check it here rather than rely on
+    // the host to call resizeCanvas() at exactly the right moment.
+    this._syncCanvasSize();
     if (this.playing) {
       if (this._lastNow) {
         this.playhead += (now - this._lastNow) / 1000 * this._playbackRate;
@@ -716,16 +721,28 @@ class VideoEngine extends EventTarget {
   }
 
   // Size the canvas backing store to the pane (device pixels) and repaint the
-  // current frame. Called from the window resize handler.
-  resizeCanvas() {
+  // current frame. Safe to call at any time; update() also calls it every tick,
+  // so a host does not have to get the timing right.
+  resizeCanvas() { this._syncCanvasSize(); }
+
+  _syncCanvasSize() {
     const pane = this.canvas.parentElement;
     const dpr = window.devicePixelRatio || 1;
-    const width = Math.max(1, Math.round(pane.clientWidth * dpr));
-    const height = Math.max(1, Math.round(pane.clientHeight * dpr));
-    if (this.canvas.width !== width || this.canvas.height !== height) {
-      this.canvas.width = width;
-      this.canvas.height = height;
-    }
+    const width = Math.round(pane.clientWidth * dpr);
+    const height = Math.round(pane.clientHeight * dpr);
+
+    // A pane with no layout — display:none, not yet in the document, a host that
+    // reveals its player only once the clip is ready — measures 0x0. Leave the
+    // canvas alone and wait to be called again once it has a box. Sizing it to
+    // 1x1 here (the obvious clamp) would quietly replace the frame with a single
+    // pixel of its average colour, which CSS then stretches across the pane: a
+    // flat wash that looks like a decode failure but is a layout bug.
+    if (!width || !height) return;
+
+    if (this.canvas.width === width && this.canvas.height === height) return;
+    // Assigning either dimension clears the canvas, so this must repaint.
+    this.canvas.width = width;
+    this.canvas.height = height;
     if (this._lastBitmap) this._drawBitmap(this._lastBitmap);
   }
 
@@ -1247,10 +1264,16 @@ async function createBestEngine(source, options = {}) {
     prefer = 'auto',
     declaredFrameRate = 0,
     declaredNumFrames = 0,
+    // A caller that has already built the index for this source passes it here,
+    // so the moov is not parsed twice. Passing null means "already tried, not
+    // available" — which is different from leaving it out, which means "build it
+    // for me". A host that wants to report whether the container could be indexed
+    // needs that distinction.
+    index: providedIndex,
   } = options;
 
-  let index = null;
-  if (typeof MP4Box !== 'undefined') {
+  let index = (providedIndex !== undefined) ? providedIndex : null;
+  if (providedIndex === undefined && typeof MP4Box !== 'undefined') {
     try {
       index = await ContainerIndex.fromSource(source);
     } catch (err) {

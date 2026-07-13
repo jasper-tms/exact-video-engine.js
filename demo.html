@@ -38,7 +38,9 @@
   .subtitle { margin: 0 0 24px; color: var(--muted); font-size: 14px; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
 
-  /* Drop target: the whole page accepts a drop, and this is the visible hint. */
+  /* Drop target: the whole page accepts a drop. The dashed panel is only the
+     hint shown before a clip is loaded — once one is, it gets out of the way and
+     the drag feedback moves to the page outline below. */
   #dropzone {
     border: 2px dashed var(--line);
     border-radius: 12px;
@@ -48,6 +50,25 @@
   }
   #dropzone.dragover { border-color: var(--accent); background: #1a2333; }
   #dropzone p { margin: 0 0 16px; color: var(--muted); }
+  body.loaded #dropzone { display: none; }
+
+  /* Dragging over a page that already has a clip: nothing to point at, so the
+     whole viewport becomes the target. */
+  body.loaded.dragover::after {
+    content: "Drop to replace";
+    position: fixed;
+    inset: 8px;
+    border: 2px dashed var(--accent);
+    border-radius: 12px;
+    background: rgba(90, 169, 255, 0.06);
+    color: var(--accent);
+    font-size: 14px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding-bottom: 16px;
+    pointer-events: none;
+  }
 
   button {
     font: inherit;
@@ -60,6 +81,9 @@
   }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: 0.4; cursor: default; }
+  /* The two step buttons carry a single glyph; give them a common width so the
+     control bar does not shift, and keep the triangles optically centered. */
+  #previous, #next { min-width: 48px; text-align: center; line-height: 1; }
 
   #player { display: none; }
   #player.loaded { display: block; }
@@ -112,6 +136,38 @@
   }
   .badge.exact { border-color: var(--exact); color: var(--exact); }
   .badge.approximate { border-color: var(--approximate); color: var(--approximate); }
+  /* The engine badge is a button: click it to replay the clip through the other
+     engine. Overrides the generic button rule's padding so it matches the pill
+     next to it. */
+  button.badge {
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button.badge:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+  button.badge::after { content: " ⇄"; opacity: 0.6; }
+
+  /* Names the clip directly above the frame it labels. */
+  #clip-header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 8px;
+    min-width: 0;
+  }
+  #clip-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #clip-size {
+    color: var(--muted);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
 
   #status { margin-top: 16px; font-size: 14px; color: var(--muted); min-height: 21px; }
   #status.error { color: #ff8080; }
@@ -132,6 +188,11 @@
   </div>
 
   <div id="player">
+    <div id="clip-header">
+      <span id="clip-name"></span>
+      <span id="clip-size"></span>
+    </div>
+
     <div id="pane">
       <canvas id="engine-canvas"></canvas>
       <video id="native-video" muted playsinline></video>
@@ -139,8 +200,8 @@
 
     <div class="controls">
       <button id="play">Play</button>
-      <button id="previous" title="Previous frame">&#9664;&#9612;</button>
-      <button id="next" title="Next frame">&#9612;&#9654;</button>
+      <button id="previous" title="Previous frame">&#9664;</button>
+      <button id="next" title="Next frame">&#9654;</button>
       <input id="scrubber" type="range" min="0" max="0" step="1" value="0">
       <span class="readout">
         frame <strong id="frame-readout">0</strong> / <span id="total-readout">0</span>
@@ -148,9 +209,9 @@
     </div>
 
     <div class="badges">
-      <span class="badge" id="engine-badge"></span>
-      <span class="badge" id="exact-badge"></span>
-      <span class="badge" id="file-badge"></span>
+      <span class="badge" id="format-badge"></span>
+      <button class="badge" id="engine-badge" type="button"
+              title="Click to play this clip through the other engine"></button>
     </div>
   </div>
 
@@ -171,11 +232,13 @@ const totalReadout = document.getElementById('total-readout');
 let engine = null;
 let scrubbing = false;
 
-// ?engine=native forces the <video> fallback, ?engine=webcodecs forces WebCodecs
-// (both still fall back if the clip cannot be played that way). Without it the
-// engine picks, which on a modern desktop browser always means WebCodecs — so
-// this is the only way to see the fallback tiers the library exists to provide.
-const prefer = new URLSearchParams(location.search).get('engine') || 'auto';
+// ?engine=native forces the <video> fallback, ?engine=webcodecs forces WebCodecs.
+// Without it the library picks, which on a modern desktop browser always means
+// WebCodecs — so this, and the engine pill below the video, are the only ways to
+// see the fallback tiers the library exists to provide. Either way the request is
+// only a preference: a clip WebCodecs cannot play still falls back.
+let prefer = new URLSearchParams(location.search).get('engine') || 'auto';
+let currentFile = null;
 
 function setStatus(message, isError) {
   status.textContent = message || '';
@@ -183,15 +246,32 @@ function setStatus(message, isError) {
 }
 
 async function load(file) {
+  currentFile = file;
   setStatus('Loading ' + file.name + '…');
   // Decoders are a limited browser resource, so hand back the previous engine's
   // before building another.
   if (engine) { engine.destroy(); engine = null; }
 
+  // Build the container index here rather than letting createBestEngine do it,
+  // so we can report whether mp4box could read this container at all — the thing
+  // that decides whether frame indices are exact or merely assumed. Passing the
+  // result (index, or null for "tried and failed") keeps the moov from being
+  // parsed twice.
+  let containerIndex = null;
   try {
-    engine = await createBestEngine(file, { canvas, video, prefer });
+    containerIndex = await ContainerIndex.fromSource(file);
+  } catch (indexError) {
+    containerIndex = null;
+  }
+  showFormatBadge(file, containerIndex);
+
+  try {
+    engine = await createBestEngine(file, { canvas, video, prefer, index: containerIndex });
   } catch (error) {
+    // Nothing is playing now, so bring the drop panel back rather than leave a
+    // dead player on screen.
     player.classList.remove('loaded');
+    document.body.classList.remove('loaded');
     setStatus('Could not play this file: ' + error.message, true);
     return;
   }
@@ -200,6 +280,16 @@ async function load(file) {
   for (const element of [canvas, video]) {
     element.style.display = (element === engine.displayElement) ? '' : 'none';
   }
+
+  // Reveal the player BEFORE sizing the canvas to it. resizeCanvas() measures
+  // the pane, and a hidden pane measures 0x0 — which is how a correctly decoded
+  // frame ends up as a flat wash of its own average colour, stretched across the
+  // pane from a 1x1 backing store.
+  player.classList.add('loaded');
+  // Retires the drop panel and hands drag feedback to the page outline; the drop
+  // listeners are on the document, so dropping a replacement keeps working.
+  document.body.classList.add('loaded');
+
   engine.loop = true;
   engine.resizeCanvas();
 
@@ -207,19 +297,49 @@ async function load(file) {
   scrubber.value = 0;
   totalReadout.textContent = engine.numFrames;
 
-  document.getElementById('engine-badge').textContent = engine.tier;
-  const exactBadge = document.getElementById('exact-badge');
-  exactBadge.textContent = engine.frameIndexIsExact
-    ? 'frame indices exact'
-    : 'frame indices assume a constant frame rate';
-  exactBadge.className = 'badge ' + (engine.frameIndexIsExact ? 'exact' : 'approximate');
-  document.getElementById('file-badge').textContent =
-    `${file.name} — ${engine.videoWidth}×${engine.videoHeight}`;
+  showEngineBadge();
 
-  player.classList.add('loaded');
+  document.getElementById('clip-name').textContent = file.name;
+  document.getElementById('clip-size').textContent =
+    `${engine.videoWidth}×${engine.videoHeight}`;
+
   setStatus('');
   playButton.textContent = 'Play';
 }
+
+// Whether mp4box could read this container. That is the fork in the road: it
+// yields the real per-frame timestamp table, so it decides whether frame indices
+// are exact or fall back to an assumed constant frame rate — and it is also the
+// gate on WebCodecs, which cannot play anything without a demuxer.
+function showFormatBadge(file, containerIndex) {
+  const dot = file.name.lastIndexOf('.');
+  const extension = dot === -1 ? '?' : file.name.slice(dot).toLowerCase();
+  const badge = document.getElementById('format-badge');
+  badge.textContent = `Format ${extension} → mp4box `
+    + (containerIndex ? 'succeeded' : 'failed');
+  badge.className = 'badge ' + (containerIndex ? 'exact' : 'approximate');
+  badge.title = containerIndex
+    ? 'The container yielded a real per-frame timestamp table, so frame indices '
+      + 'are exact even on a variable-frame-rate clip.'
+    : 'mp4box reads ISOBMFF (mp4/mov) only. The <video> element may still play '
+      + 'this clip, but frame indices come from an assumed constant frame rate.';
+}
+
+// Names the engine actually in use — not the one requested, since a request is
+// only a preference and a clip WebCodecs cannot play falls back regardless.
+function showEngineBadge() {
+  const badge = document.getElementById('engine-badge');
+  const isNative = engine.tier.startsWith('native');
+  badge.textContent = `Engine: ${isNative ? 'native' : 'webcodecs'}`;
+  badge.title = engine.tier + ' — click to play this clip through the other engine';
+}
+
+// The engine pill is a toggle: flip the preference and reload the same clip.
+document.getElementById('engine-badge').addEventListener('click', () => {
+  if (!engine || !currentFile) return;
+  prefer = engine.tier.startsWith('native') ? 'webcodecs' : 'native';
+  load(currentFile);
+});
 
 // One rAF loop for the life of the page. VideoEngine advances its playhead and
 // paints inside update(); NativeVideoEngine's update() is a no-op (the element
@@ -266,20 +386,29 @@ fileInput.addEventListener('change', () => {
   if (fileInput.files.length) load(fileInput.files[0]);
 });
 
-// Drag and drop, anywhere on the page. dragover must be cancelled or the browser
-// navigates away to the dropped file instead of handing it to us.
+// Drag and drop, anywhere on the page, whether or not a clip is already loaded.
+// dragover must be cancelled or the browser navigates away to the dropped file
+// instead of handing it to us. The `dragover` class goes on both the panel and
+// the body: only one of them is visible at a time (see the CSS), so this is one
+// listener serving the empty and the loaded state.
+function setDragging(dragging) {
+  dropzone.classList.toggle('dragover', dragging);
+  document.body.classList.toggle('dragover', dragging);
+}
 for (const type of ['dragenter', 'dragover']) {
   document.addEventListener(type, (event) => {
     event.preventDefault();
-    dropzone.classList.add('dragover');
+    setDragging(true);
   });
 }
 document.addEventListener('dragleave', (event) => {
-  if (event.relatedTarget === null) dropzone.classList.remove('dragover');
+  // relatedTarget is null only when the pointer leaves the window entirely;
+  // without that check, crossing between elements would flicker the highlight.
+  if (event.relatedTarget === null) setDragging(false);
 });
 document.addEventListener('drop', (event) => {
   event.preventDefault();
-  dropzone.classList.remove('dragover');
+  setDragging(false);
   const file = event.dataTransfer.files[0];
   if (file) load(file);
 });

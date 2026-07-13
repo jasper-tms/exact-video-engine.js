@@ -3,7 +3,7 @@
 # Cut a release: repoint the pinned CDN URLs at a new version, commit that, and
 # tag the commit.
 #
-# Order matters. The tag has to point at a commit whose index.html and README
+# Order matters. The tag has to point at a commit whose demo.html and README
 # already reference that same tag, so it goes rewrite -> commit -> tag. Tagging
 # first would ship a demo page that loads the PREVIOUS release from jsDelivr,
 # which is exactly the kind of thing nobody notices until a consumer does.
@@ -37,13 +37,13 @@ if [ -z "$BUMP" ]; then
     exit 1
 fi
 
-# The version the pinned URLs currently point at. Read it out of index.html
+# The version the pinned URLs currently point at. Read it out of demo.html
 # rather than from `git tag`, so that a hand-edited pin cannot silently disagree
 # with what we are bumping from.
-CURRENT=$(grep -o 'exact-video-engine\.js@v[0-9]\+\.[0-9]\+\.[0-9]\+' index.html \
+CURRENT=$(grep -o 'exact-video-engine\.js@v[0-9]\+\.[0-9]\+\.[0-9]\+' demo.html \
     | head -1 | sed 's/.*@//')
 if [ -z "$CURRENT" ]; then
-    echo "error: no pinned version found in index.html" >&2
+    echo "error: no pinned version found in demo.html" >&2
     exit 1
 fi
 
@@ -79,9 +79,9 @@ fi
 
 echo "Bumping $CURRENT -> $VERSION"
 
-# Repoint every pinned CDN URL. index.html is the demo; the README carries the
+# Repoint every pinned CDN URL. demo.html is the demo; the README carries the
 # same pin in its usage snippet, and a stale one there is what consumers copy.
-FILES=(index.html README.md)
+FILES=(demo.html README.md)
 replaced=0
 for file in "${FILES[@]}"; do
     before=$(grep -c "exact-video-engine\.js@${CURRENT}/" "$file" || true)
