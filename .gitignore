@@ -2,3 +2,8 @@ test/clips/
 node_modules/
 package.json
 package-lock.json
+# ...but src/package.json is a committed type marker, not a local convenience
+# file: it declares the src/ modules ES modules so they `import` into plain Node
+# (the unit tests, and the README's "parsers import into plain Node" promise)
+# regardless of whatever root package.json `npm install playwright` leaves behind.
+!src/package.json

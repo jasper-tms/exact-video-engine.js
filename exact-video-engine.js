@@ -1,3 +1,6 @@
+// GENERATED FILE. Do not edit directly: the source lives in src/, and
+// `node build.mjs` writes this file from it. The build only removes the
+// module import/export syntax, so every other line here IS the source.
 // ==================================================================
 // exact-video-engine.js — frame-perfect video playback for the browser.
 // https://github.com/jasper-tms/exact-video-engine.js
@@ -54,8 +57,9 @@
 // regardless of clip length (handles multi-minute clips).
 //
 // Classic (non-module) script whose host-facing globals are UrlRangeReader,
-// FileRangeReader, ContainerIndex, VideoEngine, NativeVideoEngine, and
-// createBestEngine, so both module and non-module host pages can use it.
+// FileRangeReader, ContainerIndex, VideoEngine, NativeVideoEngine,
+// createBestEngine, and formatProgress (see createBestEngine's onProgress), so
+// both module and non-module host pages can use it.
 // mp4box.js (the `MP4Box` / `DataStream` globals) should be loaded first to
 // index MP4s; WebM indexing is built in and needs nothing. Without mp4box an MP4
 // falls to step 3/4, while a WebM still gets step 2.
@@ -307,10 +311,32 @@ async function readEbmlUnsigned(cursor, byteCount) {
   return value;
 }
 
+// A progress report for a WebM index pass, handed to options.onProgress. The
+// only long-running index (an MP4's moov is a handful of range reads whatever
+// the clip's length), so this is where a "please wait" indicator earns its
+// keep. Shape:
+//   { bytesRead, totalBytes,   // of the sequential pass
+//     fraction,                // bytesRead / totalBytes, 0..1
+//     elapsedMs,               // since the pass began
+//     etaMs,                   // estimated time remaining, from the average
+//                              //   rate so far (0 at the very start and the end)
+//     framesFound }            // video frames indexed so far
+// Format one for display with formatProgress().
+function formatProgress(progress) {
+  const percent = Math.round((progress.fraction || 0) * 100);
+  if (progress.fraction >= 1 || !(progress.etaMs > 0)) return `Indexing… ${percent}%`;
+  const seconds = Math.max(1, Math.round(progress.etaMs / 1000));
+  return `Indexing… ${percent}% (~${seconds}s left)`;
+}
+
 // Read the timestamps of every frame of the file's first video track.
 //
 // options.timeoutMilliseconds  give up after this long (Infinity: never)
 // options.maxBytes             refuse a file bigger than this (Infinity: any)
+// options.onProgress           called ~once per megabyte with a progress report
+//                              (see formatProgress) during the pass, and once
+//                              more at 100% when it finishes. A throw from it is
+//                              swallowed so a buggy indicator cannot abort a load.
 //
 // Returns {presentationTimes (seconds, file order), defaultFrameDuration,
 // videoWidth, videoHeight}. Throws IndexBudgetExceededError when it runs out of
@@ -328,6 +354,8 @@ async function readMatroskaFrameTable(reader, options = {}) {
     throw new IndexBudgetExceededError('no time allowed to index this WebM');
   }
 
+  const onProgress = (typeof options.onProgress === 'function') ? options.onProgress : null;
+
   const startedAt = performance.now();
   let lastYieldedAt = startedAt;
   const state = {
@@ -340,7 +368,32 @@ async function readMatroskaFrameTable(reader, options = {}) {
     presentationTimes: [],
   };
 
+  // Build and hand a progress report to onProgress, never letting the indicator
+  // take the pass down with it. bytesRead is the cursor position — where the
+  // next refill will read from, i.e. how far the pass has consumed.
+  const report = (bytesRead) => {
+    if (!onProgress) return;
+    const elapsedMs = performance.now() - startedAt;
+    const fraction = reader.size ? Math.min(1, bytesRead / reader.size) : 1;
+    // ETA from the average rate over the pass so far — naturally smoothed, and
+    // 0 at the ends where a remaining-time estimate is meaningless or noisy.
+    const etaMs = (fraction > 0 && fraction < 1) ? elapsedMs * (1 - fraction) / fraction : 0;
+    try {
+      onProgress({
+        bytesRead, totalBytes: reader.size, fraction, elapsedMs, etaMs,
+        framesFound: state.presentationTimes.length,
+      });
+    } catch (progressError) {
+      // An indicator that throws is the host's bug, not ours; keep indexing.
+    }
+  };
+
   const cursor = new SequentialByteCursor(reader, {
+    // How many bytes each refill fetches (default 1 MB), which is also the
+    // granularity of the onProgress ticks. Exposed mostly so a test can force
+    // many ticks over a small clip; a real host might shrink it on a slow link
+    // to report progress more often.
+    chunkBytes: options.chunkBytes,
     beforeRefill: async () => {
       const now = performance.now();
       if (now - startedAt > timeoutMilliseconds) {
@@ -348,6 +401,9 @@ async function readMatroskaFrameTable(reader, options = {}) {
           `indexing this WebM did not finish within ${timeoutMilliseconds} ms `
           + `(read ${cursor.position} of ${reader.size} bytes)`);
       }
+      // A refill is one megabyte of progress: report it before fetching the next
+      // chunk (the yield below then lets the host repaint its indicator).
+      report(cursor.position);
       // Hand the event loop a turn every so often. Awaiting the read itself
       // usually does this, but a fast local File can resolve quickly enough to
       // starve rendering for the length of the pass.
@@ -381,6 +437,7 @@ async function readMatroskaFrameTable(reader, options = {}) {
   if (!state.presentationTimes.length) {
     throw new Error('no video frames found in this WebM');
   }
+  report(reader.size);   // a final 100% tick, so the host can settle the bar
   return state;
 }
 
@@ -2027,6 +2084,14 @@ async function createBestEngine(source, options = {}) {
     // Neither touches the MP4 path, which is a few range reads either way.
     indexTimeoutMilliseconds = 10000,
     indexMaxBytes = Infinity,
+    // Called ~once per megabyte while a WebM is being indexed (the one pass long
+    // enough to be worth showing), and once more at 100% when it finishes, with
+    // a progress report: { bytesRead, totalBytes, fraction, elapsedMs, etaMs,
+    // framesFound }. formatProgress() turns one into "Indexing… 42% (~8s left)".
+    // An MP4's index is a few range reads however long the clip is, so it emits
+    // no ticks — drive a bar's visibility off this promise and let onProgress
+    // fill in the WebM case. Ignored when a prebuilt index is passed in.
+    onProgress,
     // A caller that has already built the index for this source passes it here,
     // so the moov is not parsed twice. Passing null means "already tried, not
     // available" — which is different from leaving it out, which means "build it
@@ -2041,6 +2106,7 @@ async function createBestEngine(source, options = {}) {
       index = await ContainerIndex.fromSource(source, {
         timeoutMilliseconds: indexTimeoutMilliseconds,
         maxBytes: indexMaxBytes,
+        onProgress,
       });
     } catch (err) {
       console.warn('exact-video-engine: could not index this container (not '

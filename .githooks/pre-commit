@@ -12,6 +12,19 @@
 # thing.
 set -euo pipefail
 
+# The root engine file is generated from src/ by build.mjs. A commit that
+# touches either side must keep them in step, or consumers get a script that no
+# longer corresponds to the source it claims to be built from. Same philosophy
+# as the version pins below: never running this breaks nothing, because the
+# release workflow runs the same check before it tags.
+if git diff --cached --name-only | grep -qE '^(src/|exact-video-engine\.js$|build\.mjs$)'; then
+    if ! (cd "$(git rev-parse --show-toplevel)" && node build.mjs --check); then
+        echo "pre-commit: exact-video-engine.js is out of step with src/. Run" >&2
+        echo "'node build.mjs' and stage the result alongside your src/ changes." >&2
+        exit 1
+    fi
+fi
+
 # Only a change to VERSION can move the pins. Every other commit is none of our
 # business, and the hook must stay invisible for those.
 git diff --cached --name-only | grep -qx VERSION || exit 0

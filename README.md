@@ -103,6 +103,28 @@ says so. Neither option affects MP4, which is a handful of range reads however
 long the clip is. The pass yields to the event loop as it goes, so it cannot
 freeze the page.
 
+Because that pass is the one part of opening a clip whose cost grows with the
+file, it can report progress. Pass an `onProgress` callback and it is called
+about once per megabyte during the WebM scan, and once more at 100% when it
+finishes:
+
+```js
+const engine = await createBestEngine(source, {
+  canvas, video,
+  onProgress: (p) => {
+    // p = { bytesRead, totalBytes, fraction, elapsedMs, etaMs, framesFound }
+    bar.style.width = `${p.fraction * 100}%`;
+    label.textContent = formatProgress(p);   // "Indexing… 42% (~8s left)"
+  },
+});
+```
+
+`etaMs` is estimated from the average rate so far (0 at the very start and the
+end, so hide the ETA until a few percent in if you like). A throw from the
+callback is swallowed, so a broken indicator can never abort a load. An MP4
+emits no ticks — its index is instant — so drive a spinner's visibility off the
+`createBestEngine` promise and let `onProgress` fill in the WebM case.
+
 ## Usage
 
 ```html
@@ -291,6 +313,25 @@ change.
 
 Known consumers: [SportViewer](https://github.com/jasper-tms/SportViewer)
 (viewer.movim.ai) and the [movim.ai](https://movim.ai) sessions app.
+
+## Developing
+
+The engine's source lives in `src/` as ES modules — one per concern (the range
+readers, the Matroska scan, `ContainerIndex`, the two engines, the ladder) — so
+each piece can be read, edited, and tested in isolation (the parsers import
+into plain Node, no browser required). `exact-video-engine.js` at the repo root
+is *generated* from them:
+
+```sh
+node build.mjs           # rewrite exact-video-engine.js from src/
+node build.mjs --check   # verify it is in step; pre-commit and CI both run this
+```
+
+The build only drops the module import/export syntax and concatenates in
+dependency order — no minification, no renaming — so the shipped file reads
+line for line like the source. Edit `src/`, run the build, and commit both
+together; the pre-commit hook refuses a commit that lets them drift, and the
+release workflow re-checks before tagging.
 
 ## Releasing
 

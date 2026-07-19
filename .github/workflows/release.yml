@@ -31,6 +31,12 @@ jobs:
       - name: Check pinned CDN URLs match VERSION
         run: .githooks/sync_version.sh --check
 
+      # Same reasoning for the built file: exact-video-engine.js is generated
+      # from src/ by build.mjs, and a tag must never ship a script that drifted
+      # from the source it claims to be built from.
+      - name: Check exact-video-engine.js is in step with src/
+        run: node build.mjs --check
+
       - name: Create tag and GitHub Release
         uses: softprops/action-gh-release@v3
         with:
