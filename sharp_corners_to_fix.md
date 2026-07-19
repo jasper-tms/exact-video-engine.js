@@ -6,14 +6,14 @@ so these can be prioritized on impact alone.
 
 ## Things that visibly break
 
-**1. HDR / iPhone videos crash partway through playback.**
+**ALREADY FIXED: 1. HDR / iPhone videos crash partway through playback.** 
 A video shot on a recent iPhone (the default HDR / 10-bit format) can start
 playing, then die a second or two in — on iPhones, and also in desktop Safari.
 Whether the user recovers depends entirely on the app around it catching the
 failure and reloading; on its own, the player just stops. This is the single
 most common real-world "it worked on my laptop but broke on my phone" report.
 
-**2. Trimmed videos lose frame accuracy.**
+**ALREADY FIXED: 2. Trimmed videos lose frame accuracy.**
 If a clip has been trimmed so it starts partway in, the player refuses to guess
 and drops to *approximate* frame numbers. So a trimmed clip can't be annotated
 or seeked frame-accurately — the one thing this library exists to guarantee
@@ -34,7 +34,8 @@ gets.
 
 **5. Anything that isn't MP4/MOV or WebM is approximate only.**
 Ogg, streaming formats (HLS), and other containers play, but with guessed frame
-numbers. No error, just silently not frame-exact.
+numbers. No error, just silently not frame-exact. *(Fixed — see status: the
+player now guarantees frame accuracy or bails, and never silently guesses.)*
 
 ## Things you simply can't do
 
@@ -73,3 +74,22 @@ distant cloud bucket, even for a small file.
   engines play the trim frame-exact (Chromium/WebCodecs everywhere). Where a
   browser exposes the trimmed clip's `<video>` timeline inconsistently (WebKit),
   the native path degrades honestly to approximate rather than lie.
+- [x] **5** — Non-MP4/WebM containers are approximate only — *fixed (guarantee or
+  bail).* A clip that cannot be indexed (Ogg, HLS, anything but MP4/MOV and
+  WebM/MKV) no longer silently plays with guessed frame numbers. If the host
+  supplies a `declaredFrameRate`, that rate is **verified** against the clip's real
+  frame timestamps by a seek-probe at load — paused seeks on the engine's own
+  timeline, no playthrough — which flushes out a wrong rate, a variable-frame-rate
+  clip, or a hidden higher rate (2×/telecine) and throws rather than mislabel
+  frames; a rate that survives is then policed each frame during playback (a fatal
+  `errormessage` with `detail.inexact` if it later drifts off-grid). A clip with
+  neither an index nor a declared rate throws outright. `allowApproximate: true`
+  is the explicit opt-out for a host that does not need frame accuracy. On a
+  browser whose `requestVideoFrameCallback` echoes the seek target instead of
+  reporting a frame's real timestamp (Firefox), verification is skipped honestly
+  (frame numbers stay marked inexact) rather than false-bailing a good clip.
+  *Follow-ups left open:* actually widening the frame-exact set to new containers
+  (an AVI `idx1` reader, an Ogg/Theora demuxer, a whole-clip seek-stepping
+  indexer for any short playable format) — this fix makes the boundary honest, it
+  does not move it. It also tightens the WebM-timeout half of #4: a timed-out WebM
+  with a declared rate now verifies or bails instead of silently degrading.

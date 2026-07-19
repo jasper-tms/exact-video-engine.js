@@ -31,6 +31,17 @@ export async function createBestEngine(source, options = {}) {
     windowAhead,
     declaredFrameRate = 0,
     declaredNumFrames = 0,
+    // Guarantee-or-bail for frame accuracy. A clip we cannot index (not MP4/MOV,
+    // not WebM/MKV) has no per-frame timestamp table, so the native engine can
+    // only map frames from a declared rate — exact only if the clip really is
+    // constant-frame-rate at that rate. By default such a clip must come with a
+    // declaredFrameRate (which is then VERIFIED against the real frame timestamps
+    // and rejected if inconsistent, rather than trusted); a clip with neither an
+    // index nor a rate throws rather than play with silently guessed frame
+    // numbers. Set allowApproximate: true to opt out of both — play the clip
+    // best-effort with whatever mapping is available and no frame-accuracy
+    // guarantee — for a host that genuinely does not need exact frame numbers.
+    allowApproximate = false,
     // How long the WebM index is allowed to take. Building it means reading the
     // whole file (Matroska keeps no central sample table), which is quick from
     // disk and as slow as the network from a URL — so it gets a deadline, and a
@@ -67,8 +78,9 @@ export async function createBestEngine(source, options = {}) {
     } catch (err) {
       console.warn('exact-video-engine: could not index this container (not '
         + 'ISOBMFF or WebM, mp4box.js not loaded, or the WebM pass ran out of '
-        + 'time). The <video> element may still play it, but frame indices will '
-        + 'come from the declared frame rate.', err);
+        + 'time). The <video> element may still play it, but only from a declared '
+        + 'frame rate — a clip with neither an index nor a declaredFrameRate bails '
+        + 'below rather than guess frame numbers.', err);
     }
   }
 
@@ -109,11 +121,28 @@ export async function createBestEngine(source, options = {}) {
   if (!video) {
     throw new Error('createBestEngine: no <video> element supplied to fall back to');
   }
+
+  // Guarantee-or-bail: a clip with no container index and no declared frame rate
+  // could only be played with frame numbers guessed from an assumed rate. Rather
+  // than hand back an engine that silently reports guesses, refuse — unless the
+  // host has explicitly accepted best-effort playback with allowApproximate.
+  if (!index && !allowApproximate && !(declaredFrameRate > 0)) {
+    throw new Error('createBestEngine: this container could not be indexed for '
+      + 'frame-exact playback (it is not MP4/MOV or WebM/MKV), and no '
+      + 'declaredFrameRate was supplied to fall back to, so frame numbers would be '
+      + 'guesses. Pass declaredFrameRate to accept declared-rate mapping (it is '
+      + 'verified against the real frame timestamps and rejected if inconsistent), '
+      + 'or allowApproximate: true to play it best-effort without frame accuracy.');
+  }
+
   const engine = new NativeVideoEngine(video);
   await engine.load(source, {
     index,
     frameRate: declaredFrameRate,
     numFrames: declaredNumFrames,
+    // With no index and a declared rate, verify that rate against the clip's real
+    // frame timestamps and throw if it is wrong (unless the host opted out).
+    verifyDeclaredRate: !allowApproximate,
   });
   return engine;
 }

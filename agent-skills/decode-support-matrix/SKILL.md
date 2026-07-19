@@ -31,7 +31,13 @@ Container indexing is codec-agnostic and separate from decoding:
   from), so WebM never gets the WebCodecs backend — only frame-exact `<video>`
   playback, and only if the index finishes within its deadline/byte budget.
 - No index at all → native engine maps frames from a declared constant frame
-  rate and `frameIndexIsExact` is false.
+  rate and `frameIndexIsExact` is false. That declared rate is no longer trusted
+  blindly: `createBestEngine` verifies it against the clip's real frame
+  timestamps with a paused seek-probe at load and throws if it is wrong (or bails
+  outright if no rate was given), so an un-indexable clip is guaranteed
+  frame-exact or refused, never silently approximate. `allowApproximate: true`
+  opts out. See `src/frame-rate-check.js` and the README's "Frame accuracy is
+  guaranteed, or the clip bails".
 
 So "can this backend decode it" (below) never affects whether frame numbers
 are trustworthy — only which pixels-producing path is available.

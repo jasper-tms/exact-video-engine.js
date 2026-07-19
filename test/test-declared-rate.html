@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine declared-frame-rate verification test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<div id="pane" style="width: 150px; height: 90px"><canvas id="engine-canvas"></canvas></div>
+<video id="native-video" muted playsinline></video>
+<script>
+// Drives createBestEngine down the DECLARED-FRAME-RATE path to exercise the
+// guarantee-or-bail behavior for clips with no usable container index.
+//
+// Query params:
+//   file                a clip under clips/
+//   forceNoIndex=1      pass index:null, so an indexable MP4 still takes the
+//                       declared-rate path (lets the test reuse the counter clips
+//                       instead of needing a real un-indexable container)
+//   indexTimeoutMs      cap the container-index build (0 makes a WebM scan time
+//                       out, the real path behind sharp corner #4)
+//   declaredFrameRate   the rate to declare (and have the probe verify)
+//   allowApproximate=1  opt out of verification / bail
+const params = new URLSearchParams(location.search);
+
+async function run() {
+  const file = 'clips/' + params.get('file');
+  const canvas = document.getElementById('engine-canvas');
+  const video = document.getElementById('native-video');
+  const source = await (await fetch(file)).blob();
+
+  const options = { canvas, video };
+  if (params.get('forceNoIndex') === '1') options.index = null;
+  if (params.get('indexTimeoutMs') !== null) {
+    options.indexTimeoutMilliseconds = Number(params.get('indexTimeoutMs'));
+  }
+  if (params.get('declaredFrameRate')) {
+    options.declaredFrameRate = Number(params.get('declaredFrameRate'));
+  }
+  if (params.get('allowApproximate') === '1') options.allowApproximate = true;
+
+  const result = {
+    loaded: false, tier: null, frameIndexIsExact: null,
+    frameMappingInexact: null, numFrames: null, error: null,
+  };
+  let engine = null;
+  try {
+    engine = await createBestEngine(source, options);
+    result.loaded = true;
+    result.tier = engine.tier;
+    result.frameIndexIsExact = engine.frameIndexIsExact;
+    result.frameMappingInexact = engine.frameMappingInexact;
+    result.numFrames = engine.numFrames;
+  } catch (err) {
+    result.error = String(err && err.message || err);
+  } finally {
+    if (engine && engine.destroy) { try { engine.destroy(); } catch (e) {} }
+  }
+  window.__result = result;
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>

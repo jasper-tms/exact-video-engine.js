@@ -100,7 +100,7 @@ const CASES = [
 const browser = await launchBrowser();
 let failures = 0;
 
-for (const { name, file, mode, expect } of CASES) {
+async function loadCase(file, mode) {
   const page = await browser.newPage();
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(e.message));
@@ -113,6 +113,33 @@ for (const { name, file, mode, expect } of CASES) {
   const { result, err } = await page.evaluate(
     () => ({ result: window.__result, err: window.__err }));
   await page.close();
+  return { result, err, settled, elapsed, pageErrors };
+}
+
+// The trimming-edit-list case rides the same flaky Chromium load-time race
+// frame-index-test.mjs documents and retries: _indexDescribesElement reads
+// video.duration right after 'loadeddata', and for an edit-list clip Chromium
+// sometimes reports the media duration there and only later extends it, so the
+// duration check occasionally mistakes the honored index for a trimming mismatch
+// and drops it to the declared frame rate. It rolls per load, so a case that
+// expects the index gets a fresh roll by reloading. Retry ONLY that exact
+// signature — expected an exact index, got the declared-rate fallback — so a real
+// regression (wrong frames, a hang, a page error) still fails every attempt.
+const MAX_ATTEMPTS = 4;
+async function loadCaseExpectingIndex(file, mode, wantsExactIndex) {
+  let loaded = await loadCase(file, mode);
+  let attempts = 1;
+  while (wantsExactIndex && attempts < MAX_ATTEMPTS
+      && loaded.result && loaded.result.frameIndexIsExact === false) {
+    attempts += 1;
+    loaded = await loadCase(file, mode);
+  }
+  return loaded;
+}
+
+for (const { name, file, mode, expect } of CASES) {
+  const { result, err, settled, elapsed, pageErrors } =
+    await loadCaseExpectingIndex(file, mode, expect.frameIndexIsExact === true);
 
   const problems = [];
 

@@ -159,9 +159,13 @@ const CASES = [
     firefox: { exact: false, indexExact: false } },
   // Indexing a WebM costs a pass over the whole file, so the engine puts a
   // deadline on it. Give it none and it must land softly on the declared frame
-  // rate — mismapping the VFR clip exactly as native-declared does, and playing
-  // it rather than failing.
-  { file: 'counter-vfr.webm', mode: 'native-timeout', firstBar: 0, exact: false, indexExact: false },
+  // rate — and for a CONSTANT-frame-rate clip the declared rate is right, so the
+  // pixels stay exact (indexExact false, exact true), proving the timeout path
+  // still plays rather than failing. The VARIABLE-frame-rate twin cannot land here
+  // anymore: with a declared rate it fails the frame-rate verification and bails
+  // (rather than silently mismap), which the pixel-walk harness cannot express —
+  // declared-rate-verify-test.mjs pins that bail against counter-vfr.webm instead.
+  { file: 'counter-cfr.webm', mode: 'native-timeout', firstBar: 0, exact: true, indexExact: false },
 
   // --- Regression fixtures appended by the test-fixtures work ---------------
   // These pin the CURRENT behavior on input classes that upcoming feature work

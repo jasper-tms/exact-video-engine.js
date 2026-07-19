@@ -1675,6 +1675,128 @@ class VideoEngine extends EventTarget {
 }
 
 // ==================================================================
+// frame-rate-check — verify a declared constant frame rate against the video's
+// real frame timestamps, so a clip we could not index never SILENTLY plays with
+// guessed frame numbers.
+//
+// When a container cannot be indexed (not MP4/MOV, not WebM/MKV — Ogg, HLS, and
+// anything else), the native <video> engine has no per-frame timestamp table and
+// falls back to mapping frames as `mediaTime * declaredFrameRate`. That mapping
+// is exact only if the clip really is constant-frame-rate at exactly that rate,
+// and nothing so far checked whether it is. This module is that check.
+//
+// The tool is `requestVideoFrameCallback`, whose `mediaTime` is the EXACT
+// presentation timestamp of the frame on screen. Seeking a paused element to a
+// chosen time and reading the landed mediaTime lets us sample the real timestamp
+// lattice on our own timeline (seek latency is bounded by group-of-pictures
+// length, not clip duration — so this costs the same on a 10-second or a 2-hour
+// clip), and a truly constant-frame-rate clip has every frame k at time
+// anchor + k/rate. Two failure modes matter and the probe plan below targets
+// both:
+//
+//   * a WRONG or DRIFTING rate (e.g. 30 declared for a 29.97 clip, or a variable
+//     clip that skips a frame): any dropped or extra frame shifts every LATER
+//     frame by a whole slot permanently, so the residual grows toward the end of
+//     the clip. Sampling spread across the clip — and decisively at the last
+//     slot — catches an integer frame-count mismatch a near-the-start sample
+//     would miss.
+//   * a HIGHER true rate (60 declared as 30, telecine): every declared grid
+//     point still sits on a real frame, so the intruders hide exactly BETWEEN
+//     the points a single midpoint probe would check. Sampling two points INSIDE
+//     one predicted frame's interval and requiring both to resolve to the same
+//     frame flushes them out.
+//
+// This is falsification, not proof: passing every probe cannot prove constant
+// frame rate (a pathological rate hiding entirely between the sample points
+// survives — only decoding every frame proves it), but it disproves the
+// realistic wrong-rate, dropped-frame, and doubled-rate cases. The engine treats
+// a pass as "not disproven, proceed" and never upgrades frameIndexIsExact on the
+// strength of it.
+// ==================================================================
+
+// The tolerance, in seconds, within which a presented timestamp must sit on the
+// declared-rate grid to count as on it. A quarter of a frame: tight enough that a
+// whole-frame mislabel (the thing we are guarding against) always exceeds it,
+// loose enough to absorb the container's sub-millisecond timestamp rounding.
+function declaredRateTolerance(rate) {
+  return 0.25 / rate;
+}
+
+// How many frames a clip of this many seconds holds at this rate — the frame
+// count the declared-rate mapping implies, used to place the spread probe points
+// (and, at the last slot, to catch a clip that holds fewer frames than its
+// duration-times-rate would suggest).
+function predictedFrameCount(durationSeconds, rate) {
+  if (!(rate > 0) || !(durationSeconds > 0)) return 1;
+  return Math.max(1, Math.round(durationSeconds * rate));
+}
+
+// The seek plan: where to seek (in seconds from the first frame's timestamp) and
+// which frame a constant-rate clip must present there. Each step is
+// { frameUnits, seekOffsetSeconds, expectedFrameIndex, expectedTimeSeconds };
+// the engine seeks to anchor + seekOffsetSeconds, reads the landed mediaTime, and
+// requires |landed - anchor - expectedTimeSeconds| <= declaredRateTolerance.
+//
+// `frameUnits` is the seek position measured in declared-frame widths; the
+// expected frame is floor(frameUnits), so two sub-frame points in the same
+// interval (0.33 and 0.66) share an expected frame and disagree only if a hidden
+// higher-rate boundary splits them.
+function buildDeclaredRateProbePlan(rate, predictedFrames) {
+  if (!(rate > 0)) return [];
+  const frameDuration = 1 / rate;
+  const lastFrame = Math.max(0, (predictedFrames | 0) - 1);
+  const points = new Set();
+
+  // Inside the first frame: catches a doubled/telecined rate whose extra frame
+  // boundary falls between these two points (a single midpoint would miss it).
+  points.add(0.33);
+  points.add(0.66);
+
+  // Consecutive early frames pin the base interval spacing precisely.
+  points.add(1.5);
+  points.add(2.5);
+  points.add(3.5);
+
+  // Spread across the clip. A single dropped or extra frame shifts every later
+  // frame by one whole slot permanently, so the residual GROWS toward the end;
+  // sampling at 1/4, 1/2, 3/4 (each as a .33/.66 pair, to also catch a rate that
+  // changes partway) and decisively at the last slot catches any integer
+  // frame-count mismatch.
+  for (const fraction of [0.25, 0.5, 0.75]) {
+    const anchorFrame = Math.round(fraction * lastFrame);
+    points.add(anchorFrame + 0.33);
+    points.add(anchorFrame + 0.66);
+  }
+  points.add(lastFrame + 0.5);
+
+  return Array.from(points)
+    .filter((frameUnits) => frameUnits >= 0 && Math.floor(frameUnits) <= lastFrame)
+    .sort((a, b) => a - b)
+    .map((frameUnits) => ({
+      frameUnits,
+      seekOffsetSeconds: frameUnits * frameDuration,
+      expectedFrameIndex: Math.floor(frameUnits),
+      expectedTimeSeconds: Math.floor(frameUnits) * frameDuration,
+    }));
+}
+
+// Does a landed timestamp (measured from the first frame's timestamp) sit within
+// tolerance of where a constant-rate clip would present the expected frame?
+function probeStepPasses(observedTimeFromAnchor, expectedTimeSeconds, rate) {
+  return Math.abs(observedTimeFromAnchor - expectedTimeSeconds) <= declaredRateTolerance(rate);
+}
+
+// The runtime check, for a frame presented during ordinary playback: snap the
+// timestamp to the nearest declared-rate slot and report whether it landed on it.
+// A clip that is constant-rate at the declared rate keeps every presented frame
+// on a slot; sustained misses mean the mapping is wrong.
+function isPresentedTimeOnGrid(observedTimeFromAnchor, rate) {
+  const frameIndex = Math.round(observedTimeFromAnchor * rate);
+  if (frameIndex < 0) return { onGrid: false, frameIndex, residual: Infinity };
+  const residual = Math.abs(observedTimeFromAnchor - frameIndex / rate);
+  return { onGrid: residual <= declaredRateTolerance(rate), frameIndex, residual };
+}
+// ==================================================================
 // NativeVideoEngine — a <video> element behind the same surface as VideoEngine.
 //
 // Observational, not authoritative: the browser decides which frame is on
@@ -1719,6 +1841,19 @@ class NativeVideoEngine extends EventTarget {
     // nonzero start time; calibrated at load (see _calibrateTimeOffset).
     this._timeOffset = 0;
     this._indexStrikes = 0;        // consecutive presented frames that missed the table
+
+    // Declared-frame-rate verification (only when there is no index and a rate
+    // was supplied — see load()'s verifyDeclaredRate). The anchor is the first
+    // frame's real timestamp, against which the k/rate grid is measured; strikes
+    // count consecutive presented frames that miss it during playback; _probing
+    // suppresses the runtime watcher while the load-time seek-probe drives its own
+    // seeks; _frameMappingInexact latches once playback disproves the rate.
+    this._verifyDeclaredRateEnabled = false;
+    this._declaredAnchor = null;
+    this._declaredStrikes = 0;
+    this._probing = false;
+    this._probeResolver = null;
+    this._frameMappingInexact = false;
 
     this._loop = true;
     this._rate = 1;                // reapplied after each load (src reset clears it)
@@ -1805,8 +1940,20 @@ class NativeVideoEngine extends EventTarget {
   // True only when frame indices come from the container's real timestamps.
   // With a declared frame rate they are exact for constant-frame-rate clips and
   // approximate otherwise, and a host that must not mislabel a frame (an
-  // annotation tool, say) should check this and say so.
+  // annotation tool, say) should check this and say so. Never promoted on the
+  // strength of the declared-rate probe: sampling can disprove constant frame
+  // rate but cannot prove it (see frame-rate-check.js), so the honest answer for
+  // a declared-rate clip stays false.
   get frameIndexIsExact() { return this._index !== null; }
+
+  // True once a declared-frame-rate clip is caught mid-playback presenting frames
+  // that no longer sit on the declared grid — i.e. the rate the host supplied is
+  // wrong and the frame numbers this engine reports are unreliable. Stays false
+  // for indexed clips (their numbers come from real timestamps) and for a
+  // declared-rate clip whose timestamps have so far stayed on the grid. A host
+  // can poll this or listen for the fatal 'errormessage' (detail.inexact) it is
+  // set alongside.
+  get frameMappingInexact() { return this._frameMappingInexact; }
 
   frameAtTime(t) {
     if (this._index) return this._index.frameAtTime(t);
@@ -1946,6 +2093,24 @@ class NativeVideoEngine extends EventTarget {
         if (options.frameRate) this.framesPerSecond = options.frameRate;
         this.numFrames = options.numFrames
           || Math.round(this.duration * this.framesPerSecond);
+        // No container index means frames are mapped from the declared rate,
+        // which is exact only if the clip really is constant-frame-rate at that
+        // rate. Verify it against the real presented timestamps before handing
+        // back an engine that would otherwise report guessed frame numbers
+        // silently: a disproven rate throws out of load() (createBestEngine turns
+        // that into a clear bail), and a rate that survives the probe is then
+        // policed for the rest of playback by _checkDeclaredRate.
+        //
+        // Gate on options.frameRate, not framesPerSecond: the probe verifies a
+        // rate the HOST asserted. An index dropped mid-load (a trimming edit list
+        // the element mis-times, a WebM whose scan fell short) leaves framesPerSecond
+        // set to the index's own average, but the host never claimed that as a
+        // constant rate — so there is nothing of theirs to verify or bail on, and
+        // the pre-existing honest-approximate fallback stands.
+        if (options.verifyDeclaredRate && options.frameRate > 0) {
+          await this._verifyDeclaredFrameRate();
+          this._verifyDeclaredRateEnabled = true;
+        }
       }
 
       this.ready = true;
@@ -2029,6 +2194,163 @@ class NativeVideoEngine extends EventTarget {
     return this._timeOffset + lastFrameStart <= elementDuration + slack;
   }
 
+  // Whether the element can be seeked at all. A live stream or a container the
+  // browser cannot random-access cannot be probed; seekable stays empty until the
+  // element knows, so an empty range means "cannot verify", not "seekable to 0".
+  _elementIsSeekable() {
+    const ranges = this.video.seekable;
+    if (!ranges || ranges.length === 0) return false;
+    try { return ranges.end(ranges.length - 1) > ranges.start(0); }
+    catch (e) { return false; }
+  }
+
+  // Try to disprove a declared constant frame rate against the clip's real frame
+  // timestamps, on our own timeline (paused seeks, no playthrough — seek latency
+  // is bounded by group-of-pictures length, not clip duration). Seeks to the
+  // points frame-rate-check plans and requires each landed timestamp to sit on the
+  // k/rate grid; a single miss beyond tolerance means the rate is wrong or the
+  // clip is variable, and we throw rather than hand back guessed frame numbers.
+  //
+  // Returns without throwing where we simply cannot check — no presented-frame
+  // clock, an unseekable source, or no frame to anchor on — because the host
+  // explicitly accepted declared-rate mapping by supplying a rate; we add a safety
+  // net where one is possible and never make that opted-into case worse.
+  async _verifyDeclaredFrameRate() {
+    if (!this.hasPresentedFrameClock) {
+      console.warn('NativeVideoEngine: cannot verify the declared frame rate — this '
+        + 'browser has no requestVideoFrameCallback, so there are no frame timestamps '
+        + 'to check. Frame numbers are exact only if the clip is constant-frame-rate.');
+      return;
+    }
+    if (!this._elementIsSeekable()) {
+      console.warn('NativeVideoEngine: cannot verify the declared frame rate — the '
+        + 'source is not seekable. Frame numbers are exact only if the clip is '
+        + 'constant-frame-rate.');
+      return;
+    }
+    const anchor = await this._nextPresentedMediaTime(2000);
+    if (anchor === null) {
+      console.warn('NativeVideoEngine: cannot verify the declared frame rate — no frame '
+        + 'was presented to anchor on. Frame numbers are exact only if the clip is '
+        + 'constant-frame-rate.');
+      return;
+    }
+    this._declaredAnchor = anchor;
+
+    const rate = this.framesPerSecond;
+    const duration = this.video.duration;
+    const frames = predictedFrameCount(
+      (isFinite(duration) && duration > 0) ? duration : (this.numFrames / rate) || 1, rate);
+    const plan = buildDeclaredRateProbePlan(rate, frames);
+    const tolerance = declaredRateTolerance(rate);
+
+    this._probing = true;
+    let disproof = null;
+    try {
+      // Calibrate the signal before trusting it. Seek to a point safely inside
+      // frame 0 (0.4 of a frame in — still frame 0 for any true rate up to ~2.5x
+      // the declared one) and check the reported timestamp is frame 0's, i.e. the
+      // anchor. A browser that reports a seeked frame's real presentation timestamp
+      // (Chromium, WebKit) returns the anchor; Firefox instead ECHOES the time we
+      // seeked to, which would make every probe look like a disproof. When the
+      // timestamps are unreadable this way we cannot verify — so proceed with the
+      // declared rate honestly rather than bail on a signal known to be unreliable
+      // (the same clock imprecision that makes Firefox drop the container index).
+      const calibrated = await this._seekAndReadPresentedTime(anchor + 0.4 / rate);
+      if (calibrated === null || Math.abs(calibrated - anchor) > tolerance) {
+        console.warn('NativeVideoEngine: cannot verify the declared frame rate — this '
+          + "browser's requestVideoFrameCallback does not report a seeked frame's "
+          + 'presentation timestamp (it echoes the seek target), so the real frame '
+          + 'timestamps are unreadable. Frame numbers are exact only if the clip is '
+          + 'constant-frame-rate.');
+        this._declaredAnchor = null;   // the same clock drives the runtime watcher; leave it off too
+        return;
+      }
+      for (const step of plan) {
+        const landed = await this._seekAndReadPresentedTime(anchor + step.seekOffsetSeconds);
+        if (landed === null) continue;   // inconclusive seek; do not hold it against the rate
+        const residual = Math.abs((landed - anchor) - step.expectedTimeSeconds);
+        if (residual > tolerance) { disproof = { step, landed, residual }; break; }
+      }
+    } finally {
+      this._probing = false;
+      // Leave the element on its first frame so the host starts from a clean state.
+      try { this.video.currentTime = anchor; } catch (e) { /* seek back not available */ }
+    }
+
+    if (disproof) {
+      const { step, landed, residual } = disproof;
+      this._frameMappingInexact = true;
+      throw new Error(
+        `declared frame rate ${rate} fps is inconsistent with this video's real frame `
+        + `timestamps: seeking to ${(anchor + step.seekOffsetSeconds).toFixed(4)}s presented a `
+        + `frame at ${landed.toFixed(4)}s, but a ${rate} fps clip would present frame `
+        + `${step.expectedFrameIndex} at ${(anchor + step.expectedTimeSeconds).toFixed(4)}s `
+        + `(off by ${(residual * 1000).toFixed(1)} ms). The clip is variable-frame-rate or the `
+        + 'declared rate is wrong, so frame numbers cannot be trusted. Pass '
+        + 'allowApproximate: true to play it anyway without frame accuracy.');
+    }
+  }
+
+  // Seek the paused element to a time and resolve with the timestamp of the frame
+  // that ends up on screen — or null if the seek could not be read. Registers the
+  // one-shot resolver BEFORE moving the playhead so it cannot miss the repaint,
+  // and treats "seek settled but no new frame painted within a grace window" (the
+  // same frame still covers the target — exactly what two probes inside one frame
+  // should see) as the frame already on screen rather than a failure.
+  _seekAndReadPresentedTime(target, timeoutMs = 3000, graceMs = 150) {
+    const before = this._presentedMediaTime;
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        this._probeResolver = null;
+        this.video.removeEventListener('seeked', onSeeked);
+        clearTimeout(overall);
+        resolve(value);
+      };
+      // A repaint after the seek resolves with the new frame's timestamp.
+      this._probeResolver = (mediaTime) => finish(mediaTime);
+      // The seek completing with no repaint within a short grace means the same
+      // frame still covers the target; report the frame already on screen.
+      const onSeeked = () => setTimeout(() => finish(before), graceMs);
+      this.video.addEventListener('seeked', onSeeked);
+      // A seek that never settles (an unseekable region) is inconclusive.
+      const overall = setTimeout(() => finish(null), timeoutMs);
+      try { this.video.currentTime = target; }
+      catch (e) { finish(null); }
+    });
+  }
+
+  // The declared-rate sibling of _checkPresentedFrame: for a clip mapped from a
+  // declared rate, each presented frame's timestamp must sit on the k/rate grid.
+  // Sustained misses mean the rate is wrong — the clip changed rate partway, or
+  // the load-time probe's samples happened to miss the irregularity — so latch the
+  // inexact flag and emit a fatal errormessage the host can bail on. Suppressed
+  // while the load-time probe is driving its own seeks.
+  _checkDeclaredRate() {
+    if (this._index || this._probing || !this._verifyDeclaredRateEnabled) return;
+    if (this._frameMappingInexact) return;   // already reported
+    if (this._declaredAnchor === null || this._presentedMediaTime === null) return;
+    const rate = this.framesPerSecond;
+    const { onGrid, residual } = isPresentedTimeOnGrid(
+      this._presentedMediaTime - this._declaredAnchor, rate);
+    if (onGrid) { this._declaredStrikes = 0; return; }
+    if (++this._declaredStrikes < 5) return;   // tolerate a transient straggler
+    this._frameMappingInexact = true;
+    console.warn('NativeVideoEngine: presented frames no longer sit on the declared '
+      + `${rate} fps grid (off by ${(residual * 1000).toFixed(1)} ms); the clip is not `
+      + 'constant-frame-rate at that rate, so frame numbers are unreliable.');
+    this.dispatchEvent(new CustomEvent('errormessage', { detail: {
+      message: 'This video is not constant-frame-rate at the declared rate; '
+        + 'frame numbers are unreliable.',
+      fatal: true,
+      inexact: true,
+      declaredFrameRate: rate,
+    } }));
+  }
+
   // Find the constant offset between the container index's timeline and the
   // element's own.
   //
@@ -2076,7 +2398,16 @@ class NativeVideoEngine extends EventTarget {
     if (this._clockStopped) return;   // destroyed; stop the self-perpetuating loop
     this._presentedMediaTime = metadata.mediaTime;
     this._presentedAt = now;
+
+    // The load-time seek-probe, if one is waiting, takes this frame first.
+    if (this._probeResolver) {
+      const resolveProbe = this._probeResolver;
+      this._probeResolver = null;
+      resolveProbe(metadata.mediaTime);
+    }
+
     this._checkPresentedFrame();
+    this._checkDeclaredRate();
 
     const waiters = this._presentWaiters;
     this._presentWaiters = [];
@@ -2132,6 +2463,12 @@ class NativeVideoEngine extends EventTarget {
     this._index = null;
     this._timeOffset = 0;
     this._indexStrikes = 0;
+    this._verifyDeclaredRateEnabled = false;
+    this._declaredAnchor = null;
+    this._declaredStrikes = 0;
+    this._probing = false;
+    this._probeResolver = null;
+    this._frameMappingInexact = false;
     this._hideError();
   }
 
@@ -2246,6 +2583,17 @@ async function createBestEngine(source, options = {}) {
     windowAhead,
     declaredFrameRate = 0,
     declaredNumFrames = 0,
+    // Guarantee-or-bail for frame accuracy. A clip we cannot index (not MP4/MOV,
+    // not WebM/MKV) has no per-frame timestamp table, so the native engine can
+    // only map frames from a declared rate — exact only if the clip really is
+    // constant-frame-rate at that rate. By default such a clip must come with a
+    // declaredFrameRate (which is then VERIFIED against the real frame timestamps
+    // and rejected if inconsistent, rather than trusted); a clip with neither an
+    // index nor a rate throws rather than play with silently guessed frame
+    // numbers. Set allowApproximate: true to opt out of both — play the clip
+    // best-effort with whatever mapping is available and no frame-accuracy
+    // guarantee — for a host that genuinely does not need exact frame numbers.
+    allowApproximate = false,
     // How long the WebM index is allowed to take. Building it means reading the
     // whole file (Matroska keeps no central sample table), which is quick from
     // disk and as slow as the network from a URL — so it gets a deadline, and a
@@ -2282,8 +2630,9 @@ async function createBestEngine(source, options = {}) {
     } catch (err) {
       console.warn('exact-video-engine: could not index this container (not '
         + 'ISOBMFF or WebM, mp4box.js not loaded, or the WebM pass ran out of '
-        + 'time). The <video> element may still play it, but frame indices will '
-        + 'come from the declared frame rate.', err);
+        + 'time). The <video> element may still play it, but only from a declared '
+        + 'frame rate — a clip with neither an index nor a declaredFrameRate bails '
+        + 'below rather than guess frame numbers.', err);
     }
   }
 
@@ -2324,11 +2673,28 @@ async function createBestEngine(source, options = {}) {
   if (!video) {
     throw new Error('createBestEngine: no <video> element supplied to fall back to');
   }
+
+  // Guarantee-or-bail: a clip with no container index and no declared frame rate
+  // could only be played with frame numbers guessed from an assumed rate. Rather
+  // than hand back an engine that silently reports guesses, refuse — unless the
+  // host has explicitly accepted best-effort playback with allowApproximate.
+  if (!index && !allowApproximate && !(declaredFrameRate > 0)) {
+    throw new Error('createBestEngine: this container could not be indexed for '
+      + 'frame-exact playback (it is not MP4/MOV or WebM/MKV), and no '
+      + 'declaredFrameRate was supplied to fall back to, so frame numbers would be '
+      + 'guesses. Pass declaredFrameRate to accept declared-rate mapping (it is '
+      + 'verified against the real frame timestamps and rejected if inconsistent), '
+      + 'or allowApproximate: true to play it best-effort without frame accuracy.');
+  }
+
   const engine = new NativeVideoEngine(video);
   await engine.load(source, {
     index,
     frameRate: declaredFrameRate,
     numFrames: declaredNumFrames,
+    // With no index and a declared rate, verify that rate against the clip's real
+    // frame timestamps and throw if it is wrong (unless the host opted out).
+    verifyDeclaredRate: !allowApproximate,
   });
   return engine;
 }

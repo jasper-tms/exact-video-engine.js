@@ -34,6 +34,7 @@ const MODULE_ORDER = [
   'src/matroska.js',
   'src/container-index.js',
   'src/video-engine.js',
+  'src/frame-rate-check.js',
   'src/native-video-engine.js',
   'src/decode-support.js',
   'src/create-best-engine.js',
@@ -55,7 +56,17 @@ const GENERATED_BANNER =
 function stripModuleSyntax(source, modulePath) {
   const kept = [];
   for (const line of source.split('\n')) {
-    if (/^import\b/.test(line)) continue;
+    if (/^import\b/.test(line)) {
+      // Only whole-line imports are dropped. A multi-line import leaves its
+      // continuation lines behind (they do not start with `import`), which then
+      // slip past the guard below and ship as a syntax error — so refuse one here
+      // with a message that names the fix rather than let it reach the browser.
+      if (!/\bfrom\b.*;?\s*$/.test(line)) {
+        throw new Error(`${modulePath}: '${line.slice(0, 60)}' is a multi-line import; `
+          + 'this build only strips single-line imports (keep the whole import on one line)');
+      }
+      continue;
+    }
     kept.push(line.replace(/^export (?=(async )?(class|function|const|let|var)\b)/, ''));
   }
   while (kept.length && kept[0] === '') kept.shift();

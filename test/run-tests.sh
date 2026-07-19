@@ -22,6 +22,7 @@ node_status=0
 node test/matroska-progress-test.mjs || node_status=1
 node test/decode-support-test.mjs || node_status=1
 node test/edit-list-test.mjs || node_status=1
+node test/frame-rate-check-test.mjs || node_status=1
 
 # test/serve.py, not `python3 -m http.server`: the latter ignores Range headers
 # and answers 200 with the whole file, which the engine reads over Range. That is
@@ -56,13 +57,17 @@ done
 # a Chromium-specific decoder error surface (decoder-failure), and the task they
 # verify is engine bookkeeping that is not browser-specific — so running them
 # under one engine is enough and porting them would only add contortions.
-echo "=== chromium-only: startup, memory, decoder-failure, known-bad-codec ==="
+echo "=== chromium-only: startup, memory, decoder-failure, known-bad-codec, declared-rate ==="
 node test/startup-test.mjs || status=1
 node test/memory-test.mjs || status=1
 node test/decoder-failure-test.mjs || status=1
 # known-bad-codec spoofs navigator.vendor to exercise the WebKit routing path from
 # Chromium (the decision is codec-string-based, so no real HEVC decode is needed).
 node test/known-bad-codec-test.mjs || status=1
+# declared-rate drives the seek-probe that verifies (or bails on) a declared frame
+# rate for un-indexable clips; it forces the path with index:null on the counter
+# clips, so it needs a standard <video>/rVFC surface, not a specific decode path.
+node test/declared-rate-verify-test.mjs || status=1
 
 # Chromium-only too, but for a different reason: robustness-test pins that
 # malformed and truncated inputs fail softly (bounded time, no page crash). That

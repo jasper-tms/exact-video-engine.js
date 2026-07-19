@@ -61,7 +61,7 @@ browser:
 | --- | --- | --- | --- |
 | 1. WebCodecs | container (MP4) | engine-owned canvas | exact |
 | 2. `<video>` + index | container (MP4 or WebM) | browser | exact |
-| 3. `<video>` + declared rate | assumed frame rate | browser | exact only if constant-frame-rate |
+| 3. `<video>` + declared rate | assumed frame rate | browser | verified against the real timestamps, or the clip bails |
 | 4. no `requestVideoFrameCallback` | assumed frame rate | browser | `currentTime * frameRate`; last resort |
 
 Step 2 is the one that usually does not exist. It covers browsers without
@@ -74,6 +74,40 @@ Step 3 is where a container we cannot index lands (Ogg, HLS, or a WebM whose
 indexing pass ran out of time): the element still plays it, and
 `frameIndexIsExact` tells you the indices are only as good as the frame rate you
 declared.
+
+### Frame accuracy is guaranteed, or the clip bails
+
+A clip that reaches step 3 used to play with *silently* guessed frame numbers,
+which is the one thing a frame-exact library must not do quietly. It no longer
+does. What happens depends on what you told `createBestEngine`:
+
+- **You passed a `declaredFrameRate`.** The engine treats it as a hypothesis and
+  tries to disprove it before trusting it. At load it drives a handful of *paused
+  seeks* on its own timeline (bounded by group-of-pictures length, not clip
+  duration — the same on a 10-second or a two-hour clip) and reads each landed
+  frame's real presentation timestamp from `requestVideoFrameCallback`. If the
+  timestamps do not sit on the `k / rate` grid — a wrong rate, a
+  variable-frame-rate clip, or a hidden higher rate like 60-declared-as-30 or
+  telecine, which it catches by probing *inside* a single predicted frame — `load`
+  throws instead of mislabeling frames. A rate that survives the probe is then
+  policed every frame during playback: if the clip drifts off-grid later, the
+  engine sets `frameMappingInexact` and emits a fatal `errormessage` with
+  `detail.inexact: true`. This is falsification, not proof — passing cannot prove
+  constant frame rate (only decoding every frame could), so `frameIndexIsExact`
+  stays honestly `false`; the clip is simply no longer allowed to be *silently*
+  wrong.
+- **You passed no rate.** There is nothing to map frames from but a guess, so
+  `createBestEngine` throws rather than hand back an engine that reports guesses.
+- **You passed `allowApproximate: true`.** The explicit opt-out: play the clip
+  best-effort with whatever mapping is available and no frame-accuracy guarantee,
+  for a host that genuinely does not need exact frame numbers. No probe, no bail.
+
+One browser caveat, handled without sniffing: Firefox's
+`requestVideoFrameCallback` reports the *seek target* rather than the presented
+frame's real timestamp, so the probe cannot read the truth there. A calibration
+seek detects that up front and skips verification (frame numbers stay marked
+inexact) rather than false-bail a clip it simply cannot check — the same clock
+imprecision that already makes Firefox fall back from the container index.
 
 ### Codecs a browser accepts and then fails on
 
@@ -120,9 +154,11 @@ const engine = await createBestEngine(source, {
 
 A clip that blows through the budget falls back to the declared frame rate
 (step 3) rather than making the host wait — `frameIndexIsExact` goes false and
-says so. Neither option affects MP4, which is a handful of range reads however
-long the clip is. The pass yields to the event loop as it goes, so it cannot
-freeze the page.
+says so, and if you declared a rate it is verified against the real timestamps
+first (a variable-frame-rate WebM that times out bails rather than mismap; see
+"Frame accuracy is guaranteed, or the clip bails" above). Neither option affects
+MP4, which is a handful of range reads however long the clip is. The pass yields
+to the event loop as it goes, so it cannot freeze the page.
 
 Because that pass is the one part of opening a clip whose cost grows with the
 file, it can report progress. Pass an `onProgress` callback and it is called
@@ -215,6 +251,7 @@ plays through.
 | `displayElement` | The canvas or `<video>` the engine presents into. |
 | `tier` | What this engine got, e.g. `webcodecs` or `native (container index, presented clock)`. Useful for a dev label. |
 | `frameIndexIsExact` | Whether frame numbers are exact, or only as good as an assumed constant frame rate. A tool that must not mislabel a frame should check this and say so. |
+| `frameMappingInexact` | `NativeVideoEngine` only: false until a declared-rate clip is caught mid-playback presenting frames off the declared grid, then true — the rate you gave is wrong and the frame numbers are unreliable. Emitted alongside a fatal `errormessage` (`detail.inexact: true`). Stays false for indexed clips and for a declared rate that keeps checking out. |
 | `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when no index / no decoder configuration (WebM). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. |
 | `failed` | `VideoEngine` only: true once the `VideoDecoder` has reported an unrecoverable error. |
 | `destroy()` | Release resources when done (decoders are a limited browser resource). |
