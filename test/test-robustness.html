@@ -1,0 +1,86 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine robustness test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<!-- Both display elements are supplied so createBestEngine can walk its full
+     ladder: WebCodecs onto the canvas, or a fall back onto the <video> element. -->
+<div id="pane" style="width: 150px; height: 90px"><canvas id="engine-canvas"></canvas></div>
+<video id="native-video" muted playsinline></video>
+<script>
+// Loads ?file=<clip> through createBestEngine under ?mode= and reports, in one
+// result object, everything the driver needs to decide whether the engine
+// behaved SOFTLY: whether it loaded, what tier and frame-index honesty it
+// settled on, any console warnings it emitted, whether a first frame is
+// reachable, how long the whole thing took, and — if it refused the clip — the
+// error message a host would surface. A malformed input must land here with a
+// human-readable error OR a graceful fallback; it must never hang (which shows
+// up as this script never setting window.__result) or throw uncaught (which the
+// driver catches as a page error).
+
+// Capture warnings without losing them from the devtools console: the engine
+// announces every graceful degradation through console.warn, and several of the
+// behaviors pinned here (the trimming edit list, an unindexable container) are
+// only observable through that channel.
+const warnings = [];
+const originalWarn = console.warn;
+console.warn = (...args) => { warnings.push(args.map(String).join(' ')); originalWarn.apply(console, args); };
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const file = 'clips/' + params.get('file');
+  const mode = params.get('mode') || 'auto';
+  const canvas = document.getElementById('engine-canvas');
+  const video = document.getElementById('native-video');
+
+  // A Blob, so the engine reads exactly these bytes and does not depend on the
+  // test server's Range handling for a deliberately malformed file.
+  const source = await (await fetch(file)).blob();
+
+  const startedAt = performance.now();
+  const result = {
+    loaded: false, error: null, tier: null, frameIndexIsExact: null,
+    numFrames: null, videoWidth: null, videoHeight: null, elementDuration: null,
+    frameReachable: false, warnings,
+  };
+
+  let engine = null;
+  try {
+    // No declaredFrameRate/declaredNumFrames on purpose: when the engine falls
+    // back, we want to see the degradation it reaches on its own, not one the
+    // test propped up.
+    engine = await createBestEngine(source, { canvas, video, prefer: mode });
+    result.loaded = true;
+    result.tier = engine.tier;
+    result.frameIndexIsExact = engine.frameIndexIsExact;
+    result.numFrames = engine.numFrames;
+    result.videoWidth = engine.videoWidth;
+    result.videoHeight = engine.videoHeight;
+    result.elementDuration = video.duration;
+
+    // Prove a first frame is actually reachable, not merely that load() resolved.
+    // For the WebCodecs engine that means the decoder produces frame 0; for the
+    // native element the frame is whatever the element presents, so numFrames > 0
+    // is the reachability we can assert without racing the element's own clock.
+    if (engine.numFrames > 0) {
+      engine.seekToFrame(0);
+      if (engine.displayElement === canvas) {
+        await engine.ensureFrame(0);
+        engine.update(performance.now());
+      }
+      result.frameReachable = true;
+    }
+  } catch (err) {
+    // A refused clip: the promise rejected. This is a SOFT failure as long as the
+    // message is human-readable, which the driver checks. Record it rather than
+    // letting it become an uncaught page error.
+    result.error = String(err && err.message || err);
+  } finally {
+    if (engine && engine.destroy) { try { engine.destroy(); } catch (e) {} }
+  }
+
+  result.elapsedMilliseconds = performance.now() - startedAt;
+  window.__result = result;
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>

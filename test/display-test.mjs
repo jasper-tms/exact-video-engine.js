@@ -1,5 +1,7 @@
-// Drives test-display.html through headless Chromium and checks that a frame
-// actually reaches the screen.
+// Drives test-display.html through the browser named by TEST_BROWSER (chromium,
+// webkit, or firefox) and checks that a frame actually reaches the screen. The
+// assertions hold identically on every engine, so there are no per-browser
+// expectations here.
 //
 // This is a regression test for a bug the frame-index test could never have
 // caught, because that test asserts only on frame NUMBERS. The engine was
@@ -15,7 +17,7 @@
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
 // that) and Playwright (npm install playwright).
-import { chromium } from 'playwright';
+import { launchBrowser, serverBase } from './harness.mjs';
 
 // Neither case calls resizeCanvas() after the pane is revealed. That is the
 // point: doing so repairs the canvas even in the broken engine, so a case that
@@ -34,14 +36,14 @@ const CASES = [
 // 1x1 bug produces a single flat colour, whose spread is 0.
 const MINIMUM_PIXEL_SPREAD = 20;
 
-const browser = await chromium.launch();
+const browser = await launchBrowser();
 let failures = 0;
 
 for (const { mode } of CASES) {
   const file = 'counter-cfr.mp4';
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.log('pageerror:', e.message));
-  await page.goto(`http://localhost:8798/test/test-display.html?file=${file}&mode=${mode}`);
+  await page.goto(`${serverBase}/test/test-display.html?file=${file}&mode=${mode}`);
   await page.waitForFunction(() => window.__result || window.__err, { timeout: 60000 })
     .catch(() => {});
   const { result, err } = await page.evaluate(

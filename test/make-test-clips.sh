@@ -32,10 +32,26 @@ for degrees in 90 180 270; do
         -c copy "clips/rot${degrees}.mp4"
 done
 
-# -qp 0 (lossless) so the bar's edges stay exactly where they were drawn.
+# Near-lossless (-qp 1) rather than lossless (-qp 0), and 8-bit 4:2:0 High
+# profile with no B-frames, because this fixture is decoded three ways in the
+# test suite and two of them are fussy about how it is coded:
+#   * -qp 0 makes libx264 emit the High 4:4:4 Predictive profile (avc1.f4xxxx).
+#     WebKit's WebCodecs honestly rejects that profile at load, so the whole
+#     WebCodecs path went untested on WebKit/iOS -- exactly the engine the test
+#     matrix was widened to cover. -qp 1 with an explicit yuv420p keeps the High
+#     (8-bit 4:2:0) profile every browser's WebCodecs decodes.
+#   * -bf 0 (no B-frames) because B-frames reorder decode-versus-display and add
+#     composition-time offsets, and the <video> element's frame-accurate seek
+#     lands a frame off around them on the variable-frame-rate clip -- which
+#     would make the native-index cases in frame-index-test.mjs mismap on every
+#     browser. The original lossless clips had no B-frames as a side effect of
+#     -qp 0; -bf 0 keeps that property explicit now that the encode is lossy.
+# -qp 1 is still visually lossless at the scale that matters here: the bar edges
+# stay a hard black/white step, so visibleFrame()'s "columns brighter than half"
+# detection reads the same bar position on all three browsers' YUV-to-RGB paths.
 ffmpeg -y -loglevel error -f lavfi \
     -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
-    -pix_fmt yuv420p -c:v libx264 -qp 0 -g 10 clips/counter-cfr.mp4
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 clips/counter-cfr.mp4
 
 # settb pins the timebase to milliseconds so the setpts expression below is in
 # whole ms and needs no rounding; without it the encoder re-times against the
@@ -43,7 +59,7 @@ ffmpeg -y -loglevel error -f lavfi \
 ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
     -vf "settb=1/1000,setpts='33*N + 33*floor(N/5)'" \
     -fps_mode passthrough -video_track_timescale 1000 \
-    -pix_fmt yuv420p -c:v libx264 -qp 0 -g 10 clips/counter-vfr.mp4
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 clips/counter-vfr.mp4
 
 # The same 30 frames again, in WebM. mp4box cannot parse this container at all,
 # so these clips are what prove the engine's own Matroska cluster scan: without
@@ -102,3 +118,89 @@ ffmpeg -y -loglevel error -f lavfi -i "testsrc2=s=1920x1080:d=5:r=30" \
 
 echo "Wrote test clips:"
 ls clips
+
+# ==================================================================
+# Regression fixtures appended by the test-fixtures work: they pin the engine's
+# CURRENT graceful-degradation behavior on input classes that upcoming feature
+# work (fragmented-MP4 indexing, edit-list handling in the WebCodecs path, a
+# WebM sample table for WebCodecs) will deliberately touch. Everything below is a
+# self-contained block so it stays cleanly separable from the clips above.
+# ==================================================================
+
+# A fragmented remux of the constant-frame-rate counter clip: empty_moov moves
+# every sample out of the moov and into moof fragments, the shape a live/DASH
+# packager writes. mp4box.js reassembles the fragments' sample table when it can
+# read the whole file, so today this small clip lands on the exact WebCodecs path
+# just like the unfragmented original (frame-index-test.mjs and
+# robustness-test.mjs both pin that). When fragmented-MP4 indexing lands, that
+# support becomes a guarantee rather than a happens-to-fit-in-one-parse accident,
+# and these expectations will be tightened deliberately.
+ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
+    -c copy -movflags frag_keyframe+empty_moov clips/counter-fragmented.mp4
+
+# A WebM whose FIRST track entry is audio and whose SECOND is video: the audio
+# stream is mapped before the video stream so the Matroska Tracks element lists
+# audio first. The engine's cluster scan must skip the audio track entirely and
+# index only the video frames; a scan that counted the first track's blocks would
+# map audio packets as frames. frame-index-test.mjs proves the video frames still
+# map exactly. (-shortest so the audio does not outrun the 30 video frames.)
+ffmpeg -y -loglevel error \
+    -f lavfi -i "anullsrc=channel_layout=mono:sample_rate=48000" \
+    -i clips/counter-cfr.mp4 \
+    -map 0:a -map 1:v -shortest \
+    -c:a libopus -c:v libvpx-vp9 -lossless 1 -g 10 clips/counter-audio-first.webm
+
+# A clip carrying a TRIMMING edit list: the container sample table spans all 30
+# frames but the element presents only a 20-frame window that begins in the
+# middle of the first group of pictures. This is the case the shifting edit list
+# in counter-elst.mp4 is NOT: there the element presents every remaining frame, so
+# the durations still match. Here they must not, which is what makes
+# NativeVideoEngine refuse the index (see make-trimming-edit-list.py for why an
+# `ffmpeg -ss -c copy` cut cannot produce this shape). robustness-test.mjs pins
+# that refusal. The WebCodecs path currently ignores the edit list, which is a
+# behavior the edit-list feature work will change on purpose.
+python3 make-trimming-edit-list.py clips/counter-cfr.mp4 clips/counter-trimming-elst.mp4
+
+# Corrupt and truncated inputs, for robustness-test.mjs. Each pins that the engine
+# fails SOFTLY on malformed bytes -- bounded time, no page crash, either a
+# human-readable error or a graceful fallback -- rather than hanging or throwing
+# uncaught. They are generated here from the clips above so they track any changes
+# to those clips.
+#
+# A front-moov (faststart) MP4 is the raw material for the truncated-mdat case:
+# faststart needs a seekable output so it is written to a real file, then truncated
+# below. It is only an intermediate, so it is not one of the shipped fixtures.
+ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 -c copy \
+    -movflags +faststart clips/counter-faststart.mp4
+python3 - <<'PYTHON'
+import os
+# A WebM cut off partway through its cluster data: a real interrupted download or
+# a partial upload. The header and Tracks survive; the frame data does not.
+webm = open("clips/counter-cfr.webm", "rb").read()
+open("clips/corrupt-webm-truncated-cluster.webm", "wb").write(webm[:int(len(webm) * 0.60)])
+
+# The EBML magic number followed by pure noise: something that announces itself as
+# Matroska but carries no valid element tree, so the scan starts and then finds
+# nothing it can use.
+open("clips/corrupt-ebml-magic-then-garbage.webm", "wb").write(
+    bytes([0x1A, 0x45, 0xDF, 0xA3]) + os.urandom(2048))
+
+# An MP4 whose moov is intact (front-loaded with +faststart) but whose mdat is
+# truncated: the index parses perfectly and every frame's byte range points past
+# the end of the file, so decoding must fail rather than read garbage. Keep the
+# mdat box header plus a sliver of payload, drop the rest.
+faststart = open("clips/counter-faststart.mp4", "rb").read()
+mdat = faststart.find(b"mdat")
+open("clips/corrupt-mp4-truncated-mdat.mp4", "wb").write(faststart[:mdat + 8 + 200])
+
+# Pure noise with no recognizable container magic at all: not Matroska, no ftyp,
+# nothing mp4box or the Matroska scan can latch onto.
+garbage = bytearray(os.urandom(4096))
+garbage[0:4] = b"\x00\x00\x00\x00"   # make sure it cannot look like a box length of note
+open("clips/corrupt-pure-garbage.bin", "wb").write(bytes(garbage))
+print("wrote corrupt/truncated fixtures")
+PYTHON
+
+echo "Wrote regression fixtures:"
+ls clips/counter-fragmented.mp4 clips/counter-audio-first.webm \
+    clips/counter-trimming-elst.mp4 clips/corrupt-*

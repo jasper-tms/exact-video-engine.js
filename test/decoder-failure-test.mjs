@@ -9,12 +9,12 @@
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
 // that) and Playwright (npm install playwright).
-import { chromium } from 'playwright';
+import { launchBrowser, serverBase } from './harness.mjs';
 
-const browser = await chromium.launch();
+const browser = await launchBrowser();
 const page = await browser.newPage();
 page.on('pageerror', (e) => console.log('pageerror:', e.message));
-await page.goto('http://localhost:8798/test/test-decoder-failure.html');
+await page.goto(`${serverBase}/test/test-decoder-failure.html`);
 await page.waitForFunction(() => window.__result || window.__err, { timeout: 60000 })
   .catch(() => {});
 const { result, err } = await page.evaluate(

@@ -79,6 +79,23 @@ async function run() {
   }
   engine.pause();
 
+  // Does the frame the playhead landed on actually paint? Ask the engine for it
+  // the way a scrubbing host would, rather than reading whether it happens to be
+  // resident this instant. With no read-ahead the current frame is decoded on
+  // demand and is legitimately not in the cache the moment playback stops -- so
+  // sampling residency directly is a race, while requesting it is the real
+  // question: can the driver still deliver the current frame, or did it die and
+  // freeze the picture (the bug this whole case guards)? ensureFrame resolves
+  // once the frame is cached and rejects fast if the driver is dead, so a caught
+  // rejection is a genuine failure, not the incidental-eviction flake.
+  let frameShown = false;
+  try {
+    await engine.ensureFrame(engine.currentFrame);
+    frameShown = Boolean(engine.bitmapForFrame(engine.currentFrame));
+  } catch {
+    frameShown = false;
+  }
+
   window.__result = {
     peakBytes,
     peakFrames,
@@ -86,7 +103,7 @@ async function run() {
     // checks that playback actually got somewhere and frames were resident.
     playedToFrame: engine.currentFrame,
     numFrames: engine.numFrames,
-    frameShown: Boolean(engine.bitmapForFrame(engine.currentFrame)),
+    frameShown,
     framesPresented: shown.size,
     worstLag,
     videoWidth: engine.videoWidth,

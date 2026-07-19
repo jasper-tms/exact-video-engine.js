@@ -16,7 +16,7 @@
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
 // that) and Playwright (npm install playwright).
-import { chromium } from 'playwright';
+import { launchBrowser, serverBase } from './harness.mjs';
 
 const LARGE_FILE = 'hd.mp4';        // 1920x1080: ~8.3 MB per decoded frame
 const SMALL_FILE = 'startup.mp4';   // 640x360: ~0.9 MB per decoded frame
@@ -47,7 +47,7 @@ const MINIMUM_FRAMES_PRESENTED = 30;
 // hides, and the one the byte budget walks into on a big clip.
 const NO_READ_AHEAD = 0;
 
-const browser = await chromium.launch();
+const browser = await launchBrowser();
 let failures = 0;
 
 function report(name, ok, detail) {
@@ -69,7 +69,7 @@ async function measure(file, options = {}) {
   });
   const query = Object.entries(options)
     .map(([key, value]) => `&${key}=${value}`).join('');
-  await page.goto(`http://localhost:8798/test/test-memory.html?file=${file}${query}`);
+  await page.goto(`${serverBase}/test/test-memory.html?file=${file}${query}`);
   await page.waitForFunction(() => window.__result || window.__err, { timeout: 120000 })
     .catch(() => {});
   const { result, err } = await page.evaluate(

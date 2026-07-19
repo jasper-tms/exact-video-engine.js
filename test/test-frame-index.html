@@ -60,11 +60,47 @@ probe.width = 150;
 probe.height = 90;
 const probeContext = probe.getContext('2d');
 
-function nextPresentedFrame(video) {
+// Caps for the two <video> synchronisation waits below. A real seek fires its
+// 'seeked' event and a real presentation fires requestVideoFrameCallback within
+// tens of milliseconds; these bounds only engage when the event never comes --
+// a seek that lands within the frame already on screen fires neither (WebKit for
+// every such seek, and the other engines occasionally under load). They are
+// sized so that even if EVERY frame in a clip fell through, the total stays well
+// under the driver's 60s per-case timeout, turning what used to be a whole-page
+// hang into, at worst, a bounded read that the ground-truth pixel check judges.
+const SEEK_SETTLE_CAP_MS = 1500;
+const PRESENTED_CAP_MS = 350;
+
+// Resolve when the element reports its seek finished, but never hang: a no-op
+// seek (already at the target media time) fires no 'seeked' at all, so fall
+// through after the cap. Reading a frame early can only mismatch the expected
+// bar and fail loudly -- it can never pass wrongly -- so the cap is safe.
+function seekSettled(video, capMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      video.removeEventListener('seeked', finish);
+      resolve();
+    };
+    video.addEventListener('seeked', finish);
+    setTimeout(finish, capMs);
+  });
+}
+
+// Resolve on the next presented frame, but never hang for the same reason. A
+// browser without requestVideoFrameCallback just gets a fixed settle.
+function nextPresentedFrame(video, capMs) {
   if (!('requestVideoFrameCallback' in video)) {
     return new Promise((resolve) => setTimeout(resolve, 50));
   }
-  return new Promise((resolve) => video.requestVideoFrameCallback(() => resolve()));
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    video.requestVideoFrameCallback(finish);
+    setTimeout(finish, capMs);
+  });
 }
 
 async function run() {
@@ -101,6 +137,24 @@ async function run() {
   }
 
   const usingCanvas = engine.displayElement === canvas;
+
+  // Prime the <video> path away from frame 0 before the loop below.
+  //
+  // WebKit fires no requestVideoFrameCallback for a seek that lands within the
+  // frame already on screen -- and with a container index the engine's load()
+  // presents frame 0 while calibrating the timeline, so the loop's very first
+  // seek (to frame 0) would be exactly that no-op seek and nextPresentedFrame()
+  // would wait forever. Chromium fires the callback for that seek anyway, which
+  // is why this only bit WebKit. Seeking to the last frame first makes every
+  // seek in the loop a genuine frame change, so a real presentation follows each
+  // one on all three browsers. The canvas (WebCodecs) path decodes on its own
+  // clock and needs none of this.
+  if (!usingCanvas && engine.numFrames > 1) {
+    engine.seekToFrame(engine.numFrames - 1);
+    await seekSettled(video, SEEK_SETTLE_CAP_MS);
+    await nextPresentedFrame(video, PRESENTED_CAP_MS);
+  }
+
   const rows = [];
   for (let n = 0; n < engine.numFrames; n++) {
     engine.seekToFrame(n);
@@ -111,9 +165,11 @@ async function run() {
       probeContext.drawImage(canvas, 0, 0, probe.width, probe.height);
     } else {
       // Let the element settle on the seek, then wait for it to actually present
-      // a frame before believing what drawImage gives back.
-      await new Promise((resolve) => { video.onseeked = resolve; });
-      await nextPresentedFrame(video);
+      // a frame before believing what drawImage gives back. Both waits are
+      // bounded: a seek that lands within the frame already on screen fires
+      // neither event, and the pixel check below is the real judge.
+      await seekSettled(video, SEEK_SETTLE_CAP_MS);
+      await nextPresentedFrame(video, PRESENTED_CAP_MS);
       probeContext.drawImage(video, 0, 0, probe.width, probe.height);
     }
 

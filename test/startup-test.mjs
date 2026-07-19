@@ -9,7 +9,7 @@
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
 // that) and Playwright (npm install playwright).
-import { chromium } from 'playwright';
+import { launchBrowser, serverBase } from './harness.mjs';
 
 const FILE = 'startup.mp4';
 // A few MB with its moov at the end: a phone clip, and the case the byte budgets
@@ -53,7 +53,7 @@ const LATENCY_MS = 50;
 // the old engine needed 4 MB + index and blew straight through this.
 const FRAME_BUDGET_SECONDS = 2.0;
 
-const browser = await chromium.launch();
+const browser = await launchBrowser();
 let failures = 0;
 
 function report(name, ok, detail) {
@@ -71,7 +71,7 @@ async function measure(mode, file = FILE) {
     uploadThroughput: DOWNLOAD_BITS_PER_SECOND / 8,
     latency: LATENCY_MS,
   });
-  await page.goto(`http://localhost:8798/test/test-startup.html?file=${file}&mode=${mode}`);
+  await page.goto(`${serverBase}/test/test-startup.html?file=${file}&mode=${mode}`);
   await page.waitForFunction(() => window.__result || window.__err, { timeout: 180000 })
     .catch(() => {});
   const { result, err } = await page.evaluate(
