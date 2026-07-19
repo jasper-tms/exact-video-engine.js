@@ -183,8 +183,42 @@ export class ContainerIndex {
     this.videoWidth = swapAxes ? videoTrack.video.height : videoTrack.video.width;
     this.videoHeight = swapAxes ? videoTrack.video.width : videoTrack.video.height;
 
-    this._buildTables(file.getTrackSamplesInfo(videoTrack.id));
+    this._buildTables(file.getTrackSamplesInfo(videoTrack.id),
+      this._editListWindow(videoTrack));
     this.containerFormat = 'isobmff';
+  }
+
+  // The composition-time window the container's edit list actually presents, in
+  // MEDIA timescale units (the same units sample.cts is in), or null for "the
+  // whole track". A trimming edit list makes the sample table describe more
+  // frames than the element ever shows — the samples before the trim point stay
+  // in the table because the decoder needs them, but they are never presented —
+  // and _buildTables uses this window to number frames over only the presented
+  // ones, so display frame 0 is the first frame the viewer sees on either engine.
+  //
+  // Scope is deliberately the common real-world shape: a phone-style trim, which
+  // is one normal-rate edit (optionally preceded by an empty edit — a leading
+  // gap, media_time -1, which shifts the presentation clock but presents no media
+  // and is handled by the timeline calibration, not here). Anything more elaborate
+  // — several edits, a rate change — returns null, leaving every frame presented
+  // (the pre-existing behaviour): the WebCodecs path shows them all and the native
+  // path's duration check still refuses an index it cannot trust.
+  _editListWindow(videoTrack) {
+    const edits = videoTrack.edits;
+    if (!edits || !edits.length) return null;
+    const presentedEdits = edits.filter((e) => e.media_time >= 0);
+    if (presentedEdits.length !== 1) return null;
+    const edit = presentedEdits[0];
+    if (edit.media_rate_integer !== undefined && edit.media_rate_integer !== 1) {
+      return null;   // a slow/fast edit; not a plain trim
+    }
+    const mediaTimescale = videoTrack.timescale;
+    const movieTimescale = videoTrack.movie_timescale || mediaTimescale;
+    // media_time is already in media units; segment_duration is in MOVIE units,
+    // so convert it across before adding.
+    const start = edit.media_time;
+    const spanMediaUnits = edit.segment_duration * mediaTimescale / movieTimescale;
+    return { start, end: start + spanMediaUnits };
   }
 
   // WebM: the timestamps and nothing else (see readMatroskaFrameTable). The
@@ -254,11 +288,17 @@ export class ContainerIndex {
     return (normalized % 90 === 0) ? normalized : 0;
   }
 
-  _buildTables(samples) {
+  // editWindow (optional): {start, end} in media units, the composition-time
+  // range the edit list presents. Frames outside it stay in the DECODE table
+  // (the decoder needs them to reconstruct the ones inside) but are left out of
+  // the DISPLAY tables, so display frame 0 is the first frame the viewer sees.
+  _buildTables(samples, editWindow) {
     const n = samples.length;
     this.timescale = n ? samples[0].timescale : 1;
 
-    // Decode-order records (the first sample is always a keyframe).
+    // Decode-order records (the first sample is always a keyframe). Always the
+    // full set — a trimming edit list removes frames from the presentation, not
+    // from what the decoder must run through to rebuild them.
     this.samples = new Array(n);
     const keyframes = [];
     for (let k = 0; k < n; k++) {
@@ -271,18 +311,35 @@ export class ContainerIndex {
     }
     this.keyframeDecodeIndices = keyframes;   // ascending == decode order
 
-    // Display order = samples sorted by composition time (B-frame safe). Times
-    // are normalized so display frame 0 sits at t = 0: with B-frames the first
-    // composition time is often a nonzero offset, and both engines want a
+    // Which decode indices the edit list actually presents. A frame counts if
+    // its composition time falls in the window, with a quarter-frame tolerance
+    // to absorb the movie-vs-media timescale rounding in the window's bounds. No
+    // window (or a window that covers everything, e.g. an identity or shifting
+    // edit list) leaves every frame presented, and this whole path collapses to
+    // the untrimmed construction below.
+    const presented = [];
+    for (let k = 0; k < n; k++) {
+      const s = this.samples[k];
+      const slack = 0.25 * s.duration;
+      if (!editWindow
+          || (s.cts >= editWindow.start - slack && s.cts < editWindow.end - slack)) {
+        presented.push(k);
+      }
+    }
+
+    // Display order = presented samples sorted by composition time (B-frame
+    // safe). Times are normalized so display frame 0 sits at t = 0: with a trim
+    // the first presented frame's cts is a nonzero offset, and (independently)
+    // with B-frames the first composition time is too — both engines want a
     // timeline whose origin is the first frame the viewer sees.
-    const order = Array.from({ length: n }, (_, k) => k);
-    order.sort((a, b) => this.samples[a].cts - this.samples[b].cts);
-    const cts0 = n ? this.samples[order[0]].cts : 0;
-    this.presentationTimes = new Float64Array(n);
-    this.frameDurations = new Float64Array(n);
-    this.displayToDecode = new Int32Array(n);
+    const order = presented.slice().sort((a, b) => this.samples[a].cts - this.samples[b].cts);
+    const p = order.length;
+    const cts0 = p ? this.samples[order[0]].cts : 0;
+    this.presentationTimes = new Float64Array(p);
+    this.frameDurations = new Float64Array(p);
+    this.displayToDecode = new Int32Array(p);
     this.microsToDisplay = new Map();
-    for (let d = 0; d < n; d++) {
+    for (let d = 0; d < p; d++) {
       const k = order[d];
       const s = this.samples[k];
       this.presentationTimes[d] = (s.cts - cts0) / this.timescale;
@@ -290,9 +347,9 @@ export class ContainerIndex {
       this.displayToDecode[d] = k;
       this.microsToDisplay.set(Math.round(s.cts * 1e6 / this.timescale), d);
     }
-    this.numFrames = n;
-    this.duration = n
-      ? this.presentationTimes[n - 1] + this.frameDurations[n - 1] : 0;
+    this.numFrames = p;
+    this.duration = p
+      ? this.presentationTimes[p - 1] + this.frameDurations[p - 1] : 0;
   }
 }
 

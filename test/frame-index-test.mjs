@@ -107,6 +107,37 @@ const CASES = [
     webkit: { skip: 'WebKit fires no requestVideoFrameCallback for the edit-list '
       + "clip's calibrated in-frame seek; calibration covered by the webcodecs case" } },
 
+  // A TRIMMING edit list. Unlike counter-elst above (a shifting list that still
+  // presents every frame in the file), this clip's container holds all 30 source
+  // frames but the edit list presents only 20 of them, starting at source frame 5
+  // — mid-group-of-pictures, so the four frames before it are decoded (to
+  // reconstruct frame 5) but never shown. The index numbers frames over just the
+  // presented window, so display frame 0 IS source frame 5 (firstBar 5) and there
+  // are 20 frames. Passing on the pixels proves the trim is applied identically on
+  // both engines: the same 20 frames, correctly numbered, whichever path plays.
+  { file: 'counter-trimming-elst.mp4', mode: 'webcodecs', firstBar: 5, exact: true, indexExact: true },
+  { file: 'counter-trimming-elst.mp4', mode: 'native-index', firstBar: 5, exact: true, indexExact: true,
+    // Firefox and WebKit put a trimmed clip's <video> timeline somewhere the
+    // container index cannot be trusted against, so both degrade HONESTLY here
+    // (frameIndexIsExact false) rather than report frame numbers the element is
+    // not actually showing — the whole point being that a host is never lied to.
+    //   * Firefox drops the index (its requestVideoFrameCallback mediaTime is far
+    //     enough off to fail the consistency check, as on every native-index case),
+    //     then the declared-rate fallback mismaps this trimmed clip because
+    //     Firefox's currentTime for it does not start at the trim point.
+    firefox: { exact: false, indexExact: false },
+    //   * WebKit runs currentTime on the media timeline but reports the shorter
+    //     edited duration, so the calibrated timeline overruns the element and the
+    //     new reachability guard drops the index (see _calibratedTimelineReachable).
+    //     The seek/present path for such a clip also collides with WebKit firing no
+    //     requestVideoFrameCallback for in-frame seeks (the counter-elst story), so
+    //     the harness would hang; skip it. The webcodecs case above proves the trim
+    //     is frame-exact on WebKit through the path a real WebKit host actually uses.
+    webkit: { skip: 'WebKit maps a trimmed clip\'s <video> timeline inconsistently '
+      + '(media-timeline currentTime, edited duration); the index is dropped for '
+      + 'honesty and the in-frame-seek hang applies, as with counter-elst. The trim '
+      + 'is proven frame-exact on WebKit by the webcodecs case.' } },
+
   // WebM, which mp4box cannot parse at all: these run on the engine's own
   // Matroska cluster scan. Same story as the MP4 pair above — the VFR clip is
   // mismapped by an assumed frame rate and exact once the real timestamps are

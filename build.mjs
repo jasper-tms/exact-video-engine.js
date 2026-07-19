@@ -35,6 +35,7 @@ const MODULE_ORDER = [
   'src/container-index.js',
   'src/video-engine.js',
   'src/native-video-engine.js',
+  'src/decode-support.js',
   'src/create-best-engine.js',
 ];
 

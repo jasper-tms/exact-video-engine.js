@@ -1,6 +1,7 @@
 import { ContainerIndex } from './container-index.js';
 import { VideoEngine } from './video-engine.js';
 import { NativeVideoEngine } from './native-video-engine.js';
+import { detectBrowserEngine, webCodecsMayFailMidStream } from './decode-support.js';
 
 // ==================================================================
 // createBestEngine — walk the ladder and return a loaded engine.
@@ -71,7 +72,25 @@ export async function createBestEngine(source, options = {}) {
     }
   }
 
-  if (prefer !== 'native' && canvas && index && index.supportsWebCodecs
+  // Proactively route away from WebCodecs for combinations it is known to
+  // accept and then fail on mid-stream (WebKit + 10-bit HEVC — the iPhone HDR
+  // default). Left to the normal ladder, isConfigSupported() and the frame-0
+  // decode both pass, so the load-time fallback below never fires and the user
+  // gets a hard crash a second or two into playback. The <video> element plays
+  // the same clip fine, and the index still makes it frame-exact. This is the
+  // proactive half of the mid-stream-death handling; VideoEngine's fatal
+  // errormessage remains the reactive net for anything this table does not name.
+  const codec = index && index.decoderConfig && index.decoderConfig.codec;
+  const webCodecsUnreliable = webCodecsMayFailMidStream(codec, detectBrowserEngine());
+  if (webCodecsUnreliable && prefer !== 'native') {
+    console.info('exact-video-engine: routing this clip to the native <video> '
+      + `element up front — ${codec} on this browser passes WebCodecs support `
+      + 'checks and then dies mid-stream. The container index keeps it '
+      + 'frame-exact.');
+  }
+
+  if (prefer !== 'native' && !webCodecsUnreliable
+      && canvas && index && index.supportsWebCodecs
       && typeof VideoDecoder !== 'undefined') {
     const engine = new VideoEngine(canvas, { windowAhead });
     try {

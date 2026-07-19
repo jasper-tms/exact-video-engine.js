@@ -768,8 +768,42 @@ class ContainerIndex {
     this.videoWidth = swapAxes ? videoTrack.video.height : videoTrack.video.width;
     this.videoHeight = swapAxes ? videoTrack.video.width : videoTrack.video.height;
 
-    this._buildTables(file.getTrackSamplesInfo(videoTrack.id));
+    this._buildTables(file.getTrackSamplesInfo(videoTrack.id),
+      this._editListWindow(videoTrack));
     this.containerFormat = 'isobmff';
+  }
+
+  // The composition-time window the container's edit list actually presents, in
+  // MEDIA timescale units (the same units sample.cts is in), or null for "the
+  // whole track". A trimming edit list makes the sample table describe more
+  // frames than the element ever shows — the samples before the trim point stay
+  // in the table because the decoder needs them, but they are never presented —
+  // and _buildTables uses this window to number frames over only the presented
+  // ones, so display frame 0 is the first frame the viewer sees on either engine.
+  //
+  // Scope is deliberately the common real-world shape: a phone-style trim, which
+  // is one normal-rate edit (optionally preceded by an empty edit — a leading
+  // gap, media_time -1, which shifts the presentation clock but presents no media
+  // and is handled by the timeline calibration, not here). Anything more elaborate
+  // — several edits, a rate change — returns null, leaving every frame presented
+  // (the pre-existing behaviour): the WebCodecs path shows them all and the native
+  // path's duration check still refuses an index it cannot trust.
+  _editListWindow(videoTrack) {
+    const edits = videoTrack.edits;
+    if (!edits || !edits.length) return null;
+    const presentedEdits = edits.filter((e) => e.media_time >= 0);
+    if (presentedEdits.length !== 1) return null;
+    const edit = presentedEdits[0];
+    if (edit.media_rate_integer !== undefined && edit.media_rate_integer !== 1) {
+      return null;   // a slow/fast edit; not a plain trim
+    }
+    const mediaTimescale = videoTrack.timescale;
+    const movieTimescale = videoTrack.movie_timescale || mediaTimescale;
+    // media_time is already in media units; segment_duration is in MOVIE units,
+    // so convert it across before adding.
+    const start = edit.media_time;
+    const spanMediaUnits = edit.segment_duration * mediaTimescale / movieTimescale;
+    return { start, end: start + spanMediaUnits };
   }
 
   // WebM: the timestamps and nothing else (see readMatroskaFrameTable). The
@@ -839,11 +873,17 @@ class ContainerIndex {
     return (normalized % 90 === 0) ? normalized : 0;
   }
 
-  _buildTables(samples) {
+  // editWindow (optional): {start, end} in media units, the composition-time
+  // range the edit list presents. Frames outside it stay in the DECODE table
+  // (the decoder needs them to reconstruct the ones inside) but are left out of
+  // the DISPLAY tables, so display frame 0 is the first frame the viewer sees.
+  _buildTables(samples, editWindow) {
     const n = samples.length;
     this.timescale = n ? samples[0].timescale : 1;
 
-    // Decode-order records (the first sample is always a keyframe).
+    // Decode-order records (the first sample is always a keyframe). Always the
+    // full set — a trimming edit list removes frames from the presentation, not
+    // from what the decoder must run through to rebuild them.
     this.samples = new Array(n);
     const keyframes = [];
     for (let k = 0; k < n; k++) {
@@ -856,18 +896,35 @@ class ContainerIndex {
     }
     this.keyframeDecodeIndices = keyframes;   // ascending == decode order
 
-    // Display order = samples sorted by composition time (B-frame safe). Times
-    // are normalized so display frame 0 sits at t = 0: with B-frames the first
-    // composition time is often a nonzero offset, and both engines want a
+    // Which decode indices the edit list actually presents. A frame counts if
+    // its composition time falls in the window, with a quarter-frame tolerance
+    // to absorb the movie-vs-media timescale rounding in the window's bounds. No
+    // window (or a window that covers everything, e.g. an identity or shifting
+    // edit list) leaves every frame presented, and this whole path collapses to
+    // the untrimmed construction below.
+    const presented = [];
+    for (let k = 0; k < n; k++) {
+      const s = this.samples[k];
+      const slack = 0.25 * s.duration;
+      if (!editWindow
+          || (s.cts >= editWindow.start - slack && s.cts < editWindow.end - slack)) {
+        presented.push(k);
+      }
+    }
+
+    // Display order = presented samples sorted by composition time (B-frame
+    // safe). Times are normalized so display frame 0 sits at t = 0: with a trim
+    // the first presented frame's cts is a nonzero offset, and (independently)
+    // with B-frames the first composition time is too — both engines want a
     // timeline whose origin is the first frame the viewer sees.
-    const order = Array.from({ length: n }, (_, k) => k);
-    order.sort((a, b) => this.samples[a].cts - this.samples[b].cts);
-    const cts0 = n ? this.samples[order[0]].cts : 0;
-    this.presentationTimes = new Float64Array(n);
-    this.frameDurations = new Float64Array(n);
-    this.displayToDecode = new Int32Array(n);
+    const order = presented.slice().sort((a, b) => this.samples[a].cts - this.samples[b].cts);
+    const p = order.length;
+    const cts0 = p ? this.samples[order[0]].cts : 0;
+    this.presentationTimes = new Float64Array(p);
+    this.frameDurations = new Float64Array(p);
+    this.displayToDecode = new Int32Array(p);
     this.microsToDisplay = new Map();
-    for (let d = 0; d < n; d++) {
+    for (let d = 0; d < p; d++) {
       const k = order[d];
       const s = this.samples[k];
       this.presentationTimes[d] = (s.cts - cts0) / this.timescale;
@@ -875,9 +932,9 @@ class ContainerIndex {
       this.displayToDecode[d] = k;
       this.microsToDisplay.set(Math.round(s.cts * 1e6 / this.timescale), d);
     }
-    this.numFrames = n;
-    this.duration = n
-      ? this.presentationTimes[n - 1] + this.frameDurations[n - 1] : 0;
+    this.numFrames = p;
+    this.duration = p
+      ? this.presentationTimes[p - 1] + this.frameDurations[p - 1] : 0;
   }
 }
 
@@ -1866,7 +1923,26 @@ class NativeVideoEngine extends EventTarget {
 
       if (this._index) {
         await this._calibrateTimeOffset();
-      } else {
+        // The calibrated offset can push the table past the range the element
+        // will actually seek to. WebKit runs currentTime on the MEDIA timeline
+        // for a trimming edit list (so the offset it calibrates is the trim) but
+        // reports the shorter EDITED duration, which leaves the late frames
+        // unreachable — a seek to them clamps. Trusting the index then would hand
+        // back exact frame numbers for frames the element can never show. Drop to
+        // the declared rate, which is honestly approximate rather than confidently
+        // wrong. (Chromium keeps currentTime and duration on the same timeline, so
+        // this never fires there and its trimmed clips stay frame-exact.)
+        if (this._index && !this._calibratedTimelineReachable()) {
+          console.warn('NativeVideoEngine: the calibrated container timeline runs '
+            + 'past what this element will seek to (an edit-list clip whose '
+            + 'currentTime and duration disagree, seen on WebKit). Falling back to '
+            + 'the declared frame rate rather than report frame numbers the element '
+            + 'cannot reach.');
+          this._index = null;
+          this._timeOffset = 0;
+        }
+      }
+      if (!this._index) {
         if (options.frameRate) this.framesPerSecond = options.frameRate;
         this.numFrames = options.numFrames
           || Math.round(this.duration * this.framesPerSecond);
@@ -1931,6 +2007,26 @@ class NativeVideoEngine extends EventTarget {
       + 'element never shows (a trimming edit list?). Falling back to the '
       + 'declared frame rate rather than report shifted frame numbers.');
     return false;
+  }
+
+  // Does the calibrated timeline stay within the range the element will seek to?
+  //
+  // Calibration anchors the first presented frame; this checks the far end. The
+  // last frame's presentation time, shifted by the offset, must be a currentTime
+  // the element can actually reach — i.e. within its duration. It usually is (the
+  // offset is zero or the duration accommodates it), but a trimming edit list on
+  // WebKit breaks the assumption: WebKit puts currentTime on the media timeline
+  // (nonzero offset) yet reports the shorter edited duration, so the tail frames
+  // sit past the end and clamp. A generous slack keeps the ordinary last-frame
+  // rounding (which the presented-frame clamp already rescues) from tripping it.
+  _calibratedTimelineReachable() {
+    const elementDuration = this.video.duration;
+    if (!isFinite(elementDuration) || elementDuration <= 0) return true;
+    const n = this._index.numFrames;
+    if (!n) return true;
+    const lastFrameStart = this._index.presentationTimes[n - 1];
+    const slack = 1.5 / this.framesPerSecond;
+    return this._timeOffset + lastFrameStart <= elementDuration + slack;
   }
 
   // Find the constant offset between the container index's timeline and the
@@ -2048,6 +2144,81 @@ class NativeVideoEngine extends EventTarget {
 }
 
 // ==================================================================
+// decode-support — which (browser engine, codec) pairs WebCodecs lies about.
+//
+// WebCodecs decode support tracks the BROWSER ENGINE, not the device, and its
+// feature detection is not always honest. The dangerous class is the "dishonest
+// yes": WebKit (desktop Safari and every iOS browser — they are all WebKit
+// underneath) answers VideoDecoder.isConfigSupported() = true for 10-bit HEVC
+// (the iPhone's own HDR camera format), decodes the first keyframe, and then the
+// decoder dies once sustained decoding starts. That death lands AFTER load()
+// resolved — past createBestEngine's load-time fallback — so the user sees the
+// clip play for a second or two and then stop.
+//
+// The reactive net for this (v1.7.0) is engine.failed + a fatal errormessage a
+// host can rebuild from. This module is the PROACTIVE half: recognize the
+// combination up front and route straight to the <video> element, which decodes
+// the same clip fine (it uses the platform's own AVFoundation path, not
+// WebCodecs). No crash, no flash, and the container index still makes the native
+// path frame-exact.
+//
+// The matrix here is empirical (real-device testing; see the decode-support-matrix
+// agent skill). It is deliberately TIGHT — a false positive needlessly gives up
+// the WebCodecs owned-clock path — so it names only combinations confirmed to
+// crash, and the reactive net still backs up anything it misses.
+// ==================================================================
+
+// The browser's underlying engine, inferred from navigator. WebCodecs bugs live
+// in the engine, so this — not the device or the browser brand — is what decides
+// whether a decode config can be trusted.
+//
+//   'webkit'  desktop Safari AND all iOS browsers (Chrome/Firefox/Edge on iOS
+//             are WebKit-backed by platform mandate). navigator.vendor is
+//             'Apple Computer, Inc.' for every one of them.
+//   'blink'   Chrome/Edge/Brave/Opera off iOS. navigator.vendor is 'Google Inc.'
+//   'gecko'   Firefox off iOS. navigator.vendor is '' (fall back to the UA).
+//   'unknown' anything we cannot place; treated as trustworthy (no routing).
+function detectBrowserEngine(nav) {
+  const navigatorObject = nav
+    || (typeof navigator !== 'undefined' ? navigator : null);
+  if (!navigatorObject) return 'unknown';
+  const vendor = navigatorObject.vendor || '';
+  if (vendor === 'Apple Computer, Inc.') return 'webkit';
+  if (vendor === 'Google Inc.') return 'blink';
+  const userAgent = navigatorObject.userAgent || '';
+  if (/firefox|gecko\//i.test(userAgent)) return 'gecko';
+  return 'unknown';
+}
+
+// Is this codec string 10-bit HEVC — the format WebKit's WebCodecs accepts and
+// then fails on? Covers HEVC Main 10 (general_profile_idc 2, the iPhone HDR
+// default) declared as hvc1/hev1, and Dolby Vision (dvh1/dvhe), which is
+// HEVC-based and always at least 10-bit. Range-Extensions profiles that reach
+// 10-bit through a different profile idc are exotic and not matched from the
+// codec string alone; the reactive fatal-fallback still covers those.
+function isTenBitHevc(codecString) {
+  if (!codecString) return false;
+  const parts = String(codecString).split('.');
+  const fourCharCode = parts[0].toLowerCase();
+  // Dolby Vision (HEVC-based) is always >= 10-bit.
+  if (fourCharCode === 'dvhe' || fourCharCode === 'dvh1') return true;
+  if (fourCharCode === 'hvc1' || fourCharCode === 'hev1') {
+    // hvc1.<profile>.<compat>.<tier><level>.<constraints...>; the profile field
+    // may carry a one-letter profile-space prefix (A/B/C) before the number.
+    const profileField = (parts[1] || '').replace(/^[ABC]/i, '');
+    return parseInt(profileField, 10) === 2;   // 2 == HEVC Main 10
+  }
+  return false;
+}
+
+// Should createBestEngine skip the WebCodecs engine for this (codec, engine)
+// pair because WebCodecs would accept it and then die mid-stream? True only for
+// the confirmed dishonest-yes combinations; everything else goes down the normal
+// ladder (try WebCodecs, fall back on an honest rejection).
+function webCodecsMayFailMidStream(codecString, browserEngine) {
+  return browserEngine === 'webkit' && isTenBitHevc(codecString);
+}
+// ==================================================================
 // createBestEngine — walk the ladder and return a loaded engine.
 //
 // The container index is built once, up front, and handed to whichever engine
@@ -2116,7 +2287,25 @@ async function createBestEngine(source, options = {}) {
     }
   }
 
-  if (prefer !== 'native' && canvas && index && index.supportsWebCodecs
+  // Proactively route away from WebCodecs for combinations it is known to
+  // accept and then fail on mid-stream (WebKit + 10-bit HEVC — the iPhone HDR
+  // default). Left to the normal ladder, isConfigSupported() and the frame-0
+  // decode both pass, so the load-time fallback below never fires and the user
+  // gets a hard crash a second or two into playback. The <video> element plays
+  // the same clip fine, and the index still makes it frame-exact. This is the
+  // proactive half of the mid-stream-death handling; VideoEngine's fatal
+  // errormessage remains the reactive net for anything this table does not name.
+  const codec = index && index.decoderConfig && index.decoderConfig.codec;
+  const webCodecsUnreliable = webCodecsMayFailMidStream(codec, detectBrowserEngine());
+  if (webCodecsUnreliable && prefer !== 'native') {
+    console.info('exact-video-engine: routing this clip to the native <video> '
+      + `element up front — ${codec} on this browser passes WebCodecs support `
+      + 'checks and then dies mid-stream. The container index keeps it '
+      + 'frame-exact.');
+  }
+
+  if (prefer !== 'native' && !webCodecsUnreliable
+      && canvas && index && index.supportsWebCodecs
       && typeof VideoDecoder !== 'undefined') {
     const engine = new VideoEngine(canvas, { windowAhead });
     try {

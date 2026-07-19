@@ -4,12 +4,12 @@
 //
 // Two kinds of pin live here.
 //
-//   1. Graceful degradation with HONEST signals. A trimming edit list and a
+//   1. Honest signals on the harder container shapes. A trimming edit list and a
 //      fragmented MP4 both load and play; what matters is that tier and
 //      frameIndexIsExact tell the truth about how exact the frame numbers are, so
-//      a host (an annotation tool, say) knows whether it may trust them. When the
-//      edit-list and fragmented-MP4 features land they will deliberately change
-//      some of these expectations — the cases marked WILL-CHANGE flag which.
+//      a host (an annotation tool, say) knows whether it may trust them. The
+//      trimming edit list is now honored end to end (frame-exact, 20 presented
+//      frames); the remaining WILL-CHANGE case flags where feature work still will.
 //
 //   2. SOFT failure on malformed bytes. A corrupt or truncated file must settle
 //      in bounded time, never crash the page (no uncaught error), and end in
@@ -32,30 +32,29 @@ const CASES = [
 
   // Trimming edit list, native path: the container sample table spans 30 frames
   // but the element presents a 20-frame window starting mid-group-of-pictures.
-  // NativeVideoEngine._indexDescribesElement must REFUSE that index (it cannot be
-  // trusted without shifting every frame number) and fall back to the declared
-  // frame rate, saying so through both a console.warn and frameIndexIsExact
-  // going false. This is the whole reason the duration check exists.
+  // The index now HONORS the edit list — it numbers frames over only the 20
+  // presented ones (see ContainerIndex._buildTables) — so its duration matches
+  // what the element plays, the duration check accepts it, and the native path
+  // stays frame-exact: container-index tier, frameIndexIsExact true, numFrames 20.
   {
-    name: 'trimming edit list refused (native)',
+    name: 'trimming edit list honored (native, frame-exact)',
     file: 'counter-trimming-elst.mp4', mode: 'native',
     expect: {
-      loaded: true, frameReachable: true, frameIndexIsExact: false,
-      tierIncludes: 'declared frame rate', warningIncludes: 'trimming edit list',
+      loaded: true, frameReachable: true, frameIndexIsExact: true,
+      tierIncludes: 'container index', numFrames: 20,
     },
   },
-  // Trimming edit list, WebCodecs path: the decoder reads the sample table and
-  // IGNORES the edit list entirely, so it decodes all 30 source frames from frame
-  // 0 and reports them as exact. That is not what the trim asks for, but it is
-  // today's behavior. CURRENT-BEHAVIOR-WILL-CHANGE: applying edit lists in the
-  // WebCodecs path is planned, and when it lands this clip should present the
-  // trimmed 20-frame window and numFrames should drop to 20.
+  // Trimming edit list, WebCodecs path: the decoder still runs the whole sample
+  // table (it needs the frames before the trim point to reconstruct the first
+  // presented one), but the presentation table lists only the 20 frames the edit
+  // list presents, so the engine shows the trimmed window and numFrames is 20 —
+  // the same frame-exact answer the native path gives.
   {
-    name: 'trimming edit list ignored by WebCodecs (WILL-CHANGE)',
+    name: 'trimming edit list honored by WebCodecs (frame-exact, 20 frames)',
     file: 'counter-trimming-elst.mp4', mode: 'auto',
     expect: {
       loaded: true, frameReachable: true, frameIndexIsExact: true,
-      tierIncludes: 'webcodecs', numFrames: 30,
+      tierIncludes: 'webcodecs', numFrames: 20,
     },
   },
   // Fragmented MP4 (empty_moov: samples live in moof fragments). mp4box.js

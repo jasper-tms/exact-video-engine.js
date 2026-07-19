@@ -92,6 +92,18 @@ is fine, the WebCodecs plumbing is not.
 
 ## Practical guidance
 
+- **Proactive routing (current):** `createBestEngine` now recognizes the confirmed
+  dishonest-yes combination — WebKit + 10-bit HEVC — from the container's declared
+  codec string and routes straight to the native `<video>` element BEFORE
+  attempting WebCodecs, so the mid-stream crash never happens and the index keeps
+  the native path frame-exact. It is `detectBrowserEngine()` (navigator.vendor ===
+  'Apple Computer, Inc.' for all WebKit) + `isTenBitHevc()` (HEVC general_profile_idc
+  2, or Dolby Vision dvh1/dvhe) in `src/decode-support.js`, wired into the ladder.
+  The table is intentionally tight (a false positive gives up the owned clock), so
+  the reactive fatal-fallback below is still the net for anything it does not name
+  (e.g. Range-Extensions high-bit-depth HEVC, or a future WebKit regression). If you
+  confirm another dishonest-yes combination, add it to `webCodecsMayFailMidStream`
+  AND record it in the matrix above.
 - Since v1.7.0, a mid-stream `VideoDecoder` death sets `engine.failed`, makes
   `ensureFrame()` reject promptly, and emits `errormessage` with
   `detail.fatal: true` plus diagnostics (`errorName`, `codec`, `frame`). The

@@ -75,6 +75,27 @@ indexing pass ran out of time): the element still plays it, and
 `frameIndexIsExact` tells you the indices are only as good as the frame rate you
 declared.
 
+### Codecs a browser accepts and then fails on
+
+WebCodecs support tracks the browser *engine*, not the device, and its feature
+detection is not always honest. WebKit (desktop Safari and every iOS browser)
+answers `isConfigSupported()` = true for **10-bit HEVC** — the iPhone's own HDR
+camera format — decodes the first keyframe, and then the decoder dies a second or
+two into sustained playback. Both the support check and the frame-0 decode pass,
+so the ladder's load-time fallback never sees it and the user gets a hard crash
+mid-playback.
+
+`createBestEngine` recognizes that combination up front and routes straight to
+the `<video>` element, which decodes the same clip fine (it uses the platform's
+own path, not WebCodecs). No crash, no flash, and the container index keeps the
+native path frame-exact. This table is deliberately tight — a false positive
+needlessly gives up the WebCodecs owned-clock path — so it names only the
+combination confirmed to crash, and the `errormessage` `fatal` flag above remains
+the reactive net for anything else. The pieces are exported for a host that wants
+to make the same prediction itself (flagging an upload for server-side
+transcoding, say): `detectBrowserEngine()`, `isTenBitHevc(codecString)`, and
+`webCodecsMayFailMidStream(codecString, browserEngine)`.
+
 ### WebM
 
 mp4box only speaks ISOBMFF, so WebM used to land on step 3 and get silently
@@ -199,7 +220,7 @@ plays through.
 | `destroy()` | Release resources when done (decoders are a limited browser resource). |
 | `resizeCanvas()` | Re-size the canvas backing store to its parent and repaint (`VideoEngine`); a no-op on `NativeVideoEngine`, where CSS `object-fit` handles it. `update()` already does this every tick, so you rarely need to call it — a pane that gains its size *after* the clip loads (a host that reveals the player only once it is ready) is handled without you having to get the timing right. |
 | event `loaded` | Fired when `load()` completes. |
-| event `errormessage` | `detail.message`: human-readable error string, or null to clear. When the `VideoDecoder` dies mid-stream the detail also carries `fatal: true` plus diagnostics (`errorName`, `codec`, `frame`). A fatal error means this engine will never produce another frame for the clip — some decoders pass `isConfigSupported()` and decode frame 0 but die once sustained decoding starts (WebKit with 10-bit HEVC), which is after `load()` resolved and therefore past `createBestEngine`'s load-time fallback. A host that can fall back should respond by rebuilding with `createBestEngine(source, { prefer: 'native' })`; the `<video>` element typically plays the same clip fine. |
+| event `errormessage` | `detail.message`: human-readable error string, or null to clear. When the `VideoDecoder` dies mid-stream the detail also carries `fatal: true` plus diagnostics (`errorName`, `codec`, `frame`). A fatal error means this engine will never produce another frame for the clip — some decoders pass `isConfigSupported()` and decode frame 0 but die once sustained decoding starts (WebKit with 10-bit HEVC), which is after `load()` resolved and therefore past `createBestEngine`'s load-time fallback. A host that can fall back should respond by rebuilding with `createBestEngine(source, { prefer: 'native' })`; the `<video>` element typically plays the same clip fine. **`createBestEngine` now heads the best-known case off before it happens** — see below — so this event is the net for combinations not yet in that table. |
 
 `VideoEngine` additionally has `bitmapForFrame(n)`, the decoded `ImageBitmap`
 for a frame (coded orientation, possibly downscaled for display — apply
@@ -296,12 +317,19 @@ Two things are load-bearing, and both are tested:
   edit list presents its first frame at a nonzero `mediaTime`. The engine
   calibrates the offset at load by anchoring on the first presented frame, whose
   identity it knows.
-- **A trimming edit list is refused, not guessed at.** If the container's frame
-  table spans more than the element will present, the table describes frames the
-  element never shows and every index would be shifted. The engine detects this
-  and drops to the declared frame rate rather than report confidently wrong
-  frame numbers. It also drops if the presented frames stop landing on the table
-  at runtime.
+- **A trimming edit list is honored, not guessed at.** A clip trimmed to start
+  and end partway in — the container still holds every source frame, but the edit
+  list presents only a window of them — is numbered over just that presented
+  window, so display frame 0 is the first frame the viewer sees and both engines
+  play the trim frame-exact. (The decoder still runs the frames before the trim
+  point; it needs them to reconstruct the first presented one, but they are never
+  shown.) Where a browser exposes such a clip's `<video>` timeline inconsistently
+  — WebKit runs `currentTime` on the media timeline yet reports the shorter edited
+  duration, leaving the tail frames unreachable — the native path detects that the
+  calibrated timeline overruns the element and drops to the declared frame rate,
+  rather than report frame numbers the element cannot actually show. The WebCodecs
+  path is frame-exact on the trim everywhere. The index also drops if the presented
+  frames stop landing on the table at runtime.
 
 ## Consuming
 

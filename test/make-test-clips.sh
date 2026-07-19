@@ -154,12 +154,26 @@ ffmpeg -y -loglevel error \
 # frames but the element presents only a 20-frame window that begins in the
 # middle of the first group of pictures. This is the case the shifting edit list
 # in counter-elst.mp4 is NOT: there the element presents every remaining frame, so
-# the durations still match. Here they must not, which is what makes
-# NativeVideoEngine refuse the index (see make-trimming-edit-list.py for why an
-# `ffmpeg -ss -c copy` cut cannot produce this shape). robustness-test.mjs pins
-# that refusal. The WebCodecs path currently ignores the edit list, which is a
-# behavior the edit-list feature work will change on purpose.
+# the durations still match. Here they must not (see make-trimming-edit-list.py
+# for why an `ffmpeg -ss -c copy` cut cannot produce this shape). The engine
+# HONORS this edit list: it numbers frames over just the 20 presented ones, so
+# both engines play the trimmed window frame-exact (display frame 0 is source
+# frame 5). frame-index-test.mjs proves the pixels; robustness-test.mjs pins the
+# tier/frameIndexIsExact/numFrames signals.
 python3 make-trimming-edit-list.py clips/counter-cfr.mp4 clips/counter-trimming-elst.mp4
+
+# A 10-bit HEVC (Main 10) clip — the iPhone HDR default, and the format WebKit's
+# WebCodecs accepts at load and then dies on mid-stream. known-bad-codec-test.mjs
+# uses it to check that createBestEngine routes this codec straight to the native
+# <video> element on WebKit (rather than crashing a second into playback). Only
+# the container's declared codec string matters to that test — mp4box reads the
+# hvcC without decoding — so the clip's content is unimportant; it reuses the
+# counter pattern. -tag:v hvc1 so the sample entry is hvc1 (not hev1); either way
+# the hvcC declares general_profile_idc 2 (Main 10), which is what is detected.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "color=c=black:s=150x90:d=1:r=30,format=gray10le,geq=lum='if(between(X,5*N,5*N+4),1023,0)'" \
+    -pix_fmt yuv420p10le -c:v libx265 -tag:v hvc1 -x265-params log-level=none \
+    -g 10 clips/counter-hevc10.mp4
 
 # Corrupt and truncated inputs, for robustness-test.mjs. Each pins that the engine
 # fails SOFTLY on malformed bytes -- bounded time, no page crash, either a

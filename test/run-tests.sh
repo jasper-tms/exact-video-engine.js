@@ -9,15 +9,19 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-vfr.webm ] || [ ! -f test/clips/startup.mp4 ] \
         || [ ! -f test/clips/midsize.mp4 ] || [ ! -f test/clips/hd.mp4 ] \
         || [ ! -f test/clips/counter-trimming-elst.mp4 ] \
+        || [ ! -f test/clips/counter-hevc10.mp4 ] \
         || [ ! -f test/clips/corrupt-pure-garbage.bin ]; then
     bash test/make-test-clips.sh
 fi
 
-# Node-only unit tests: no browser, no server. The Matroska parser (and its WebM
-# indexing progress reports) runs in plain Node, so it is checked here directly
-# against the src/ modules, up front and cheaply.
+# Node-only unit tests: no browser, no server. These run in plain Node directly
+# against the src/ modules, up front and cheaply. The Matroska parser (and its
+# WebM indexing progress reports), the known-bad-codec routing decision, and the
+# trimming-edit-list arithmetic are all pure enough to check without a browser.
 node_status=0
 node test/matroska-progress-test.mjs || node_status=1
+node test/decode-support-test.mjs || node_status=1
+node test/edit-list-test.mjs || node_status=1
 
 # test/serve.py, not `python3 -m http.server`: the latter ignores Range headers
 # and answers 200 with the whole file, which the engine reads over Range. That is
@@ -52,10 +56,13 @@ done
 # a Chromium-specific decoder error surface (decoder-failure), and the task they
 # verify is engine bookkeeping that is not browser-specific — so running them
 # under one engine is enough and porting them would only add contortions.
-echo "=== chromium-only: startup, memory, decoder-failure ==="
+echo "=== chromium-only: startup, memory, decoder-failure, known-bad-codec ==="
 node test/startup-test.mjs || status=1
 node test/memory-test.mjs || status=1
 node test/decoder-failure-test.mjs || status=1
+# known-bad-codec spoofs navigator.vendor to exercise the WebKit routing path from
+# Chromium (the decision is codec-string-based, so no real HEVC decode is needed).
+node test/known-bad-codec-test.mjs || status=1
 
 # Chromium-only too, but for a different reason: robustness-test pins that
 # malformed and truncated inputs fail softly (bounded time, no page crash). That

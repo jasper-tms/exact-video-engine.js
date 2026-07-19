@@ -247,7 +247,26 @@ export class NativeVideoEngine extends EventTarget {
 
       if (this._index) {
         await this._calibrateTimeOffset();
-      } else {
+        // The calibrated offset can push the table past the range the element
+        // will actually seek to. WebKit runs currentTime on the MEDIA timeline
+        // for a trimming edit list (so the offset it calibrates is the trim) but
+        // reports the shorter EDITED duration, which leaves the late frames
+        // unreachable — a seek to them clamps. Trusting the index then would hand
+        // back exact frame numbers for frames the element can never show. Drop to
+        // the declared rate, which is honestly approximate rather than confidently
+        // wrong. (Chromium keeps currentTime and duration on the same timeline, so
+        // this never fires there and its trimmed clips stay frame-exact.)
+        if (this._index && !this._calibratedTimelineReachable()) {
+          console.warn('NativeVideoEngine: the calibrated container timeline runs '
+            + 'past what this element will seek to (an edit-list clip whose '
+            + 'currentTime and duration disagree, seen on WebKit). Falling back to '
+            + 'the declared frame rate rather than report frame numbers the element '
+            + 'cannot reach.');
+          this._index = null;
+          this._timeOffset = 0;
+        }
+      }
+      if (!this._index) {
         if (options.frameRate) this.framesPerSecond = options.frameRate;
         this.numFrames = options.numFrames
           || Math.round(this.duration * this.framesPerSecond);
@@ -312,6 +331,26 @@ export class NativeVideoEngine extends EventTarget {
       + 'element never shows (a trimming edit list?). Falling back to the '
       + 'declared frame rate rather than report shifted frame numbers.');
     return false;
+  }
+
+  // Does the calibrated timeline stay within the range the element will seek to?
+  //
+  // Calibration anchors the first presented frame; this checks the far end. The
+  // last frame's presentation time, shifted by the offset, must be a currentTime
+  // the element can actually reach — i.e. within its duration. It usually is (the
+  // offset is zero or the duration accommodates it), but a trimming edit list on
+  // WebKit breaks the assumption: WebKit puts currentTime on the media timeline
+  // (nonzero offset) yet reports the shorter edited duration, so the tail frames
+  // sit past the end and clamp. A generous slack keeps the ordinary last-frame
+  // rounding (which the presented-frame clamp already rescues) from tripping it.
+  _calibratedTimelineReachable() {
+    const elementDuration = this.video.duration;
+    if (!isFinite(elementDuration) || elementDuration <= 0) return true;
+    const n = this._index.numFrames;
+    if (!n) return true;
+    const lastFrameStart = this._index.presentationTimes[n - 1];
+    const slack = 1.5 / this.framesPerSecond;
+    return this._timeOffset + lastFrameStart <= elementDuration + slack;
   }
 
   // Find the constant offset between the container index's timeline and the

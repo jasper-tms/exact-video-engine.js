@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine known-bad-codec routing test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<!-- The spoof must be installed BEFORE the engine script's globals are used, but
+     detectBrowserEngine() reads navigator at call time, so overriding it here (in
+     a script that runs before createBestEngine is called) is enough. -->
+<script>
+  // ?spoofVendor=webkit makes navigator.vendor report what every WebKit browser
+  // reports, so a Chromium test process can exercise the WebKit routing path
+  // without a WebKit build (and without any real 10-bit-HEVC decode support,
+  // which this test does not need — it checks the ROUTING DECISION, made from the
+  // container's declared codec string, which mp4box reads without decoding).
+  const params = new URLSearchParams(location.search);
+  if (params.get('spoofVendor') === 'webkit') {
+    Object.defineProperty(navigator, 'vendor',
+      { get: () => 'Apple Computer, Inc.', configurable: true });
+  }
+</script>
+<script src="/exact-video-engine.js"></script>
+<div id="pane" style="width: 150px; height: 90px"><canvas id="engine-canvas"></canvas></div>
+<video id="native-video" muted playsinline></video>
+<script>
+async function run() {
+  const file = 'clips/' + params.get('file');
+  const canvas = document.getElementById('engine-canvas');
+  const video = document.getElementById('native-video');
+  const source = await (await fetch(file)).blob();
+
+  const result = {
+    detectedEngine: detectBrowserEngine(),   // confirms the spoof took (or did not)
+    loaded: false, tier: null, frameIndexIsExact: null, numFrames: null, error: null,
+  };
+  let engine = null;
+  try {
+    engine = await createBestEngine(source, { canvas, video });
+    result.loaded = true;
+    result.tier = engine.tier;
+    result.frameIndexIsExact = engine.frameIndexIsExact;
+    result.numFrames = engine.numFrames;
+  } catch (err) {
+    // A native-<video> HEVC decode may not exist in every test browser (Chromium
+    // ships without HEVC). That is not what this test checks — the routing
+    // DECISION happens before the native load — so a load failure here is
+    // recorded, not fatal to the assertion the driver makes.
+    result.error = String(err && err.message || err);
+  } finally {
+    if (engine && engine.destroy) { try { engine.destroy(); } catch (e) {} }
+  }
+  window.__result = result;
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>
