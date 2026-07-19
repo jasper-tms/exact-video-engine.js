@@ -27,17 +27,20 @@ Container indexing is codec-agnostic and separate from decoding:
   without touching encoded pixels, so 10-bit HEVC, Dolby Vision, and any other
   exotic codec parse fine. The index is handed to **whichever** backend plays,
   so the native engine stays frame-exact for any indexed clip.
-- **WebM** has a built-in indexer (timestamps only, no sample table to decode
-  from), so WebM never gets the WebCodecs backend — only frame-exact `<video>`
-  playback, and only if the index finishes within its deadline/byte budget.
-- No index at all → native engine maps frames from a declared constant frame
-  rate and `frameIndexIsExact` is false. That declared rate is no longer trusted
-  blindly: `createBestEngine` verifies it against the clip's real frame
-  timestamps with a paused seek-probe at load and throws if it is wrong (or bails
-  outright if no rate was given), so an un-indexable clip is guaranteed
-  frame-exact or refused, never silently approximate. `allowApproximate: true`
-  opts out. See `src/frame-rate-check.js` and the README's "Frame accuracy is
-  guaranteed, or the clip bails".
+- **Fragmented MP4** (`mvex`/`moof`, the DASH/CMAF shape) is indexed by feeding
+  the whole file through mp4box so every fragment's samples land in the table —
+  a full-file read with the same deadline/byte budget and progress reporting as
+  the WebM scan, but a complete index (sample table included), so fragmented
+  clips play through WebCodecs like classic ones.
+- **WebM** and **Ogg/Theora** have built-in indexers (timestamps only, no
+  sample table to decode from), so they never get the WebCodecs backend — only
+  frame-exact `<video>` playback.
+- No index at all → the clip is REFUSED with a clear error ("index or refuse",
+  see the README). There is no approximate mode: `declaredFrameRate` /
+  `allowApproximate` no longer exist, and every engine `createBestEngine`
+  returns has `frameIndexIsExact` true. An indexing pass that blows its budget
+  refuses too; the IndexedDB index cache (`src/index-cache.js`) makes a
+  finished full-file pass a once-per-clip cost.
 
 So "can this backend decode it" (below) never affects whether frame numbers
 are trustworthy — only which pixels-producing path is available.

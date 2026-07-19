@@ -26,16 +26,15 @@ A `.webm` clip only ever plays through the plain browser player, and is only
 frame-accurate if the app finishes reading it in time. It can never hand back
 pixels for a named frame (see #6).
 
-**4. Big WebM files (or slow connections) time out into approximate mode.**
+**FIXED: 4. Big WebM files (or slow connections) time out into approximate mode.**
 Opening a WebM means reading through the whole file. A large one, or a slow
 link, blows the deadline — the user waits, watches a progress bar, and then gets
 *degraded* frame accuracy as the reward. The bigger the file, the worse this
 gets.
 
-**5. Anything that isn't MP4/MOV or WebM is approximate only.**
+**FIXED: 5. Anything that isn't MP4/MOV or WebM is approximate only.**
 Ogg, streaming formats (HLS), and other containers play, but with guessed frame
-numbers. No error, just silently not frame-exact. *(Fixed — see status: the
-player now guarantees frame accuracy or bails, and never silently guesses.)*
+numbers. No error, just silently not frame-exact.
 
 ## Things you simply can't do
 
@@ -50,7 +49,7 @@ plain browser player.
 
 ## Things that are slow / wasteful (work correctly, but cost the user time)
 
-**8. Reopening the same clip re-does all the opening work.**
+**FIXED: 8. Reopening the same clip re-does all the opening work.**
 There's no memory of a clip you've already opened — reopen it and you pay the
 full cost again, which for a large WebM means sitting through the whole scan a
 second time.
@@ -73,23 +72,23 @@ distant cloud bucket, even for a small file.
   a trimming edit list, numbering frames over just the presented window, so both
   engines play the trim frame-exact (Chromium/WebCodecs everywhere). Where a
   browser exposes the trimmed clip's `<video>` timeline inconsistently (WebKit),
-  the native path degrades honestly to approximate rather than lie.
-- [x] **5** — Non-MP4/WebM containers are approximate only — *fixed (guarantee or
-  bail).* A clip that cannot be indexed (Ogg, HLS, anything but MP4/MOV and
-  WebM/MKV) no longer silently plays with guessed frame numbers. If the host
-  supplies a `declaredFrameRate`, that rate is **verified** against the clip's real
-  frame timestamps by a seek-probe at load — paused seeks on the engine's own
-  timeline, no playthrough — which flushes out a wrong rate, a variable-frame-rate
-  clip, or a hidden higher rate (2×/telecine) and throws rather than mislabel
-  frames; a rate that survives is then policed each frame during playback (a fatal
-  `errormessage` with `detail.inexact` if it later drifts off-grid). A clip with
-  neither an index nor a declared rate throws outright. `allowApproximate: true`
-  is the explicit opt-out for a host that does not need frame accuracy. On a
-  browser whose `requestVideoFrameCallback` echoes the seek target instead of
-  reporting a frame's real timestamp (Firefox), verification is skipped honestly
-  (frame numbers stay marked inexact) rather than false-bailing a good clip.
-  *Follow-ups left open:* actually widening the frame-exact set to new containers
-  (an AVI `idx1` reader, an Ogg/Theora demuxer, a whole-clip seek-stepping
-  indexer for any short playable format) — this fix makes the boundary honest, it
-  does not move it. It also tightens the WebM-timeout half of #4: a timed-out WebM
-  with a declared rate now verifies or bails instead of silently degrading.
+  the native path refuses the clip rather than lie (the WebCodecs path plays the
+  same trim frame-exact there).
+- [x] **4** — WebM timeouts degrade — *fixed (index or refuse).* A pass that
+  blows its budget now refuses with a clear error instead of degrading to
+  guessed frame numbers; the host can raise `indexTimeoutMilliseconds`, and the
+  index cache (#8) makes a finished pass a once-per-clip cost.
+- [x] **5** — Non-MP4/WebM containers are approximate only — *fixed (index or
+  refuse).* There is no approximate mode at all anymore: every returned engine
+  has a real per-frame timestamp table, and everything else throws a clear
+  error. The frame-exact set also widened — fragmented MP4 is indexed by feeding
+  every `moof` through mp4box, and Ogg/Theora by the engine's own page scan
+  (`src/ogg.js`). HLS/segmented delivery, live streams, and raw elementary
+  streams remain refused by design (no single indexable byte sequence exists).
+  *Follow-ups left open:* an AVI `idx1` reader, or a whole-clip seek-stepping
+  indexer for any short playable format, if either is ever worth it.
+- [x] **8** — Reopening a clip re-does the work — *fixed.* Indexes that took
+  longer than ~500 ms to build are cached in IndexedDB, keyed on proven content
+  identity (`(name, size, lastModified)` for a File; URL + size + strong
+  ETag/Last-Modified for a URL) and rebuilt on any doubt — a stale index would
+  be a wrong index. Repeat opens of a big WebM/fMP4/Ogg are instant.

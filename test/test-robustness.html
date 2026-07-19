@@ -46,10 +46,14 @@ async function run() {
 
   let engine = null;
   try {
-    // No declaredFrameRate/declaredNumFrames on purpose: when the engine falls
-    // back, we want to see the degradation it reaches on its own, not one the
-    // test propped up.
-    engine = await createBestEngine(source, { canvas, video, prefer: mode });
+    const options = { canvas, video, prefer: mode };
+    // ?indexTimeoutMs= pins the index-or-refuse deadline behavior: a full-file
+    // indexing pass (WebM, fragmented MP4, Ogg) given no time must REFUSE with a
+    // clear error rather than hang or play with guessed frame numbers.
+    if (params.get('indexTimeoutMs') !== null) {
+      options.indexTimeoutMilliseconds = Number(params.get('indexTimeoutMs'));
+    }
+    engine = await createBestEngine(source, options);
     result.loaded = true;
     result.tier = engine.tier;
     result.frameIndexIsExact = engine.frameIndexIsExact;

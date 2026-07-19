@@ -30,13 +30,14 @@ const repositoryRoot = dirname(fileURLToPath(import.meta.url));
 // before it), and header.js is the file-level design commentary.
 const MODULE_ORDER = [
   'src/header.js',
+  'src/decode-support.js',
   'src/range-readers.js',
+  'src/index-cache.js',
   'src/matroska.js',
+  'src/ogg.js',
   'src/container-index.js',
   'src/video-engine.js',
-  'src/frame-rate-check.js',
   'src/native-video-engine.js',
-  'src/decode-support.js',
   'src/create-best-engine.js',
 ];
 

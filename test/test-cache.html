@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine index-cache test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<video id="native-video" muted playsinline></video>
+<script>
+// Exercises the IndexedDB index cache end to end, in the environment it actually
+// runs in (a real browser with real IndexedDB). The stakes are stated in
+// src/index-cache.js: a stale cached index is a WRONG index, so what is pinned
+// here is not just that hits happen but that every doubtful identity is a MISS.
+//
+// Steps, reported as named checks in window.__result.checks:
+//   1. A cold build of a WebM (full-file parse) stores its index (the build-time
+//      threshold is forced to 0 so a tiny fixture qualifies), and a second load
+//      of the identical File returns the cached index with identical tables.
+//   2. The same bytes with a different lastModified is a MISS and a rebuild.
+//   3. A bare Blob (no name/lastModified — no stable identity) is never cached.
+//   4. A URL source keys on (url, size, validator) and hits on the second load
+//      (test/serve.py sends ETag/Last-Modified on its 206s, like production
+//      object stores).
+//   5. A payload stored with a wrong schemaVersion is a MISS.
+//   6. A cached (hydrated) index still drives an engine: numFrames, duration,
+//      and a frame lookup agree with the freshly built index.
+const CLIP = 'clips/counter-vfr.webm';
+
+function tablesEqual(a, b) {
+  if (a.numFrames !== b.numFrames) return false;
+  for (let i = 0; i < a.numFrames; i++) {
+    if (a.presentationTimes[i] !== b.presentationTimes[i]) return false;
+    if (a.frameDurations[i] !== b.frameDurations[i]) return false;
+  }
+  return Math.abs(a.duration - b.duration) < 1e-12;
+}
+
+async function run() {
+  const checks = [];
+  const check = (name, ok, detail) => checks.push({ name, ok, detail: detail || '' });
+
+  // A clean slate, so a previous run's entries cannot fake a hit or a miss.
+  await new Promise((resolve) => {
+    const request = indexedDB.deleteDatabase('exact-video-engine-index-cache');
+    request.onsuccess = request.onerror = request.onblocked = () => resolve();
+  });
+
+  const bytes = await (await fetch(CLIP)).blob();
+  const file = new File([bytes], 'cache-test.webm', { lastModified: 1700000000000 });
+  // Threshold 0: the fixture is a few KB and builds in microseconds, far under
+  // the real 500 ms bar, but what is under test is the cache logic, not the bar.
+  const cacheable = { cacheMinimumBuildMilliseconds: 0 };
+
+  // --- 1: build, store, hit --------------------------------------------------
+  const built = await ContainerIndex.fromSource(file, cacheable);
+  check('cold load is a build, not a hit', !built.fromCache,
+    `fromCache=${built.fromCache}`);
+  // The store is fire-and-forget on the load path; the test must not race it.
+  await built.cacheWritePromise;
+  const hit = await ContainerIndex.fromSource(file, cacheable);
+  check('identical File hits the cache', hit.fromCache === true,
+    `fromCache=${hit.fromCache}`);
+  check('hit returns identical tables', tablesEqual(built, hit),
+    `built ${built.numFrames} frames / ${built.duration}s, `
+    + `hit ${hit.numFrames} frames / ${hit.duration}s`);
+
+  // --- 2: changed lastModified is a miss --------------------------------------
+  const touched = new File([bytes], 'cache-test.webm', { lastModified: 1700000000001 });
+  const afterTouch = await ContainerIndex.fromSource(touched, cacheable);
+  check('changed lastModified misses and rebuilds', !afterTouch.fromCache
+    && tablesEqual(built, afterTouch),
+    `fromCache=${afterTouch.fromCache}`);
+
+  // --- 3: a bare Blob has no identity and is never cached ----------------------
+  const blobFirst = await ContainerIndex.fromSource(bytes, cacheable);
+  if (blobFirst.cacheWritePromise) await blobFirst.cacheWritePromise;
+  const blobSecond = await ContainerIndex.fromSource(bytes, cacheable);
+  check('a bare Blob is never cached', !blobFirst.fromCache && !blobSecond.fromCache,
+    `first=${blobFirst.fromCache}, second=${blobSecond.fromCache}`);
+
+  // --- 4: URL sources key on (url, size, validator) ---------------------------
+  const urlBuilt = await ContainerIndex.fromSource('/test/' + CLIP, cacheable);
+  await urlBuilt.cacheWritePromise;
+  const urlHit = await ContainerIndex.fromSource('/test/' + CLIP, cacheable);
+  check('a URL with a validator hits on the second load',
+    !urlBuilt.fromCache && urlHit.fromCache === true && tablesEqual(urlBuilt, urlHit),
+    `first=${urlBuilt.fromCache}, second=${urlHit.fromCache}`);
+
+  // --- 5: a wrong schemaVersion is a miss --------------------------------------
+  const key = deriveIndexCacheKey(file, { size: file.size });
+  const doctored = serializeContainerIndex(built);
+  doctored.schemaVersion = -1;
+  await storeCachedIndexPayload(key, doctored);
+  const afterDoctor = await ContainerIndex.fromSource(file, cacheable);
+  check('a wrong schemaVersion misses and rebuilds', !afterDoctor.fromCache
+    && tablesEqual(built, afterDoctor),
+    `fromCache=${afterDoctor.fromCache}`);
+
+  // --- 6: a cached index still drives an engine --------------------------------
+  // Rebuild the (valid) entry that step 5 doctored, then load an engine from the
+  // hit and prove the hydrated index behaves like the built one where the engine
+  // touches it.
+  await storeCachedIndexPayload(key, serializeContainerIndex(built));
+  const rehit = await ContainerIndex.fromSource(file, cacheable);
+  const video = document.getElementById('native-video');
+  const engine = new NativeVideoEngine(video);
+  await engine.load(file, { index: rehit });
+  check('an engine loads from a cached index', rehit.fromCache === true
+    && engine.numFrames === built.numFrames
+    && engine.frameIndexIsExact === true
+    && engine.frameAtTime(built.presentationTimes[built.numFrames - 1])
+      === built.numFrames - 1,
+    `fromCache=${rehit.fromCache}, numFrames=${engine.numFrames}, `
+    + `exact=${engine.frameIndexIsExact}`);
+  engine.destroy();
+
+  window.__result = { checks };
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>

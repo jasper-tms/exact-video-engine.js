@@ -1,35 +1,57 @@
 import { createRangeReader } from './range-readers.js';
-import { readMatroskaFrameTable } from './matroska.js';
+import { deriveIndexCacheKey, loadCachedIndexPayload, storeCachedIndexPayload, serializeContainerIndex, hydrateContainerIndex } from './index-cache.js';
+import { readMatroskaFrameTable, IndexBudgetExceededError } from './matroska.js';
+import { readOggFrameTable } from './ogg.js';
+
+// A build faster than this is not worth caching: a classic single-moov MP4
+// indexes in a few range reads and would only churn the cache, while a
+// full-file pass (WebM, fragmented MP4, Ogg) that took this long once is
+// exactly the cost the cache exists to not pay twice. Matches the npimage
+// heuristic. Overridable per call (options.cacheMinimumBuildMilliseconds),
+// which the tests use to force tiny fixtures through the cache path.
+const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 
 // ==================================================================
-// ContainerIndex — everything the moov tells us, with nothing decoded.
+// ContainerIndex — everything the container tells us, with nothing decoded.
 //
 // This is the piece both engines want and neither can get from a <video>
 // element: the real per-frame presentation timestamp table (B-frame safe,
-// variable-frame-rate safe), plus the sample table, the display rotation, and
-// the decoder configuration. Building it reads only the moov — a few range
-// requests, no frame bytes, no VideoDecoder — so it works in browsers that have
-// no WebCodecs at all, which is exactly what makes the <video> fallback
-// frame-exact rather than fps-guessing.
+// variable-frame-rate safe), plus (where the container carries them) the sample
+// table, the display rotation, and the decoder configuration. Building it never
+// decodes a frame, so it works in browsers that have no WebCodecs at all, which
+// is exactly what makes the <video> fallback frame-exact rather than fps-guessing.
 //
-// Two containers, two ways in, one table out. ISOBMFF (mp4/m4v/mov) goes
-// through mp4box, which reads the moov and hands back a full sample table:
-// timestamps, byte ranges, keyframes, decoder configuration — everything, from a
-// few range requests. WebM/Matroska goes through readMatroskaFrameTable above,
-// which streams the file to collect the timestamps alone. So a WebM index is
-// deliberately a lesser thing: it carries the per-frame PTS table (which is what
-// makes the <video> path exact, and the whole point of the exercise) but no
-// sample table and no decoder configuration, so WebCodecs cannot decode from it.
-// `supportsWebCodecs` is how the ladder in createBestEngine tells them apart.
+// Three containers, three ways in, one table out.
 //
-// Anything else (Ogg, HLS) still fails here, and the <video> element still plays
-// it without an exact index. That is the intended degradation, not a bug.
+//   * ISOBMFF (mp4/m4v/mov) goes through mp4box. A classic single-`moov` file is
+//     the cheap case: a few range reads hand back a full sample table (times,
+//     byte ranges, keyframes, decoder configuration) however long the clip is. A
+//     FRAGMENTED file (fMP4/CMAF: the samples live in `moof` boxes scattered the
+//     length of the file, not in the `moov`) is not cheap — its sample table is
+//     empty at `onReady`, so we keep feeding the whole file through mp4box, and
+//     that full-file pass takes the same budget/progress contract as the WebM and
+//     Ogg scans below.
+//   * WebM/Matroska goes through readMatroskaFrameTable, which streams the file to
+//     collect the timestamps alone. So a WebM index is deliberately a lesser
+//     thing: it carries the per-frame presentation-time table (which is what makes
+//     the <video> path exact, and the whole point of the exercise) but no sample
+//     table and no decoder configuration.
+//   * Ogg/Theora goes through readOggFrameTable, likewise a full-file pass for the
+//     timestamps alone, and likewise no sample table or decoder configuration —
+//     Ogg plays only through the native <video> path (Firefox), never WebCodecs.
+//
+// `supportsWebCodecs` is how the ladder in createBestEngine tells the ISOBMFF
+// index (decodable) from the WebM and Ogg ones (native-only).
+//
+// Anything else (HLS and other segmented delivery, raw elementary streams) still
+// fails here, and the <video> element cannot play those either. That is the
+// intended refusal, not a bug.
 // ==================================================================
 export class ContainerIndex {
   constructor(reader) {
     this.reader = reader;
     this.timescale = 1;
-    this.containerFormat = null;     // 'isobmff' | 'matroska'
+    this.containerFormat = null;     // 'isobmff' | 'matroska' | 'ogg'
 
     // Decode-order sample table (no frame bytes): {offset, size, isSync, cts,
     // duration}. The byte ranges the decoder will later fetch on demand.
@@ -48,6 +70,21 @@ export class ContainerIndex {
     this.videoHeight = 0;
     this.numFrames = 0;
     this.duration = 0;               // seconds (sum of real frame durations)
+    // True when a trimming edit list excluded samples from the display tables
+    // (the sample table still holds them for the decoder). Recorded because not
+    // every browser honors a trim the same way — Gecko presents the untrimmed
+    // frames, a whole-frame shift no runtime check can see — and the native
+    // engine refuses the combination rather than mislabel every frame.
+    this.trimmedByEditList = false;
+
+    // Set by fromSource: true when this index was hydrated from the IndexedDB
+    // cache rather than parsed out of the container, and (on a build that was
+    // stored) the promise of the best-effort cache write, so a caller that wants
+    // to observe the store — a test, mainly — can await it. Neither affects the
+    // index's contents: a hydrated index answers every query identically to a
+    // freshly built one, or it would not have been trusted.
+    this.fromCache = false;
+    this.cacheWritePromise = null;
   }
 
   // Only an ISOBMFF index has what a VideoDecoder needs (the byte ranges of
@@ -56,22 +93,64 @@ export class ContainerIndex {
   // the WebCodecs engine.
   get supportsWebCodecs() { return !!(this.samples && this.decoderConfig); }
 
-  // options.timeoutMilliseconds / options.maxBytes bound the WebM pass (see
-  // readMatroskaFrameTable); they are ignored for ISOBMFF, which is a handful of
-  // range reads however long the clip is.
+  // options.timeoutMilliseconds / options.maxBytes / options.onProgress /
+  // options.chunkBytes bound and report the full-file passes (WebM, Ogg, and a
+  // FRAGMENTED MP4 — see readMatroskaFrameTable / readOggFrameTable /
+  // _demuxIsobmff). They are inert for a classic single-`moov` MP4, which is a
+  // handful of range reads however long the clip is.
   static async load(reader, options = {}) {
     const index = new ContainerIndex(reader);
     if (await ContainerIndex._isMatroska(reader)) await index._demuxMatroska(reader, options);
-    else await index._demuxIsobmff(reader);
+    else if (await ContainerIndex._isOgg(reader)) await index._demuxOgg(reader, options);
+    else await index._demuxIsobmff(reader, options);
     return index;
   }
 
   // Build an index straight from a source, for hosts that want the frame table
-  // without instantiating an engine.
+  // without instantiating an engine. This is also where the index cache lives:
+  // an expensive build (a full-file pass over a WebM, fragmented MP4, or Ogg)
+  // is stored in IndexedDB and reused when the SAME clip is opened again.
+  //
+  // Sameness is proven, never assumed — a stale cached index is a WRONG index,
+  // the silent off-by-one this library exists to prevent — so the key is the
+  // source's full identity ((name, size, lastModified) for a File; URL + size +
+  // strong ETag/Last-Modified for a URL; see deriveIndexCacheKey), and anything
+  // doubtful is a miss and a rebuild. Every cache failure degrades to
+  // rebuilding, never to guessing. options.cache: false skips the cache
+  // entirely; options.cacheMinimumBuildMilliseconds overrides the store
+  // threshold (tests force it to 0 so tiny fixtures exercise the cache path).
   static async fromSource(source, options = {}) {
     const reader = createRangeReader(source);
     await reader.init();
-    return await ContainerIndex.load(reader, options);
+
+    const cacheKey = (options.cache === false)
+      ? null : deriveIndexCacheKey(source, reader);
+    if (cacheKey) {
+      const payload = await loadCachedIndexPayload(cacheKey);
+      if (payload) {
+        const cachedIndex = new ContainerIndex(reader);
+        // hydrate can still refuse (a schema mismatch that slipped the version
+        // check); that is a miss like any other, and we fall through to a build.
+        if (hydrateContainerIndex(cachedIndex, payload)) {
+          cachedIndex.fromCache = true;
+          return cachedIndex;
+        }
+      }
+    }
+
+    const buildStartedAt = performance.now();
+    const index = await ContainerIndex.load(reader, options);
+    const buildMilliseconds = performance.now() - buildStartedAt;
+    const minimumBuildMilliseconds = (options.cacheMinimumBuildMilliseconds === undefined)
+      ? CACHE_MINIMUM_BUILD_MILLISECONDS : options.cacheMinimumBuildMilliseconds;
+    if (cacheKey && buildMilliseconds >= minimumBuildMilliseconds) {
+      // Fire-and-forget: the write never throws and the caller is not made to
+      // wait on bookkeeping. The promise is exposed for tests that must not
+      // race it.
+      index.cacheWritePromise =
+        storeCachedIndexPayload(cacheKey, serializeContainerIndex(index));
+    }
+    return index;
   }
 
   // WebM and MP4 are told apart by their first bytes, not by a file extension or
@@ -81,6 +160,15 @@ export class ContainerIndex {
     const magic = new Uint8Array(await reader.read(0, 3));
     return magic[0] === 0x1A && magic[1] === 0x45
       && magic[2] === 0xDF && magic[3] === 0xA3;   // EBML
+  }
+
+  // Ogg is likewise told apart by its first bytes, not an extension: every Ogg
+  // file (and every page in it) begins with the "OggS" capture pattern.
+  static async _isOgg(reader) {
+    if (reader.size < 4) return false;
+    const magic = new Uint8Array(await reader.read(0, 3));
+    return magic[0] === 0x4F && magic[1] === 0x67
+      && magic[2] === 0x67 && magic[3] === 0x53;   // "OggS"
   }
 
   // Largest display frame whose presentation time is <= t (binary search over
@@ -138,31 +226,49 @@ export class ContainerIndex {
     return (start + end) / 2;
   }
 
-  async _demuxIsobmff(reader) {
+  async _demuxIsobmff(reader, options = {}) {
     if (typeof MP4Box === 'undefined') throw new Error('mp4box.js is not loaded');
     const file = MP4Box.createFile(false);   // false: discard mdat bytes
     let info = null, demuxError = null;
     file.onReady = (i) => { info = i; };
     file.onError = (e) => { demuxError = new Error('mp4box: ' + e); };
 
-    // Feed the container until the moov (index) is parsed. appendBuffer returns
-    // the next byte offset it wants, which jumps past the mdat when the moov
-    // sits at the end of the file — so we never read frame bytes here.
-    const CHUNK = 1 << 18;   // 256 KB
+    // Phase 1 — feed the container until the moov (index) is parsed. appendBuffer
+    // returns the next byte offset it wants, which jumps past the mdat when the
+    // moov sits at the end of the file — so we never read frame bytes here. This
+    // is the whole cost for a classic single-`moov` MP4, and it stays exactly as
+    // cheap as before: a few range reads, no budget, no progress ticks, no yields.
+    const READY_CHUNK = 1 << 18;   // 256 KB
     let offset = 0;
     while (info === null && demuxError === null && offset < reader.size) {
-      const end = Math.min(offset + CHUNK, reader.size) - 1;
+      const end = Math.min(offset + READY_CHUNK, reader.size) - 1;
       const buffer = await reader.read(offset, end);
       if (!buffer.byteLength) break;
       buffer.fileStart = offset;
       offset = file.appendBuffer(buffer);
     }
-    file.flush();
     if (demuxError) throw demuxError;
-    if (!info) throw new Error('no moov found (not a valid MP4?)');
+    if (!info) { file.flush(); throw new Error('no moov found (not a valid MP4?)'); }
 
     const videoTrack = info.videoTracks && info.videoTracks[0];
-    if (!videoTrack) throw new Error('no video track in file');
+    if (!videoTrack) { file.flush(); throw new Error('no video track in file'); }
+
+    // Is this a fragmented MP4 (fMP4/CMAF)? Its samples live in `moof` boxes
+    // scattered the length of the file rather than in the `moov`, so at onReady
+    // the sample table is empty and the real work is still ahead. mp4box reports
+    // the presence of an `mvex` box as info.isFragmented; as a belt-and-braces
+    // check we also treat an empty video sample table with file still unread as
+    // fragmented (a classic file's table is already complete here, even a
+    // faststart one whose mdat we have not touched).
+    const readySampleCount = file.getTrackSamplesInfo(videoTrack.id).length;
+    const isFragmented = !!info.isFragmented || (readySampleCount === 0 && offset < reader.size);
+
+    if (isFragmented) {
+      await this._demuxFragmentedIsobmff(reader, file, videoTrack, options,
+        () => demuxError, offset);
+    }
+    file.flush();
+    if (demuxError) throw demuxError;
 
     this.decoderConfig = {
       codec: videoTrack.codec,
@@ -186,6 +292,123 @@ export class ContainerIndex {
     this._buildTables(file.getTrackSamplesInfo(videoTrack.id),
       this._editListWindow(videoTrack));
     this.containerFormat = 'isobmff';
+  }
+
+  // Phase 2 of the ISOBMFF open, for a fragmented file only: feed the whole file
+  // through mp4box so every `moof` box is parsed and the sample table is complete
+  // before _demuxIsobmff reads it. This is the expensive path a classic MP4 never
+  // touches, so it carries the same budget/progress/yield contract as the WebM and
+  // Ogg passes (see readMatroskaFrameTable). Still no frame bytes are decoded —
+  // createFile(false) discards mdat payloads and appendBuffer skips past them — so
+  // this reads the container's structure, not its pixels.
+  //
+  // getDemuxError() surfaces a late mp4box parse error from _demuxIsobmff's onError
+  // closure; startOffset is where phase 1 left the cursor (just past the moov).
+  async _demuxFragmentedIsobmff(reader, file, videoTrack, options, getDemuxError, startOffset) {
+    const maxBytes = (options.maxBytes === undefined) ? Infinity : options.maxBytes;
+    // Refuse an oversized file BEFORE the full-file pass, the same gate the
+    // Matroska and Ogg scans apply — reading all of it is exactly the cost.
+    if (reader.size > maxBytes) {
+      throw new IndexBudgetExceededError(
+        `fragmented MP4 is ${reader.size} bytes; indexing it means reading all of `
+        + `them, and the caller's limit is ${maxBytes}`);
+    }
+    const timeoutMilliseconds = (options.timeoutMilliseconds === undefined)
+      ? Infinity : options.timeoutMilliseconds;
+    if (!(timeoutMilliseconds > 0)) {
+      throw new IndexBudgetExceededError('no time allowed to index this fragmented MP4');
+    }
+
+    const onProgress = (typeof options.onProgress === 'function') ? options.onProgress : null;
+    const chunkBytes = options.chunkBytes || (1 << 20);   // 1 MB, like the Matroska pass
+
+    const startedAt = performance.now();
+    let lastYieldedAt = startedAt;
+
+    // The same report shape the Matroska/Ogg passes emit. framesFound is
+    // best-effort: the number of video samples mp4box has parsed from `moof` boxes
+    // so far (a cheap read of the track's growing sample array; 0 before any
+    // appear).
+    const report = (bytesRead) => {
+      if (!onProgress) return;
+      const elapsedMs = performance.now() - startedAt;
+      const fraction = reader.size ? Math.min(1, bytesRead / reader.size) : 1;
+      const etaMs = (fraction > 0 && fraction < 1) ? elapsedMs * (1 - fraction) / fraction : 0;
+      try {
+        onProgress({
+          bytesRead, totalBytes: reader.size, fraction, elapsedMs, etaMs,
+          framesFound: file.getTrackSamplesInfo(videoTrack.id).length,
+        });
+      } catch (progressError) {
+        // A throwing indicator is the host's bug, not ours; keep indexing.
+      }
+    };
+
+    // appendBuffer returns the next byte offset it wants (often skipping an mdat);
+    // follow it exactly as phase 1 does. If it fails to advance, step to the end of
+    // the chunk ourselves so a stubborn file cannot stall the pass.
+    let offset = startOffset;
+    while (getDemuxError() === null && offset < reader.size) {
+      const now = performance.now();
+      if (now - startedAt > timeoutMilliseconds) {
+        throw new IndexBudgetExceededError(
+          `indexing this fragmented MP4 did not finish within ${timeoutMilliseconds} ms `
+          + `(read ${offset} of ${reader.size} bytes)`);
+      }
+      // A chunk of progress: report it, then let the event loop breathe so a large
+      // local file cannot freeze the page (awaiting the read usually yields, but a
+      // fast disk can resolve quickly enough to starve rendering).
+      report(offset);
+      if (now - lastYieldedAt > 16) {
+        lastYieldedAt = now;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      const end = Math.min(offset + chunkBytes, reader.size) - 1;
+      const buffer = await reader.read(offset, end);
+      if (!buffer.byteLength) break;
+      buffer.fileStart = offset;
+      const next = file.appendBuffer(buffer);
+      offset = (next > offset) ? next : end + 1;
+    }
+    report(reader.size);   // a final 100% tick, so the host can settle the bar
+  }
+
+  // Ogg/Theora: the timestamps and nothing else (see readOggFrameTable), the same
+  // shape as the Matroska path. samples, keyframeDecodeIndices and decoderConfig
+  // stay null, so supportsWebCodecs reports false and the clip plays only through
+  // the native <video> element (Firefox).
+  async _demuxOgg(reader, options) {
+    const table = await readOggFrameTable(reader, options);
+    this.containerFormat = 'ogg';
+    this.videoWidth = table.videoWidth;
+    this.videoHeight = table.videoHeight;
+    // Ogg carries no display rotation matrix (and the <video> element applies
+    // none either, so the two agree).
+    this.rotation = 0;
+
+    // readOggFrameTable already returns times in presentation order with the first
+    // frame at t = 0 (Theora is constant-frame-duration, so there is no B-frame
+    // reordering to undo — unlike the Matroska path, which must sort). Build the
+    // display tables directly.
+    const times = table.presentationTimes;
+    const n = times.length;
+    this.presentationTimes = new Float64Array(n);
+    this.frameDurations = new Float64Array(n);
+    for (let d = 0; d < n; d++) this.presentationTimes[d] = times[d];
+    // A frame lasts until the next one starts; the last frame has no next one, so
+    // it falls back to the codec's constant frame duration (then, defensively, to
+    // the previous frame's, then to a nominal 30fps) — mirroring the Matroska path.
+    for (let d = 0; d < n - 1; d++) {
+      this.frameDurations[d] = this.presentationTimes[d + 1] - this.presentationTimes[d];
+    }
+    if (n) {
+      this.frameDurations[n - 1] = table.defaultFrameDuration
+        || (n > 1 ? this.frameDurations[n - 2] : 1 / 30);
+    }
+
+    this.numFrames = n;
+    this.duration = n
+      ? this.presentationTimes[n - 1] + this.frameDurations[n - 1] : 0;
   }
 
   // The composition-time window the container's edit list actually presents, in
@@ -334,6 +557,7 @@ export class ContainerIndex {
     // timeline whose origin is the first frame the viewer sees.
     const order = presented.slice().sort((a, b) => this.samples[a].cts - this.samples[b].cts);
     const p = order.length;
+    this.trimmedByEditList = p < n;
     const cts0 = p ? this.samples[order[0]].cts : 0;
     this.presentationTimes = new Float64Array(p);
     this.frameDurations = new Float64Array(p);

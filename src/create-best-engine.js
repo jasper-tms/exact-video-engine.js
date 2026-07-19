@@ -7,10 +7,11 @@ import { detectBrowserEngine, webCodecsMayFailMidStream } from './decode-support
 // createBestEngine — walk the ladder and return a loaded engine.
 //
 // The container index is built once, up front, and handed to whichever engine
-// ends up playing: it is what WebCodecs decodes from, and it is also what lifts
-// the <video> path from an assumed frame rate to exact per-frame timestamps. So
-// it is worth building even when WebCodecs is nowhere in sight, and it is never
-// built twice.
+// ends up playing: it is what WebCodecs decodes from, and it is also what gives
+// the <video> path exact per-frame timestamps. So it is worth building even when
+// WebCodecs is nowhere in sight, and it is never built twice. An index is
+// mandatory: a container we cannot index is refused, since this engine reports
+// only true frame indices, never inferred ones.
 //
 //   createBestEngine(source, {canvas, video})  ->  VideoEngine | NativeVideoEngine
 //
@@ -29,26 +30,15 @@ export async function createBestEngine(source, options = {}) {
     // Passed through to VideoEngine; ignored by the <video> element, which does
     // its own buffering. See the VideoEngine constructor.
     windowAhead,
-    declaredFrameRate = 0,
-    declaredNumFrames = 0,
-    // Guarantee-or-bail for frame accuracy. A clip we cannot index (not MP4/MOV,
-    // not WebM/MKV) has no per-frame timestamp table, so the native engine can
-    // only map frames from a declared rate — exact only if the clip really is
-    // constant-frame-rate at that rate. By default such a clip must come with a
-    // declaredFrameRate (which is then VERIFIED against the real frame timestamps
-    // and rejected if inconsistent, rather than trusted); a clip with neither an
-    // index nor a rate throws rather than play with silently guessed frame
-    // numbers. Set allowApproximate: true to opt out of both — play the clip
-    // best-effort with whatever mapping is available and no frame-accuracy
-    // guarantee — for a host that genuinely does not need exact frame numbers.
-    allowApproximate = false,
     // How long the WebM index is allowed to take. Building it means reading the
     // whole file (Matroska keeps no central sample table), which is quick from
-    // disk and as slow as the network from a URL — so it gets a deadline, and a
-    // clip that blows through it falls back to the declared frame rate rather
-    // than making the host wait. Infinity to let it run as long as it needs;
-    // indexMaxBytes refuses outsized files before reading a byte of them.
-    // Neither touches the MP4 path, which is a few range reads either way.
+    // disk and as slow as the network from a URL — so it gets a deadline. A clip
+    // that blows through it is now REFUSED (the throw below) rather than played
+    // with guessed frame numbers; the index cache (added separately) is what
+    // softens the repeat-visit cost of a full-file parse. Infinity to let it run
+    // as long as it needs; indexMaxBytes refuses outsized files before reading a
+    // byte of them. Neither touches the MP4 path, which is a few range reads
+    // either way.
     indexTimeoutMilliseconds = 10000,
     indexMaxBytes = Infinity,
     // Called ~once per megabyte while a WebM is being indexed (the one pass long
@@ -68,6 +58,9 @@ export async function createBestEngine(source, options = {}) {
   } = options;
 
   let index = (providedIndex !== undefined) ? providedIndex : null;
+  // The build error, kept so the refusal below can name what actually went wrong
+  // (an unsupported container, mp4box.js absent, or the WebM pass timing out).
+  let indexBuildError = null;
   if (providedIndex === undefined) {
     try {
       index = await ContainerIndex.fromSource(source, {
@@ -76,12 +69,27 @@ export async function createBestEngine(source, options = {}) {
         onProgress,
       });
     } catch (err) {
-      console.warn('exact-video-engine: could not index this container (not '
-        + 'ISOBMFF or WebM, mp4box.js not loaded, or the WebM pass ran out of '
-        + 'time). The <video> element may still play it, but only from a declared '
-        + 'frame rate — a clip with neither an index nor a declaredFrameRate bails '
-        + 'below rather than guess frame numbers.', err);
+      indexBuildError = err;
     }
+  }
+
+  // Index or refuse. Every engine this function returns reports true per-frame
+  // indices read from the container, never numbers inferred from an assumed
+  // frame rate — so a container we could not index has no engine we are willing
+  // to hand back. This fires when the build failed above or when the caller
+  // explicitly passed index: null. A WebM whose indexing pass exceeded
+  // indexTimeoutMilliseconds lands here too: it now refuses rather than falling
+  // back to a declared rate, and the index cache (added separately) is what
+  // softens the cost the next time the same clip is opened.
+  if (!index) {
+    let message = 'createBestEngine: no index could be built for this container; '
+      + 'it is not a format we can index (supported: MP4/MOV, WebM/MKV, and Ogg). '
+      + 'Without a per-frame timestamp table there is no way to report exact frame '
+      + 'numbers, so this clip is refused rather than played with guesses.';
+    if (indexBuildError && indexBuildError.message) {
+      message += ` (underlying error: ${indexBuildError.message})`;
+    }
+    throw new Error(message);
   }
 
   // Proactively route away from WebCodecs for combinations it is known to
@@ -122,27 +130,24 @@ export async function createBestEngine(source, options = {}) {
     throw new Error('createBestEngine: no <video> element supplied to fall back to');
   }
 
-  // Guarantee-or-bail: a clip with no container index and no declared frame rate
-  // could only be played with frame numbers guessed from an assumed rate. Rather
-  // than hand back an engine that silently reports guesses, refuse — unless the
-  // host has explicitly accepted best-effort playback with allowApproximate.
-  if (!index && !allowApproximate && !(declaredFrameRate > 0)) {
-    throw new Error('createBestEngine: this container could not be indexed for '
-      + 'frame-exact playback (it is not MP4/MOV or WebM/MKV), and no '
-      + 'declaredFrameRate was supplied to fall back to, so frame numbers would be '
-      + 'guesses. Pass declaredFrameRate to accept declared-rate mapping (it is '
-      + 'verified against the real frame timestamps and rejected if inconsistent), '
-      + 'or allowApproximate: true to play it best-effort without frame accuracy.');
+  // The native <video> path reads which frame is on screen out of
+  // requestVideoFrameCallback's presented-frame clock, whose mediaTime is the
+  // exact presentation timestamp of the displayed frame. Without that clock there
+  // is no way to know which indexed frame the element is actually showing (raw
+  // currentTime keeps advancing through decoder stalls while the picture is
+  // frozen, and refreshes at coarse uneven intervals on older WebKit), so a
+  // perfect index is not enough — refuse rather than report inexact frame
+  // numbers. This gate is only on the native fallback: the WebCodecs path above
+  // owns its own clock and needs no requestVideoFrameCallback, so it is never
+  // gated on it.
+  if (!('requestVideoFrameCallback' in video)) {
+    throw new Error('createBestEngine: this browser lacks requestVideoFrameCallback, '
+      + 'which the exact native <video> path requires to know which frame is on '
+      + 'screen. Please use a current browser (Safari 15.4+, Firefox 132+, or any '
+      + 'recent Chromium).');
   }
 
   const engine = new NativeVideoEngine(video);
-  await engine.load(source, {
-    index,
-    frameRate: declaredFrameRate,
-    numFrames: declaredNumFrames,
-    // With no index and a declared rate, verify that rate against the clip's real
-    // frame timestamps and throw if it is wrong (unless the host opted out).
-    verifyDeclaredRate: !allowApproximate,
-  });
+  await engine.load(source, { index });
   return engine;
 }

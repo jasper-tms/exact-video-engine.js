@@ -129,14 +129,54 @@ ls clips
 
 # A fragmented remux of the constant-frame-rate counter clip: empty_moov moves
 # every sample out of the moov and into moof fragments, the shape a live/DASH
-# packager writes. mp4box.js reassembles the fragments' sample table when it can
-# read the whole file, so today this small clip lands on the exact WebCodecs path
-# just like the unfragmented original (frame-index-test.mjs and
-# robustness-test.mjs both pin that). When fragmented-MP4 indexing lands, that
-# support becomes a guarantee rather than a happens-to-fit-in-one-parse accident,
-# and these expectations will be tightened deliberately.
+# packager writes. The engine detects fragmentation and feeds the whole file
+# through mp4box so every moof's sample table is parsed (see
+# container-index.js), which makes this clip index as fully as the unfragmented
+# original — a guarantee, not a happens-to-fit-in-one-parse accident.
 ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
     -c copy -movflags frag_keyframe+empty_moov clips/counter-fragmented.mp4
+
+# The variable-frame-rate twin, fragmented: the strongest fragmented-MP4 case.
+# Constant-rate clips cannot tell a real moof-derived timestamp table from a
+# lucky guess; this one can — its frames mismap under any assumed constant rate,
+# so indexing it exactly proves the fragment pass reads the real per-frame
+# timestamps out of the truns.
+ffmpeg -y -loglevel error -i clips/counter-vfr.mp4 \
+    -c copy -movflags frag_keyframe+empty_moov clips/counter-vfr-fragmented.mp4
+
+# The same 30 counter frames in Ogg/Theora, for the engine's own Ogg page scan
+# (src/ogg.js). Theora is constant-frame-duration by codec design, so there is no
+# VFR twin; what these clips prove is that the packet counting and identification-
+# header math produce the right table at all, and (audio variant) that pages of a
+# multiplexed Vorbis stream are not counted as video frames. Theora at the top
+# quality setting keeps the bar edges hard enough for visibleFrame()'s
+# brighter-than-half detection.
+#
+# The Homebrew ffmpeg has no libtheora encoder, so resolve one: use the system
+# ffmpeg if it can encode Theora, else the full static build that imageio-ffmpeg
+# ships (fetched through uv, which caches it). If neither is available the Ogg
+# fixtures are skipped with a warning, and the tests that need them skip too.
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libtheora; then
+    FFMPEG_THEORA=ffmpeg
+else
+    FFMPEG_THEORA="$(uvx --from imageio-ffmpeg python -c \
+        'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())' \
+        2>/dev/null | tail -1)" || FFMPEG_THEORA=""
+fi
+if [ -n "$FFMPEG_THEORA" ] \
+        && "$FFMPEG_THEORA" -hide_banner -encoders 2>/dev/null | grep -q libtheora; then
+    "$FFMPEG_THEORA" -y -loglevel error -f lavfi \
+        -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+        -pix_fmt yuv420p -c:v libtheora -q:v 10 clips/counter-cfr.ogv
+    "$FFMPEG_THEORA" -y -loglevel error \
+        -f lavfi -i "sine=frequency=440:duration=1" \
+        -f lavfi -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+        -map 0:a -map 1:v -shortest \
+        -c:a libvorbis -pix_fmt yuv420p -c:v libtheora -q:v 10 \
+        clips/counter-vorbis-audio.ogv
+else
+    echo "WARNING: no ffmpeg with libtheora found; skipping the Ogg fixtures" >&2
+fi
 
 # A WebM whose FIRST track entry is audio and whose SECOND is video: the audio
 # stream is mapped before the video stream so the Matroska Tracks element lists

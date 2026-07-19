@@ -58,6 +58,13 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Accept-Ranges', 'bytes')
+        # Content validators, like production object stores send on 206s (Cloud
+        # Storage and Firebase Storage both do). The engine's index cache keys
+        # URL sources on these; without them a URL clip is simply never cached,
+        # which would leave the cache's URL path untestable against this server.
+        modified_time = int(os.path.getmtime(path))
+        self.send_header('Last-Modified', self.date_time_string(modified_time))
+        self.send_header('ETag', f'"{file_size:x}-{modified_time:x}"')
         self.end_headers()
         self.wfile.write(body)
         return None

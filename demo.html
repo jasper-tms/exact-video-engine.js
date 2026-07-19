@@ -341,37 +341,35 @@ async function load(file) {
   playButton.textContent = 'Play';
 }
 
-// Whether the container could be indexed. That is the fork in the road: the index
-// is the real per-frame timestamp table, so it decides whether frame indices are
-// exact or fall back to an assumed constant frame rate. MP4 is indexed by mp4box
-// (from the moov) and WebM by the engine's own cluster scan — but only the MP4
-// index carries the sample table WebCodecs needs, so it is also the gate on the
-// WebCodecs engine.
+// Whether the container could be indexed. That is the fork in the road: the
+// index is the real per-frame timestamp table, and a clip that cannot get one
+// is refused outright ("index or refuse") rather than played with guessed frame
+// numbers. MP4 is indexed by mp4box (from the moov, or the moof fragments for
+// fragmented files), WebM by the engine's own cluster scan, and Ogg by its page
+// scan — but only the MP4 index carries the sample table WebCodecs needs, so it
+// is also the gate on the WebCodecs engine.
 function showFormatBadge(file, containerIndex) {
   const dot = file.name.lastIndexOf('.');
   const extension = dot === -1 ? '?' : file.name.slice(dot).toLowerCase();
   const badge = document.getElementById('format-badge');
   // Spelling out the consequence, not just the verdict: "could not index" means
   // nothing to a reader who does not already know that the container is where
-  // the per-frame timestamp table comes from. Note what is NOT lost in the
-  // failing case — the presented frame's timestamp is still exact, because
-  // requestVideoFrameCallback reports it; what is missing is the table needed to
-  // turn that timestamp into a frame index.
+  // the per-frame timestamp table comes from.
   badge.textContent = `Format ${extension} → `
     + (containerIndex
       ? 'indexed → frame indices and times are exact'
-      : 'could not index → frame indices only correct for constant frame rate '
-        + 'videos, but times are exact');
+      : 'could not index → refused (this engine reports only exact frame numbers)');
   badge.className = 'badge ' + (containerIndex ? 'exact' : 'approximate');
   badge.title = containerIndex
     ? `Read the real per-frame timestamp table out of this ${containerIndex.containerFormat}`
       + ' container, so frame indices are exact even on a variable-frame-rate clip.'
-      + (containerIndex.supportsWebCodecs ? '' : ' WebM carries no sample table for '
-        + 'WebCodecs to decode from, so the <video> element plays it — with exact '
-        + 'frame numbers all the same.')
-    : 'Only MP4 (mp4box) and WebM (built-in) can be indexed, and a WebM index has '
-      + 'a time budget it may run out of. The <video> element may still play this '
-      + 'clip, but frame indices come from an assumed constant frame rate.';
+      + (containerIndex.supportsWebCodecs ? '' : ' This container carries no sample '
+        + 'table for WebCodecs to decode from, so the <video> element plays it — '
+        + 'with exact frame numbers all the same.')
+    : 'Only MP4/MOV (mp4box), WebM/MKV, and Ogg can be indexed, and a full-file '
+      + 'indexing pass has a time budget it may run out of. Rather than play with '
+      + 'frame numbers from an assumed constant frame rate, the engine refuses the '
+      + 'clip.';
 }
 
 // Names the engine actually in use — not the one requested, since a request is

@@ -19,21 +19,14 @@
 //
 //   mode=webcodecs        WebCodecs engine (decodes every frame itself)
 //   mode=native-index     <video> element + the container's real PTS table
-//   mode=native-declared  <video> element + an assumed constant frame rate,
-//                         i.e. what the fallback could do before it was given
-//                         the index. Expected to mismap the VFR clip; that
-//                         mismapping is what the index exists to fix.
-//   mode=native-timeout   the full ladder, but with no time allowed to index the
-//                         container. Indexing a WebM means reading the whole
-//                         file, so a long clip on a slow link can cost more than
-//                         it is worth; the engine must then degrade to the
-//                         declared frame rate rather than fail or hang. Same
-//                         outcome as native-declared — that is the point.
-// Only used by mode=native-declared, which by definition has no container to
-// learn the clip's length or rate from and must be told (the clips it runs
-// against are 30 frames at a nominal 30 fps).
-const DECLARED_FRAME_RATE = 30;
-const DECLARED_NUM_FRAMES = 30;
+//
+// There is no approximate mode to drive anymore: a clip the engine cannot index
+// is refused at load (see plan_always_build_an_index.md), which
+// robustness-test.mjs pins; this harness only walks clips that indexed.
+//
+// A clip the BROWSER cannot decode at all (Ogg outside Firefox, say) reports
+// { unplayable: true } instead of a frame walk, and the driver decides per
+// browser whether that is expected.
 // The clips are drawn 5 px per bar across 150 px, i.e. exactly one bar slot per
 // frame, so every column of the image belongs to some frame and the last frame's
 // bar reaches the right edge.
@@ -114,27 +107,22 @@ async function run() {
   // server honouring Range requests.
   const source = await (await fetch(file)).blob();
 
-  let engine;
-  if (mode === 'native-declared') {
-    // No index on purpose: stand in for a container we cannot read at all, where
-    // the host can only tell the engine a frame rate it got from elsewhere.
-    engine = new NativeVideoEngine(video);
-    await engine.load(source, {
-      frameRate: DECLARED_FRAME_RATE, numFrames: DECLARED_NUM_FRAMES,
-    });
-  } else if (mode === 'native-timeout') {
-    engine = await createBestEngine(source, {
-      canvas, video,
-      indexTimeoutMilliseconds: 0,   // the WebM pass never gets off the ground
-      declaredFrameRate: DECLARED_FRAME_RATE,
-      declaredNumFrames: DECLARED_NUM_FRAMES,
-    });
-  } else {
-    engine = await createBestEngine(source, {
-      canvas, video,
-      prefer: (mode === 'native-index') ? 'native' : 'webcodecs',
-    });
+  // A perfectly indexable container is still unwalkable if the browser cannot
+  // decode the codec at all (Ogg/Theora outside Firefox). Report that as its own
+  // outcome rather than a harness error, and let the driver decide per browser
+  // whether it was expected.
+  const mimeByExtension = { ogv: 'video/ogg; codecs="theora"' };
+  const extension = file.split('.').pop();
+  if (mimeByExtension[extension]
+      && video.canPlayType(mimeByExtension[extension]) === '') {
+    window.__result = { unplayable: true, mime: mimeByExtension[extension] };
+    return;
   }
+
+  const engine = await createBestEngine(source, {
+    canvas, video,
+    prefer: (mode === 'native-index') ? 'native' : 'webcodecs',
+  });
 
   const usingCanvas = engine.displayElement === canvas;
 

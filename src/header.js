@@ -32,21 +32,29 @@
 // timestamp to a frame *index*, which needs the table of every frame's PTS. A
 // <video> element never exposes that table, so we read it out of the container
 // ourselves, without decoding a single frame: from the moov for MP4 (mp4box),
-// and by scanning the clusters for WebM. Either way the same table goes to
-// whichever engine ends up playing (see ContainerIndex). That is what makes the
+// the moof fragments for fragmented MP4, the clusters for WebM, and the pages
+// for Ogg. Either way the same table goes to whichever engine ends up playing
+// (see ContainerIndex), and a full-file pass worth caching lands in IndexedDB
+// so it is paid once per clip (see index-cache). That is what makes the
 // <video> path frame-exact on variable-frame-rate clips rather than merely
 // close.
 //
 // createBestEngine() picks the best available combination for a given clip and
-// browser, degrading in this order:
+// browser, choosing between two exact tiers and otherwise refusing:
 //
 //   1. container index + WebCodecs   exact index, exact decode, owned clock
-//                                    (MP4 only: WebM's index carries timestamps
-//                                    but no sample table to decode from)
+//                                    (MP4 only, fragmented included: WebM's and
+//                                    Ogg's indexes carry timestamps but no
+//                                    sample table to decode from)
 //   2. container index + <video>     exact index, browser decode + presentation
-//                                    (MP4 and WebM)
-//   3. declared frame rate + <video> exact for constant-frame-rate clips only
-//   4. no requestVideoFrameCallback  currentTime * frameRate; last resort
+//                                    (MP4, WebM, Ogg), read out through the
+//                                    presented-frame clock (requestVideoFrameCallback)
+//
+// There is no third tier. A clip whose container we cannot index, or a native-path
+// browser with no requestVideoFrameCallback (so no exact presented-frame clock),
+// is refused with a clear error rather than played with guessed frame numbers.
+// This engine is the *exact* one: an engine it hands back always reports true
+// frame indices, never inferred ones.
 //
 // Decode (engine 1) is windowed by GOP (group of pictures: a keyframe plus the
 // frames that depend on it). To show a frame we decode just its GOP, cache the
@@ -58,8 +66,9 @@
 // createBestEngine, and formatProgress (see createBestEngine's onProgress), so
 // both module and non-module host pages can use it.
 // mp4box.js (the `MP4Box` / `DataStream` globals) should be loaded first to
-// index MP4s; WebM indexing is built in and needs nothing. Without mp4box an MP4
-// falls to step 3/4, while a WebM still gets step 2.
+// index MP4s; WebM and Ogg indexing are built in and need nothing. Without
+// mp4box an MP4 cannot be indexed and is refused, while WebM and Ogg still get
+// tier 2.
 //
 // Neither engine touches the host page's DOM beyond the canvas or <video> it is
 // given. Errors surface as an 'errormessage' CustomEvent whose detail.message

@@ -49,8 +49,9 @@ quietly mismaps every variable-frame-rate clip.
 
 That table can be read straight out of the container, with nothing decoded.
 `ContainerIndex` builds it — from the `moov` for MP4 (mp4box.js, a few range
-requests), and by scanning the clusters for WebM (see below) — and it is handed
-to whichever engine ends up playing. Given it, the `<video>` path binary-searches
+requests), by scanning the clusters for WebM, the `moof` fragments for
+fragmented MP4, and the pages for Ogg (see below) — and it is handed to
+whichever engine ends up playing. Given it, the `<video>` path binary-searches
 `mediaTime` into an exact frame index and is frame-exact on variable-frame-rate
 clips.
 
@@ -60,54 +61,52 @@ browser:
 | | Index from | Presentation | Frame index |
 | --- | --- | --- | --- |
 | 1. WebCodecs | container (MP4) | engine-owned canvas | exact |
-| 2. `<video>` + index | container (MP4 or WebM) | browser | exact |
-| 3. `<video>` + declared rate | assumed frame rate | browser | verified against the real timestamps, or the clip bails |
-| 4. no `requestVideoFrameCallback` | assumed frame rate | browser | `currentTime * frameRate`; last resort |
+| 2. `<video>` + index | container (MP4, WebM, or Ogg) | browser | exact |
 
 Step 2 is the one that usually does not exist. It covers browsers without
 WebCodecs (Safari before 16.4, older Firefox), codecs the platform decoder
-rejects, WebM (whose index carries timestamps but no sample table for WebCodecs
-to decode from), and any host that needs audio or the battery-friendly hardware
-overlay path — none of which now have to settle for guessing at frame numbers.
+rejects, WebM and Ogg (whose indexes carry timestamps but no sample table for
+WebCodecs to decode from), and any host that needs audio or the battery-friendly
+hardware overlay path — none of which have to settle for guessing at frame
+numbers.
 
-Step 3 is where a container we cannot index lands (Ogg, HLS, or a WebM whose
-indexing pass ran out of time): the element still plays it, and
-`frameIndexIsExact` tells you the indices are only as good as the frame rate you
-declared.
+There is no step 3. Every engine this library hands back has a real per-frame
+timestamp table; a clip that cannot get one is refused with a clear error.
 
-### Frame accuracy is guaranteed, or the clip bails
+### Index or refuse
 
-A clip that reaches step 3 used to play with *silently* guessed frame numbers,
-which is the one thing a frame-exact library must not do quietly. It no longer
-does. What happens depends on what you told `createBestEngine`:
+An engine that reports frame numbers it cannot stand behind is worse than no
+engine, so there is exactly one rule: every clip we agree to analyze has a real
+per-frame presentation-timestamp table, read from the container without
+decoding a frame. `createBestEngine` throws — with an error message a host can
+show — rather than play a clip it would have to guess about:
 
-- **You passed a `declaredFrameRate`.** The engine treats it as a hypothesis and
-  tries to disprove it before trusting it. At load it drives a handful of *paused
-  seeks* on its own timeline (bounded by group-of-pictures length, not clip
-  duration — the same on a 10-second or a two-hour clip) and reads each landed
-  frame's real presentation timestamp from `requestVideoFrameCallback`. If the
-  timestamps do not sit on the `k / rate` grid — a wrong rate, a
-  variable-frame-rate clip, or a hidden higher rate like 60-declared-as-30 or
-  telecine, which it catches by probing *inside* a single predicted frame — `load`
-  throws instead of mislabeling frames. A rate that survives the probe is then
-  policed every frame during playback: if the clip drifts off-grid later, the
-  engine sets `frameMappingInexact` and emits a fatal `errormessage` with
-  `detail.inexact: true`. This is falsification, not proof — passing cannot prove
-  constant frame rate (only decoding every frame could), so `frameIndexIsExact`
-  stays honestly `false`; the clip is simply no longer allowed to be *silently*
-  wrong.
-- **You passed no rate.** There is nothing to map frames from but a guess, so
-  `createBestEngine` throws rather than hand back an engine that reports guesses.
-- **You passed `allowApproximate: true`.** The explicit opt-out: play the clip
-  best-effort with whatever mapping is available and no frame-accuracy guarantee,
-  for a host that genuinely does not need exact frame numbers. No probe, no bail.
+- **A container we cannot parse** (HLS/MPEG-TS or other segmented delivery, live
+  streams, raw elementary streams, or anything else that is not MP4/MOV,
+  WebM/MKV, or Ogg). No table can exist, so no engine is returned.
+- **An indexing pass that ran out of its budget** (`indexTimeoutMilliseconds` /
+  `indexMaxBytes`, see the WebM section). A partial table is a wrong table.
+- **A browser without `requestVideoFrameCallback`, when the clip must play
+  natively.** Even a perfect index cannot say which frame a `<video>` element is
+  showing without the presented-frame clock, so the native path refuses rather
+  than map frames from raw `currentTime` (which keeps advancing through decoder
+  stalls while the picture is frozen). The clock has shipped everywhere current
+  — Safari 15.4+, Firefox 132+, any recent Chromium — and the WebCodecs path
+  owns its own clock, so this refusal only bites genuinely outdated browsers,
+  and only for clips WebCodecs cannot take (WebM/Ogg, or MP4 with no
+  WebCodecs).
+- **A container whose table disagrees with what the element actually presents**
+  (a trimming edit list the browser mis-times, a truncated file whose tail the
+  scan never saw). Caught at load by comparing durations and calibrating the
+  timeline, and refused rather than played with shifted numbers.
 
-One browser caveat, handled without sniffing: Firefox's
-`requestVideoFrameCallback` reports the *seek target* rather than the presented
-frame's real timestamp, so the probe cannot read the truth there. A calibration
-seek detects that up front and skips verification (frame numbers stay marked
-inexact) rather than false-bail a clip it simply cannot check — the same clock
-imprecision that already makes Firefox fall back from the container index.
+The same honesty applies after load: each frame the element presents during
+playback is checked against the table, and if they sustainedly disagree the
+engine latches `failed`, flips `frameIndexIsExact` to false, and emits a fatal
+`errormessage` (`detail.inexact: true`) — it never silently degrades. (Post-seek
+readbacks are exempt from that check: after a programmatic seek Firefox's
+`requestVideoFrameCallback` echoes the seek target rather than the landed
+frame's real timestamp, which says nothing about the table.)
 
 ### Codecs a browser accepts and then fails on
 
@@ -152,13 +151,12 @@ const engine = await createBestEngine(source, {
 });
 ```
 
-A clip that blows through the budget falls back to the declared frame rate
-(step 3) rather than making the host wait — `frameIndexIsExact` goes false and
-says so, and if you declared a rate it is verified against the real timestamps
-first (a variable-frame-rate WebM that times out bails rather than mismap; see
-"Frame accuracy is guaranteed, or the clip bails" above). Neither option affects
-MP4, which is a handful of range reads however long the clip is. The pass yields
-to the event loop as it goes, so it cannot freeze the page.
+A clip that blows through the budget is refused rather than making the host
+wait forever or play with guessed frame numbers ("index or refuse" above); raise
+or remove the budget to accept the wait, and the index cache below makes sure a
+finished pass is only ever paid once per clip per machine. Neither option
+affects a classic MP4, which is a handful of range reads however long the clip
+is. The pass yields to the event loop as it goes, so it cannot freeze the page.
 
 Because that pass is the one part of opening a clip whose cost grows with the
 file, it can report progress. Pass an `onProgress` callback and it is called
@@ -178,9 +176,52 @@ const engine = await createBestEngine(source, {
 
 `etaMs` is estimated from the average rate so far (0 at the very start and the
 end, so hide the ETA until a few percent in if you like). A throw from the
-callback is swallowed, so a broken indicator can never abort a load. An MP4
-emits no ticks — its index is instant — so drive a spinner's visibility off the
-`createBestEngine` promise and let `onProgress` fill in the WebM case.
+callback is swallowed, so a broken indicator can never abort a load. A classic
+MP4 emits no ticks — its index is instant — so drive a spinner's visibility off
+the `createBestEngine` promise and let `onProgress` fill in the full-file
+passes (WebM, fragmented MP4, Ogg).
+
+### Fragmented MP4
+
+A fragmented MP4 (fMP4/CMAF — the shape DASH packagers and some recorders
+write) has no central sample table: an `mvex` box in the `moov` announces that
+the samples live in `moof` fragments scattered through the file. The engine
+detects that and feeds the whole file through mp4box so every fragment's
+samples land in the table — still nothing decoded, but a full-file read, so it
+takes the same budget, progress reporting, and cache treatment as the WebM
+scan. A fragmented index is as complete as a classic one (sample table, decoder
+configuration), so fragmented clips play through WebCodecs wherever classic
+ones do.
+
+### Ogg
+
+Ogg (Theora video) is indexed by the engine's own page scan, `src/ogg.js`,
+the same shape as the Matroska scan: a sequential full-file pass reading page
+headers and counting frame packets, no decoding, budget and progress and cache
+included. An Ogg index carries timestamps but no sample table, so like WebM it
+plays through the `<video>` element — in browsers that still ship a Theora
+decoder.
+
+### The index cache
+
+A full-file indexing pass (WebM, fragmented MP4, Ogg) is paid once per clip per
+machine, not once per load: an index that took longer than ~500 ms to build is
+kept in IndexedDB and reused when the *same* clip is opened again. Identity is
+proven, never assumed — a stale cached index would be a wrong index, the exact
+silent off-by-one this library exists to prevent — so an entry is reused only
+when the source's identity fully matches:
+
+- a local `File`: its `(name, size, lastModified)` triple;
+- a URL: the address, the byte size, and the server's content validator (a
+  strong `ETag`, else `Last-Modified`). No validator — including one hidden by
+  CORS (`Access-Control-Expose-Headers`) — means the clip is simply rebuilt and
+  never cached. Weak ETags (`W/…`) are ignored for the same reason: they
+  promise semantic equivalence, and a byte-offset table needs byte identity.
+
+Anything doubtful is a miss and a rebuild; a cache failure of any kind
+(IndexedDB disabled, private browsing, quota) degrades to rebuilding, never to
+guessing. A hit is instant and marks the returned index `fromCache = true`.
+Cheap indexes (a classic MP4's few range reads) are never stored.
 
 ## Usage
 
@@ -250,10 +291,9 @@ plays through.
 | `rotation` | The track's display rotation in degrees: 0, 90, 180, or 270. Informational — both engines already present upright. |
 | `displayElement` | The canvas or `<video>` the engine presents into. |
 | `tier` | What this engine got, e.g. `webcodecs` or `native (container index, presented clock)`. Useful for a dev label. |
-| `frameIndexIsExact` | Whether frame numbers are exact, or only as good as an assumed constant frame rate. A tool that must not mislabel a frame should check this and say so. |
-| `frameMappingInexact` | `NativeVideoEngine` only: false until a declared-rate clip is caught mid-playback presenting frames off the declared grid, then true — the rate you gave is wrong and the frame numbers are unreliable. Emitted alongside a fatal `errormessage` (`detail.inexact: true`). Stays false for indexed clips and for a declared rate that keeps checking out. |
-| `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when no index / no decoder configuration (WebM). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. |
-| `failed` | `VideoEngine` only: true once the `VideoDecoder` has reported an unrecoverable error. |
+| `frameIndexIsExact` | True on every engine `createBestEngine` returns (a clip that could not be indexed is refused instead). Goes false only if the runtime watcher later catches the table disagreeing with the frames actually presented, alongside a fatal `errormessage`. |
+| `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when the index carries no decoder configuration (WebM, Ogg). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. |
+| `failed` | True once the engine can no longer stand behind its output: an unrecoverable `VideoDecoder` error (`VideoEngine`), or the container index caught disagreeing with the presented frames during playback (`NativeVideoEngine`). Both also emit a fatal `errormessage`. |
 | `destroy()` | Release resources when done (decoders are a limited browser resource). |
 | `resizeCanvas()` | Re-size the canvas backing store to its parent and repaint (`VideoEngine`); a no-op on `NativeVideoEngine`, where CSS `object-fit` handles it. `update()` already does this every tick, so you rarely need to call it — a pane that gains its size *after* the clip loads (a host that reveals the player only once it is ready) is handled without you having to get the timing right. |
 | event `loaded` | Fired when `load()` completes. |
@@ -334,17 +374,12 @@ coded orientation — see the API note above).
 Lowering `cacheBytes` shrinks read-ahead first and history second; it never
 changes which frames are *available*, only how many are held in memory at once.
 
-`NativeVideoEngine` additionally has `setFrameRate(framesPerSecond, numFrames)`,
-for hosts that know the clip's rate from elsewhere (a sidecar file, say) when no
-container index is available. It is ignored when an index is present, which is
-strictly better.
-
 Also exported: `ContainerIndex` (`ContainerIndex.fromSource(source, {timeoutMilliseconds,
 maxBytes})` builds the frame table on its own, for hosts that want the timestamps
-without an engine — it sniffs MP4 vs WebM from the bytes, and reports which it
-found in `containerFormat` and whether the result is rich enough to decode from
-in `supportsWebCodecs`), and `UrlRangeReader` / `FileRangeReader`, the
-random-access byte readers.
+without an engine — it sniffs MP4 vs WebM vs Ogg from the bytes, and reports
+which it found in `containerFormat` and whether the result is rich enough to
+decode from in `supportsWebCodecs`), and `UrlRangeReader` / `FileRangeReader`,
+the random-access byte readers.
 
 ### Notes on the fallback's exactness
 
@@ -360,13 +395,16 @@ Two things are load-bearing, and both are tested:
   window, so display frame 0 is the first frame the viewer sees and both engines
   play the trim frame-exact. (The decoder still runs the frames before the trim
   point; it needs them to reconstruct the first presented one, but they are never
-  shown.) Where a browser exposes such a clip's `<video>` timeline inconsistently
-  — WebKit runs `currentTime` on the media timeline yet reports the shorter edited
-  duration, leaving the tail frames unreachable — the native path detects that the
-  calibrated timeline overruns the element and drops to the declared frame rate,
-  rather than report frame numbers the element cannot actually show. The WebCodecs
-  path is frame-exact on the trim everywhere. The index also drops if the presented
-  frames stop landing on the table at runtime.
+  shown.) Where a browser mishandles such a clip's `<video>` timeline, the
+  native path refuses the clip rather than report frame numbers the element is
+  not actually showing: WebKit runs `currentTime` on the media timeline yet
+  reports the shorter edited duration (leaving the tail frames unreachable, which
+  the calibration detects), and Gecko presents the untrimmed frames outright — a
+  whole-frame shift no runtime check can see, so it is refused up front. The
+  WebCodecs path is frame-exact on the trim everywhere, and it is what the auto
+  ladder picks for these clips anyway. The same honesty applies at runtime: if
+  the presented frames stop landing on the table, the engine latches `failed`
+  and says so fatally instead of degrading silently.
 
 ## Consuming
 
@@ -467,24 +505,30 @@ bash test/run-tests.sh
 engine and a native `<video>` element and compares where an asymmetric marker
 lands.
 
-**Frame index** walks every frame of five clips through each engine and checks
-that asking for frame `n` both puts frame `n` on screen and reports frame `n`
-back. Ground truth is the pixels: each frame identifies itself by the position
-of a white bar, so nothing is taken on trust from a clock. The clips are chosen
-to make the fallback's exactness falsifiable:
+**Frame index** walks every frame of the counter clips through each engine and
+checks that asking for frame `n` both puts frame `n` on screen and reports
+frame `n` back. Ground truth is the pixels: each frame identifies itself by the
+position of a white bar, so nothing is taken on trust from a clock. The clips
+are chosen to make the index's exactness falsifiable:
 
-- `counter-vfr.mp4` is variable-frame-rate. The `<video>` path mismaps 25 of its
-  30 frames when it can only assume a constant frame rate — and, worse, keeps
-  reporting the frame you asked for while showing a different one. With the
-  container index it gets all 30 right.
-- `counter-vfr.webm` is the same 30 frames in a container mp4box cannot parse, so
-  it exercises the engine's own Matroska scan: mismapped 25 of 30 by an assumed
-  frame rate, exact once the cluster timestamps are read. Running it with
-  `indexTimeoutMilliseconds: 0` also pins the bail-out — no time to index means
-  falling back to the declared rate, not failing.
+- `counter-vfr.mp4` is variable-frame-rate: no assumed constant rate maps it
+  correctly, so all 30 frames landing right proves the real timestamp table is
+  in charge.
+- `counter-vfr.webm` is the same 30 frames in a container mp4box cannot parse,
+  so it exercises the engine's own Matroska scan.
+- `counter-vfr-fragmented.mp4` is the same 30 frames with the sample table
+  scattered across `moof` fragments, so it exercises the fragmented-MP4 pass.
+- `counter-cfr.ogv` exercises the Ogg page scan, in browsers that still decode
+  Theora (`ogg-table-test.mjs` pins the parser itself, browser-independently).
 - `counter-elst.mp4` carries an edit list, so its first frame presents at
   `mediaTime` 0.133 rather than 0. It passes only if the timeline calibration is
   genuinely finding that offset instead of getting away with a zero one.
+
+The refusal side — a WebM given no indexing time must be refused with a clear
+error, not approximated — is pinned by **robustness**, and the **index cache**
+test pins that a cache hit returns identical tables while any doubtful identity
+(changed `lastModified`, an identity-less `Blob`, a wrong schema version) is a
+miss and a rebuild.
 
 **Display** checks that the frame actually reaches the screen, which the frame
 index test cannot: it asserts only on frame *numbers*, and would pass just the

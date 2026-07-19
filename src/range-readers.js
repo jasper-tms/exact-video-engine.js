@@ -22,11 +22,20 @@ export class UrlRangeReader {
     this.url = url;
     this.size = 0;
     this._cache = null;    // bytes [0, _cache.length) of the file, or null
+
+    // The server's content validator (strong ETag, else Last-Modified, else
+    // null), captured from the first response in init(). The index cache keys
+    // on it: a byte-offset index is only reusable if the bytes it was built
+    // against are byte-for-byte the same, and this header is what promises that.
+    // null means the server gave us nothing to trust, so the cache must not
+    // store or reuse an index for this URL. See src/index-cache.js.
+    this.entityValidator = null;
   }
 
   async init() {
     const head = await this._fetchRange(0, UrlRangeReader.HEAD_BYTES - 1);
     this._cache = new Uint8Array(head.body);
+    this.entityValidator = head.entityValidator;
 
     if (head.totalSize) this.size = head.totalSize;
     else this.size = this._cache.length;   // a 200: the whole file is in hand
@@ -63,7 +72,32 @@ export class UrlRangeReader {
     const contentRange = response.headers.get('Content-Range');
     const totalSize = contentRange
       ? parseInt(contentRange.split('/')[1], 10) : 0;
-    return { body: await response.arrayBuffer(), totalSize };
+    return {
+      body: await response.arrayBuffer(),
+      totalSize,
+      entityValidator: this._entityValidatorOf(response.headers),
+    };
+  }
+
+  // The strongest content validator the response headers offer, for the index
+  // cache to key on: a strong ETag if there is one, else Last-Modified, else
+  // null.
+  //
+  // A WEAK ETag (one prefixed 'W/') is deliberately skipped. A weak validator
+  // promises only that two representations are semantically equivalent — same
+  // pixels, perhaps re-muxed — but our index is a table of byte offsets, so it
+  // is correct only against byte-for-byte identical content. Semantic sameness
+  // is not enough; we need byte identity, which only a strong validator asserts.
+  //
+  // NOTE on CORS: a cross-origin response exposes ETag and Last-Modified to
+  // JavaScript only when the server lists them in Access-Control-Expose-Headers.
+  // An unexposed header reads here as absent, so we return null and simply do
+  // not cache — which is the safe direction (rebuild rather than risk a stale
+  // index), never a wrong one.
+  _entityValidatorOf(headers) {
+    const etag = headers.get('ETag');
+    if (etag && !etag.startsWith('W/')) return etag;
+    return headers.get('Last-Modified') || null;
   }
 }
 

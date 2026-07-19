@@ -57,19 +57,30 @@ const CASES = [
       tierIncludes: 'webcodecs', numFrames: 20,
     },
   },
-  // Fragmented MP4 (empty_moov: samples live in moof fragments). mp4box.js
-  // reassembles the fragments' sample table when it can read the whole file, so
-  // today this small clip is indexed as fully as an unfragmented one and decodes
-  // on WebCodecs, exact. Pinning webcodecs + exact + 30 frames is what would
-  // catch fragmented-MP4 feature work regressing the small-file path that already
-  // works. (frame-index-test.mjs additionally proves the frames are pixel-exact.)
+  // Fragmented MP4 (empty_moov: samples live in moof fragments). The engine
+  // detects fragmentation and feeds the whole file through mp4box so every
+  // moof's samples land in the table — guaranteed, not a small-file accident.
+  // (frame-index-test.mjs additionally proves the frames are pixel-exact,
+  // including on the variable-frame-rate fragmented twin.)
   {
-    name: 'fragmented MP4 indexes fully today',
+    name: 'fragmented MP4 indexes fully',
     file: 'counter-fragmented.mp4', mode: 'auto',
     expect: {
       loaded: true, frameReachable: true, frameIndexIsExact: true,
       tierIncludes: 'webcodecs', numFrames: 30,
     },
+  },
+
+  // --- Index or refuse -------------------------------------------------------
+  // A clip whose index cannot be built must be REFUSED with a clear error —
+  // never played with guessed frame numbers (there is no approximate mode
+  // anymore). The WebM given no indexing time is the canonical case: the pass
+  // is cut off before it reads a byte, and the old behavior (fall back to a
+  // declared frame rate) no longer exists.
+  {
+    name: 'WebM with no indexing time is refused, not approximated',
+    file: 'counter-cfr.webm', mode: 'auto', indexTimeoutMilliseconds: 0,
+    expect: { refused: true, errorMatches: /index/i },
   },
 
   // --- Soft failure on malformed input -------------------------------------
@@ -79,11 +90,10 @@ const CASES = [
   // pin survives a defensible change in wording while still catching a hang or a
   // page crash.
 
-  // A WebM truncated partway through its clusters. Today the partial Matroska
-  // scan builds an index for only the frames it could read; that index's duration
-  // falls short of the element's, so it is refused (the same duration check the
-  // trimming edit list trips) and the clip plays on the element at the declared
-  // frame rate — loaded, frameIndexIsExact false.
+  // A WebM truncated partway through its clusters. The partial Matroska scan
+  // yields a table for only the frames it could read; that table's duration
+  // falls short of what the element would present, so the native engine refuses
+  // the clip (index-or-refuse) with a human-readable error.
   { name: 'WebM truncated mid-cluster', file: 'corrupt-webm-truncated-cluster.webm', mode: 'auto', expect: { soft: true } },
   // EBML magic then noise: announces itself as Matroska, then has no usable
   // element tree. The index build fails, the element cannot play noise, and the
@@ -100,12 +110,14 @@ const CASES = [
 const browser = await launchBrowser();
 let failures = 0;
 
-async function loadCase(file, mode) {
+async function loadCase(file, mode, indexTimeoutMilliseconds) {
   const page = await browser.newPage();
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(e.message));
   const startedAt = Date.now();
-  await page.goto(`${serverBase}/test/test-robustness.html?file=${file}&mode=${mode}`);
+  const timeoutQuery = (indexTimeoutMilliseconds !== undefined)
+    ? `&indexTimeoutMs=${indexTimeoutMilliseconds}` : '';
+  await page.goto(`${serverBase}/test/test-robustness.html?file=${file}&mode=${mode}${timeoutQuery}`);
   const settled = await page
     .waitForFunction(() => window.__result || window.__err, { timeout: SETTLE_BUDGET_MILLISECONDS })
     .then(() => true).catch(() => false);
@@ -126,20 +138,22 @@ async function loadCase(file, mode) {
 // signature — expected an exact index, got the declared-rate fallback — so a real
 // regression (wrong frames, a hang, a page error) still fails every attempt.
 const MAX_ATTEMPTS = 4;
-async function loadCaseExpectingIndex(file, mode, wantsExactIndex) {
-  let loaded = await loadCase(file, mode);
+async function loadCaseExpectingIndex(file, mode, indexTimeoutMilliseconds, wantsExactIndex) {
+  let loaded = await loadCase(file, mode, indexTimeoutMilliseconds);
   let attempts = 1;
   while (wantsExactIndex && attempts < MAX_ATTEMPTS
-      && loaded.result && loaded.result.frameIndexIsExact === false) {
+      && loaded.result
+      && (loaded.result.frameIndexIsExact === false || loaded.result.error)) {
     attempts += 1;
-    loaded = await loadCase(file, mode);
+    loaded = await loadCase(file, mode, indexTimeoutMilliseconds);
   }
   return loaded;
 }
 
-for (const { name, file, mode, expect } of CASES) {
+for (const { name, file, mode, indexTimeoutMilliseconds, expect } of CASES) {
   const { result, err, settled, elapsed, pageErrors } =
-    await loadCaseExpectingIndex(file, mode, expect.frameIndexIsExact === true);
+    await loadCaseExpectingIndex(file, mode, indexTimeoutMilliseconds,
+      expect.frameIndexIsExact === true);
 
   const problems = [];
 
@@ -151,7 +165,18 @@ for (const { name, file, mode, expect } of CASES) {
   if (settled && !err && !result) problems.push('settled but produced no result');
 
   if (result) {
-    if (expect.soft) {
+    if (expect.refused) {
+      // The engine must have rejected the load with a human-readable error —
+      // never a hang, never a playable engine with guessed frame numbers.
+      if (result.loaded !== false) {
+        problems.push(`loaded=${result.loaded}, wanted a refusal`);
+      }
+      if (!(typeof result.error === 'string' && result.error.length > 0)) {
+        problems.push('refusal carried no human-readable error');
+      } else if (expect.errorMatches && !expect.errorMatches.test(result.error)) {
+        problems.push(`error "${result.error}" does not match ${expect.errorMatches}`);
+      }
+    } else if (expect.soft) {
       // Soft = ended in a human-readable error OR a graceful load; either is
       // acceptable, a silent no-op is not.
       const softlyHandled = result.loaded === true

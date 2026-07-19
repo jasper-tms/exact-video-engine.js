@@ -35,21 +35,29 @@
 // timestamp to a frame *index*, which needs the table of every frame's PTS. A
 // <video> element never exposes that table, so we read it out of the container
 // ourselves, without decoding a single frame: from the moov for MP4 (mp4box),
-// and by scanning the clusters for WebM. Either way the same table goes to
-// whichever engine ends up playing (see ContainerIndex). That is what makes the
+// the moof fragments for fragmented MP4, the clusters for WebM, and the pages
+// for Ogg. Either way the same table goes to whichever engine ends up playing
+// (see ContainerIndex), and a full-file pass worth caching lands in IndexedDB
+// so it is paid once per clip (see index-cache). That is what makes the
 // <video> path frame-exact on variable-frame-rate clips rather than merely
 // close.
 //
 // createBestEngine() picks the best available combination for a given clip and
-// browser, degrading in this order:
+// browser, choosing between two exact tiers and otherwise refusing:
 //
 //   1. container index + WebCodecs   exact index, exact decode, owned clock
-//                                    (MP4 only: WebM's index carries timestamps
-//                                    but no sample table to decode from)
+//                                    (MP4 only, fragmented included: WebM's and
+//                                    Ogg's indexes carry timestamps but no
+//                                    sample table to decode from)
 //   2. container index + <video>     exact index, browser decode + presentation
-//                                    (MP4 and WebM)
-//   3. declared frame rate + <video> exact for constant-frame-rate clips only
-//   4. no requestVideoFrameCallback  currentTime * frameRate; last resort
+//                                    (MP4, WebM, Ogg), read out through the
+//                                    presented-frame clock (requestVideoFrameCallback)
+//
+// There is no third tier. A clip whose container we cannot index, or a native-path
+// browser with no requestVideoFrameCallback (so no exact presented-frame clock),
+// is refused with a clear error rather than played with guessed frame numbers.
+// This engine is the *exact* one: an engine it hands back always reports true
+// frame indices, never inferred ones.
 //
 // Decode (engine 1) is windowed by GOP (group of pictures: a keyframe plus the
 // frames that depend on it). To show a frame we decode just its GOP, cache the
@@ -61,8 +69,9 @@
 // createBestEngine, and formatProgress (see createBestEngine's onProgress), so
 // both module and non-module host pages can use it.
 // mp4box.js (the `MP4Box` / `DataStream` globals) should be loaded first to
-// index MP4s; WebM indexing is built in and needs nothing. Without mp4box an MP4
-// falls to step 3/4, while a WebM still gets step 2.
+// index MP4s; WebM and Ogg indexing are built in and need nothing. Without
+// mp4box an MP4 cannot be indexed and is refused, while WebM and Ogg still get
+// tier 2.
 //
 // Neither engine touches the host page's DOM beyond the canvas or <video> it is
 // given. Errors surface as an 'errormessage' CustomEvent whose detail.message
@@ -70,6 +79,81 @@
 // the host owns rendering (and translating) that message.
 // ==================================================================
 
+// ==================================================================
+// decode-support — which (browser engine, codec) pairs WebCodecs lies about.
+//
+// WebCodecs decode support tracks the BROWSER ENGINE, not the device, and its
+// feature detection is not always honest. The dangerous class is the "dishonest
+// yes": WebKit (desktop Safari and every iOS browser — they are all WebKit
+// underneath) answers VideoDecoder.isConfigSupported() = true for 10-bit HEVC
+// (the iPhone's own HDR camera format), decodes the first keyframe, and then the
+// decoder dies once sustained decoding starts. That death lands AFTER load()
+// resolved — past createBestEngine's load-time fallback — so the user sees the
+// clip play for a second or two and then stop.
+//
+// The reactive net for this (v1.7.0) is engine.failed + a fatal errormessage a
+// host can rebuild from. This module is the PROACTIVE half: recognize the
+// combination up front and route straight to the <video> element, which decodes
+// the same clip fine (it uses the platform's own AVFoundation path, not
+// WebCodecs). No crash, no flash, and the container index still makes the native
+// path frame-exact.
+//
+// The matrix here is empirical (real-device testing; see the decode-support-matrix
+// agent skill). It is deliberately TIGHT — a false positive needlessly gives up
+// the WebCodecs owned-clock path — so it names only combinations confirmed to
+// crash, and the reactive net still backs up anything it misses.
+// ==================================================================
+
+// The browser's underlying engine, inferred from navigator. WebCodecs bugs live
+// in the engine, so this — not the device or the browser brand — is what decides
+// whether a decode config can be trusted.
+//
+//   'webkit'  desktop Safari AND all iOS browsers (Chrome/Firefox/Edge on iOS
+//             are WebKit-backed by platform mandate). navigator.vendor is
+//             'Apple Computer, Inc.' for every one of them.
+//   'blink'   Chrome/Edge/Brave/Opera off iOS. navigator.vendor is 'Google Inc.'
+//   'gecko'   Firefox off iOS. navigator.vendor is '' (fall back to the UA).
+//   'unknown' anything we cannot place; treated as trustworthy (no routing).
+function detectBrowserEngine(nav) {
+  const navigatorObject = nav
+    || (typeof navigator !== 'undefined' ? navigator : null);
+  if (!navigatorObject) return 'unknown';
+  const vendor = navigatorObject.vendor || '';
+  if (vendor === 'Apple Computer, Inc.') return 'webkit';
+  if (vendor === 'Google Inc.') return 'blink';
+  const userAgent = navigatorObject.userAgent || '';
+  if (/firefox|gecko\//i.test(userAgent)) return 'gecko';
+  return 'unknown';
+}
+
+// Is this codec string 10-bit HEVC — the format WebKit's WebCodecs accepts and
+// then fails on? Covers HEVC Main 10 (general_profile_idc 2, the iPhone HDR
+// default) declared as hvc1/hev1, and Dolby Vision (dvh1/dvhe), which is
+// HEVC-based and always at least 10-bit. Range-Extensions profiles that reach
+// 10-bit through a different profile idc are exotic and not matched from the
+// codec string alone; the reactive fatal-fallback still covers those.
+function isTenBitHevc(codecString) {
+  if (!codecString) return false;
+  const parts = String(codecString).split('.');
+  const fourCharCode = parts[0].toLowerCase();
+  // Dolby Vision (HEVC-based) is always >= 10-bit.
+  if (fourCharCode === 'dvhe' || fourCharCode === 'dvh1') return true;
+  if (fourCharCode === 'hvc1' || fourCharCode === 'hev1') {
+    // hvc1.<profile>.<compat>.<tier><level>.<constraints...>; the profile field
+    // may carry a one-letter profile-space prefix (A/B/C) before the number.
+    const profileField = (parts[1] || '').replace(/^[ABC]/i, '');
+    return parseInt(profileField, 10) === 2;   // 2 == HEVC Main 10
+  }
+  return false;
+}
+
+// Should createBestEngine skip the WebCodecs engine for this (codec, engine)
+// pair because WebCodecs would accept it and then die mid-stream? True only for
+// the confirmed dishonest-yes combinations; everything else goes down the normal
+// ladder (try WebCodecs, fall back on an honest rejection).
+function webCodecsMayFailMidStream(codecString, browserEngine) {
+  return browserEngine === 'webkit' && isTenBitHevc(codecString);
+}
 // Random-access byte readers used to feed mp4box (the moov index) and to fetch
 // encoded samples per GOP on demand — only the bytes actually needed are read.
 // URLs go over HTTP Range (the server must answer 206); local Files use
@@ -94,11 +178,20 @@ class UrlRangeReader {
     this.url = url;
     this.size = 0;
     this._cache = null;    // bytes [0, _cache.length) of the file, or null
+
+    // The server's content validator (strong ETag, else Last-Modified, else
+    // null), captured from the first response in init(). The index cache keys
+    // on it: a byte-offset index is only reusable if the bytes it was built
+    // against are byte-for-byte the same, and this header is what promises that.
+    // null means the server gave us nothing to trust, so the cache must not
+    // store or reuse an index for this URL. See src/index-cache.js.
+    this.entityValidator = null;
   }
 
   async init() {
     const head = await this._fetchRange(0, UrlRangeReader.HEAD_BYTES - 1);
     this._cache = new Uint8Array(head.body);
+    this.entityValidator = head.entityValidator;
 
     if (head.totalSize) this.size = head.totalSize;
     else this.size = this._cache.length;   // a 200: the whole file is in hand
@@ -135,7 +228,32 @@ class UrlRangeReader {
     const contentRange = response.headers.get('Content-Range');
     const totalSize = contentRange
       ? parseInt(contentRange.split('/')[1], 10) : 0;
-    return { body: await response.arrayBuffer(), totalSize };
+    return {
+      body: await response.arrayBuffer(),
+      totalSize,
+      entityValidator: this._entityValidatorOf(response.headers),
+    };
+  }
+
+  // The strongest content validator the response headers offer, for the index
+  // cache to key on: a strong ETag if there is one, else Last-Modified, else
+  // null.
+  //
+  // A WEAK ETag (one prefixed 'W/') is deliberately skipped. A weak validator
+  // promises only that two representations are semantically equivalent — same
+  // pixels, perhaps re-muxed — but our index is a table of byte offsets, so it
+  // is correct only against byte-for-byte identical content. Semantic sameness
+  // is not enough; we need byte identity, which only a strong validator asserts.
+  //
+  // NOTE on CORS: a cross-origin response exposes ETag and Last-Modified to
+  // JavaScript only when the server lists them in Access-Control-Expose-Headers.
+  // An unexposed header reads here as absent, so we return null and simply do
+  // not cache — which is the safe direction (rebuild rather than risk a stale
+  // index), never a wrong one.
+  _entityValidatorOf(headers) {
+    const etag = headers.get('ETag');
+    if (etag && !etag.startsWith('W/')) return etag;
+    return headers.get('Last-Modified') || null;
   }
 }
 
@@ -154,6 +272,343 @@ function createRangeReader(source) {
     ? new UrlRangeReader(source) : new FileRangeReader(source);
 }
 
+// ==================================================================
+// Index cache — repeat loads of the same clip, without re-parsing it.
+//
+// Building an index for a container with no central sample table — WebM,
+// fragmented MP4, Ogg — means reading the whole file and walking it end to end
+// (see readMatroskaFrameTable). No frame is decoded, but every byte still has
+// to go past us, which is disk-speed for a local File and network-speed for a
+// URL. That cost is paid on every single load of the clip, and for a long clip
+// over a slow link it is the difference between an instant open and a visible
+// wait. So we keep the finished index in IndexedDB and hand it back next time.
+//
+// THE SHARP EDGE, and the reason this file is written the way it is: a stale
+// cached index is not a slow index, it is a WRONG index. It is a table of
+// per-frame presentation times and byte offsets; reuse it against even slightly
+// different bytes and every frame number it reports can be off by one — the
+// exact silent error the "index or refuse" plan exists to eliminate. So the
+// cache is not allowed to guess. It reuses an entry only when the source's
+// content validator (a strong ETag / Last-Modified for a URL, or a File's
+// (name, size, lastModified) triple) proves the bytes are the same ones the
+// index was built from. When that proof is missing or weak, the correct answer
+// is a MISS: rebuild from scratch. deriveIndexCacheKey returning null means
+// exactly that — "do not look up, and do not store" — never "probably fine".
+//
+// The cache is an accelerator, never a dependency. Every entry point here
+// swallows its own failures and degrades to "rebuild the index," which is
+// always safe: IndexedDB may be undefined (this module runs in plain Node too),
+// disabled (private browsing), full, or blocked mid-upgrade, and none of that
+// may ever surface to the caller as an error. When in doubt, rebuild.
+// ==================================================================
+
+// Bump this on ANY change to the serialized payload's shape (a renamed field, a
+// new required field, a changed representation). A stored payload whose
+// schemaVersion does not match is treated as a miss, so an old entry from a
+// previous build can never be hydrated into a struct it no longer fits.
+const INDEX_CACHE_SCHEMA_VERSION = 1;
+
+const DATABASE_NAME = 'exact-video-engine-index-cache';
+const DATABASE_VERSION = 1;
+const OBJECT_STORE_NAME = 'container-indexes';
+
+// A deliberately simple bound standing in for a real quota policy. The plan
+// leaves eviction open (LRU? size cap? quota-aware?); until it is decided we
+// keep at most this many entries and drop the least-recently-used past it. A
+// multi-hour index is megabytes, so this is a coarse guard against unbounded
+// growth, not a tuned cache — and since a missed entry only costs a rebuild,
+// evicting too eagerly is never a correctness problem.
+const MAXIMUM_ENTRIES = 40;
+
+// The key must be derivable without re-reading the content — otherwise the
+// cache saves nothing, because computing the key would cost the same read the
+// index does. So it is built entirely from cheap identity metadata the reader
+// already has in hand after init().
+//
+// Returns a stable string identity for the source, or null when the source has
+// no trustworthy identity. null is load-bearing in BOTH directions: a null key
+// means do not look the cache up (there is nothing safe to look up by) AND do
+// not store into it (a future load could collide on a weak key and reuse the
+// wrong index). Callers treat null as an unconditional miss-and-do-not-store.
+function deriveIndexCacheKey(source, reader) {
+  // A local File carries its own strong identity: the browser gives us the
+  // name, the byte size, and the last-modified time, and the trio changes
+  // whenever the file's bytes could have. A bare Blob (no name, no
+  // lastModified) has no such stable identity across loads — two unrelated
+  // Blobs of the same size would collide — so it gets no key and is never
+  // cached.
+  if (source && typeof source === 'object' && typeof source.size === 'number') {
+    const hasFileIdentity = typeof source.name === 'string'
+      && source.name.length > 0
+      && typeof source.lastModified === 'number';
+    if (!hasFileIdentity) return null;
+    return `file:${source.name}:${source.size}:${source.lastModified}`;
+  }
+
+  // A URL is identified by its address, its byte length, and the server's
+  // content validator (a strong ETag or Last-Modified — see
+  // UrlRangeReader.entityValidator, which already skips weak ETags and
+  // unexposed cross-origin headers). No validator means the server gave us
+  // nothing to prove the bytes are unchanged, so we refuse to cache rather than
+  // risk reusing a stale index: null, a miss.
+  if (typeof source === 'string') {
+    const validator = reader && reader.entityValidator;
+    if (!validator) return null;
+    return `url:${source}:${reader.size}:${validator}`;
+  }
+
+  return null;
+}
+
+// --- IndexedDB, wrapped in promises -------------------------------------------
+//
+// IndexedDB is an event-based API (requests fire onsuccess/onerror, the open
+// request also fires onupgradeneeded/onblocked). These helpers wrap the few
+// shapes we need into promises so the logic below reads top to bottom. Each
+// rejects rather than throws synchronously, and every caller turns a rejection
+// into a miss — the cache never lets an IndexedDB failure escape.
+
+// Open (and, on first use, create) the database. Rejects if IndexedDB is
+// missing, if the open errors, or if the upgrade is blocked by another tab
+// holding an older version open.
+function openDatabase() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('indexedDB is not available'));
+      return;
+    }
+    const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(OBJECT_STORE_NAME)) {
+        database.createObjectStore(OBJECT_STORE_NAME, { keyPath: 'cacheKey' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('indexedDB open failed'));
+    request.onblocked = () => reject(new Error('indexedDB open blocked'));
+  });
+}
+
+// Resolve when a request succeeds, reject when it errors — the atom the
+// store/get/delete/getAll helpers below are all built from.
+function awaitRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('indexedDB request failed'));
+  });
+}
+
+// Resolve when a transaction commits, reject if it aborts or errors. A
+// transaction is not a request — it fires oncomplete, not onsuccess — so
+// awaiting one (e.g. after firing several deletes into it) needs its own shape.
+function awaitTransaction(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error('indexedDB transaction failed'));
+    transaction.onabort = () => reject(transaction.error || new Error('indexedDB transaction aborted'));
+  });
+}
+
+// Look up a source's cached index payload, or null.
+//
+// A hit returns the stored payload only when its schemaVersion matches this
+// build's; a version mismatch is a miss (see INDEX_CACHE_SCHEMA_VERSION). Any
+// failure at all — no IndexedDB, open error, blocked upgrade, read error —
+// resolves to null and never throws, because a failed lookup must be
+// indistinguishable from an absent entry: both mean "rebuild."
+//
+// On a hit we bump the record's lastUsedAtMilliseconds so eviction can favour
+// recently-used clips, but that write is fire-and-forget: the payload we are
+// about to return is already in hand, and a failed bookkeeping write must not
+// turn a good hit into a miss.
+async function loadCachedIndexPayload(cacheKey) {
+  if (!cacheKey) return null;
+  let database = null;
+  try {
+    database = await openDatabase();
+    const transaction = database.transaction(OBJECT_STORE_NAME, 'readonly');
+    const store = transaction.objectStore(OBJECT_STORE_NAME);
+    const record = await awaitRequest(store.get(cacheKey));
+    if (!record || !record.payload
+        || record.payload.schemaVersion !== INDEX_CACHE_SCHEMA_VERSION) {
+      return null;
+    }
+    touchRecord(cacheKey).catch(() => {});   // fire-and-forget; failures ignored
+    return record.payload;
+  } catch (error) {
+    return null;
+  } finally {
+    if (database) database.close();
+  }
+}
+
+// Rewrite a record's lastUsedAtMilliseconds to now. Best-effort bookkeeping for
+// eviction ordering; callers ignore whether it succeeds.
+async function touchRecord(cacheKey) {
+  let database = null;
+  try {
+    database = await openDatabase();
+    const transaction = database.transaction(OBJECT_STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(OBJECT_STORE_NAME);
+    const record = await awaitRequest(store.get(cacheKey));
+    if (record) {
+      record.lastUsedAtMilliseconds = Date.now();
+      await awaitRequest(store.put(record));
+    }
+  } finally {
+    if (database) database.close();
+  }
+}
+
+// Store a built index payload for a source, best-effort. Never throws: a failed
+// write (quota exceeded, IndexedDB disabled, transaction error) only means the
+// next load rebuilds, which is always safe. After writing we prune to
+// MAXIMUM_ENTRIES, dropping the least-recently-used — likewise best-effort.
+async function storeCachedIndexPayload(cacheKey, payload) {
+  if (!cacheKey || !payload) return;
+  let database = null;
+  try {
+    database = await openDatabase();
+    const transaction = database.transaction(OBJECT_STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(OBJECT_STORE_NAME);
+    await awaitRequest(store.put({
+      cacheKey,
+      lastUsedAtMilliseconds: Date.now(),
+      payload,
+    }));
+  } catch (error) {
+    return;   // a store that fails just means the next load rebuilds
+  } finally {
+    if (database) database.close();
+  }
+  await pruneToLimit().catch(() => {});   // best-effort; a full store still works
+}
+
+// Keep the store at or below MAXIMUM_ENTRIES by deleting the oldest-used
+// records. Reads every record's lastUsedAtMilliseconds, sorts, and deletes the
+// excess from the front. Best-effort: any failure leaves the store as-is (an
+// over-full cache is a space concern, never a correctness one).
+async function pruneToLimit() {
+  let database = null;
+  try {
+    database = await openDatabase();
+    const readTransaction = database.transaction(OBJECT_STORE_NAME, 'readonly');
+    const readStore = readTransaction.objectStore(OBJECT_STORE_NAME);
+    const records = await awaitRequest(readStore.getAll());
+    if (!records || records.length <= MAXIMUM_ENTRIES) return;
+
+    records.sort((a, b) =>
+      (a.lastUsedAtMilliseconds || 0) - (b.lastUsedAtMilliseconds || 0));
+    const doomed = records.slice(0, records.length - MAXIMUM_ENTRIES);
+
+    const writeTransaction = database.transaction(OBJECT_STORE_NAME, 'readwrite');
+    const writeStore = writeTransaction.objectStore(OBJECT_STORE_NAME);
+    for (const record of doomed) writeStore.delete(record.cacheKey);
+    await awaitTransaction(writeTransaction);
+  } finally {
+    if (database) database.close();
+  }
+}
+
+// --- serialization ------------------------------------------------------------
+//
+// The payload is a plain, structured-cloneable snapshot of a ContainerIndex —
+// everything both engines need to run without the container, and nothing that
+// cannot survive IndexedDB's structured clone. Typed arrays (Float64Array,
+// Int32Array, Uint8Array) clone as-is, so they are stored directly with no
+// conversion to and from plain arrays. The reader is not stored (it is a live
+// object bound to a URL or File, rebuilt per load), and neither is
+// microsToDisplay — a Map keyed on values derived from the sample table, which
+// hydrateContainerIndex reconstructs rather than serialize a redundant copy.
+
+// Snapshot a built ContainerIndex into a storable payload.
+function serializeContainerIndex(index) {
+  const decoderConfig = index.decoderConfig ? {
+    codec: index.decoderConfig.codec,
+    codedWidth: index.decoderConfig.codedWidth,
+    codedHeight: index.decoderConfig.codedHeight,
+    // The avcC/hvcC bytes, a Uint8Array (or undefined for codecs that carry no
+    // description); a Uint8Array survives structured clone unchanged.
+    description: index.decoderConfig.description,
+    optimizeForLatency: index.decoderConfig.optimizeForLatency,
+  } : null;
+
+  return {
+    schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
+    containerFormat: index.containerFormat,
+    timescale: index.timescale,
+    // Display-order tables (typed arrays, stored as-is).
+    presentationTimes: index.presentationTimes,
+    frameDurations: index.frameDurations,
+    displayToDecode: index.displayToDecode,
+    // Decode-order sample table: an array of small plain objects
+    // ({offset, size, isSync, cts, duration}), or null for a WebM/Ogg index
+    // that has timestamps but no sample table. Stored as-is either way.
+    samples: index.samples,
+    keyframeDecodeIndices: index.keyframeDecodeIndices,
+    decoderConfig,
+    rotation: index.rotation,
+    videoWidth: index.videoWidth,
+    videoHeight: index.videoHeight,
+    numFrames: index.numFrames,
+    duration: index.duration,
+    trimmedByEditList: index.trimmedByEditList,
+  };
+}
+
+// Assign a payload back onto a freshly constructed (empty) ContainerIndex.
+//
+// The target is duck-typed: we assign its fields directly rather than import
+// ContainerIndex, because container-index.js imports THIS module and importing
+// it back would be a cycle. So the contract is "an object with the same fields
+// the constructor lays out."
+//
+// Returns false without touching the target when the payload is falsy or its
+// schemaVersion does not match this build — the caller then rebuilds. On
+// success every field is restored, microsToDisplay is rebuilt from the sample
+// table (see below), and it returns true.
+function hydrateContainerIndex(index, payload) {
+  if (!payload || payload.schemaVersion !== INDEX_CACHE_SCHEMA_VERSION) return false;
+
+  index.containerFormat = payload.containerFormat;
+  index.timescale = payload.timescale;
+  index.presentationTimes = payload.presentationTimes;
+  index.frameDurations = payload.frameDurations;
+  index.displayToDecode = payload.displayToDecode;
+  index.samples = payload.samples;
+  index.keyframeDecodeIndices = payload.keyframeDecodeIndices;
+  index.decoderConfig = payload.decoderConfig;
+  index.rotation = payload.rotation;
+  index.videoWidth = payload.videoWidth;
+  index.videoHeight = payload.videoHeight;
+  index.numFrames = payload.numFrames;
+  index.duration = payload.duration;
+  index.trimmedByEditList = !!payload.trimmedByEditList;
+
+  // microsToDisplay is rebuilt, not stored: it is a Map from a sample's
+  // composition time (in whole microseconds) to its display index, and it only
+  // exists for an ISOBMFF index that has a sample table. Rebuild it exactly as
+  // container-index.js's _buildTables does — key Math.round(cts * 1e6 /
+  // timescale), value the display index — so a hydrated index answers
+  // microsToDisplay lookups identically to a freshly-built one. A WebM/Ogg
+  // index has no samples, so it keeps microsToDisplay null, matching the
+  // freshly-built shape.
+  if (payload.samples && payload.displayToDecode) {
+    const microsToDisplay = new Map();
+    for (let displayIndex = 0; displayIndex < payload.displayToDecode.length; displayIndex++) {
+      const decodeIndex = payload.displayToDecode[displayIndex];
+      const sample = payload.samples[decodeIndex];
+      microsToDisplay.set(
+        Math.round(sample.cts * 1e6 / payload.timescale), displayIndex);
+    }
+    index.microsToDisplay = microsToDisplay;
+  } else {
+    index.microsToDisplay = null;
+  }
+
+  return true;
+}
 // ==================================================================
 // Matroska/WebM frame table — the second way to get real timestamps.
 //
@@ -587,34 +1042,431 @@ async function readMatroskaBlock(cursor, state) {
 }
 
 // ==================================================================
-// ContainerIndex — everything the moov tells us, with nothing decoded.
+// Ogg/Theora frame table — the third way to get real timestamps.
+//
+// Firefox plays Ogg/Theora, so it is a format worth an exact index, and like
+// WebM it carries no central sample table: the timing lives inline, spread
+// across every page, so there is no way to build the frame table without a
+// sequential pass over the whole file. This is the same shape and cost as the
+// Matroska scan (SequentialByteCursor, a budget, onProgress ticks, event-loop
+// yields), and it decodes nothing — it reads page headers and skips every
+// packet's payload, with the single exception of the Theora identification
+// header, whose 42 bytes give us the frame rate and picture dimensions.
+//
+// Theora is a constant-frame-duration codec by design: every packet after the
+// three header packets is exactly one video frame (a zero-length packet is a
+// duplicate of the previous frame — still one frame), and frame n is presented
+// at n * FRD / FRN seconds. We still build the table per-frame from the
+// container's REAL packet count rather than trusting a declared rate, because a
+// truncated or malformed stream can carry fewer packets than its header claims,
+// and the whole point of this engine is to number the frames that are actually
+// there. As a second, independent check we reconcile that packet count against
+// the granule position Theora writes on its pages (see the sanity check below):
+// if the container's own two accounts of "how many frames" disagree, this is a
+// file we would mis-index, and we refuse it rather than guess.
+//
+// Two byte orders live in one file, which is a rich source of bugs: the Ogg
+// page layer (capture pattern, granule position, serial numbers, sequence
+// numbers) is LITTLE-endian, while every multi-byte integer inside a Theora
+// header is BIG-endian. Each read below says which it is.
+// ==================================================================
+
+
+// The 7-byte identifier that opens a Theora identification header packet: the
+// packet-type byte 0x80 (bit 7 set = a header packet) followed by "theora".
+const THEORA_SIGNATURE = [0x80, 0x74, 0x68, 0x65, 0x6F, 0x72, 0x61];   // 0x80 "theora"
+
+// Ogg page header flag (the header_type byte). Only the beginning-of-stream bit
+// matters to us: it marks the page whose first packet is a codec's identification
+// header, which is where we find (and identify) the Theora stream. The
+// continued-packet bit (0x01) and end-of-stream bit (0x04) need no handling —
+// the lacing-value packet accounting below is immune to page boundaries, and the
+// pass simply runs to the file's end.
+const OGG_FLAG_BEGIN_OF_STREAM = 0x02;
+
+// The three non-frame packets every Theora logical stream begins with:
+// identification, comment, and setup headers. Every later packet is a frame.
+const THEORA_HEADER_PACKET_COUNT = 3;
+
+// A little-endian unsigned integer of `byteCount` bytes, read from the cursor at
+// `offset` from its current position (bytes the caller has already ensure()d).
+// Ogg's page layer is little-endian; this reads its serial numbers and such.
+function readLittleEndian(cursor, offset, byteCount) {
+  let value = 0;
+  for (let i = byteCount - 1; i >= 0; i--) value = value * 256 + cursor.peek(offset + i);
+  return value;
+}
+
+// A big-endian unsigned integer of `byteCount` bytes, read from a byte array at
+// `offset`. Every multi-byte field inside a Theora header is big-endian, the
+// opposite of the Ogg page layer around it.
+function readBigEndian(bytes, offset, byteCount) {
+  let value = 0;
+  for (let i = 0; i < byteCount; i++) value = value * 256 + bytes[offset + i];
+  return value;
+}
+
+// Parse the Theora identification header (Theora spec 6.1). `bytes` is the first
+// packet's payload starting at the 0x80 signature; it is a fixed 42-byte layout.
+// Returns the frame-rate rational, the keyframe-granule shift, the bitstream
+// revision, and the picture dimensions. All fields are big-endian.
+function parseTheoraIdentificationHeader(bytes) {
+  // bytes[0..6] is the 0x80 "theora" signature, already checked by the caller.
+  const versionMajor = bytes[7];
+  const versionMinor = bytes[8];
+  const versionRevision = bytes[9];
+  if (versionMajor !== 3) {
+    throw new Error(`unsupported Theora bitstream version ${versionMajor}.${versionMinor}.${versionRevision}`);
+  }
+  // Frame dimensions in macroblocks (16 px each), a fallback for the picture size.
+  const frameWidthMacroblocks = readBigEndian(bytes, 10, 2);    // FMBW
+  const frameHeightMacroblocks = readBigEndian(bytes, 12, 2);   // FMBH
+  const pictureWidth = readBigEndian(bytes, 14, 3);             // PICW (24-bit)
+  const pictureHeight = readBigEndian(bytes, 17, 3);            // PICH (24-bit)
+  // bytes[20] PICX, bytes[21] PICY — the picture's offset within the frame; the
+  // timeline does not care where the picture sits, only how big it is.
+  const frameRateNumerator = readBigEndian(bytes, 22, 4);      // FRN
+  const frameRateDenominator = readBigEndian(bytes, 26, 4);    // FRD
+  // bytes[30..32] PARN, bytes[33..35] PARD (pixel aspect ratio), bytes[36] CS
+  // (colorspace), bytes[37..39] NOMBR (nominal bitrate) — none affect timing.
+
+  // The last two bytes pack four fields, read most-significant-bit first across
+  // the 16-bit big-endian value: QUAL(6) KFGSHIFT(5) PF(2) Res(3). Only the
+  // keyframe-granule shift matters here — it is how a Theora granule position
+  // splits into (keyframe number, frames since keyframe).
+  const packed = (bytes[40] << 8) | bytes[41];
+  const keyframeGranuleShift = (packed >> 5) & 0x1F;
+
+  if (!(frameRateNumerator > 0) || !(frameRateDenominator > 0)) {
+    throw new Error(
+      `Theora header declares a nonsensical frame rate ${frameRateNumerator}/${frameRateDenominator}`);
+  }
+
+  return {
+    versionRevision,
+    frameRateNumerator,
+    frameRateDenominator,
+    keyframeGranuleShift,
+    // PICW/PICH are the real display size; fall back to the macroblock-rounded
+    // frame size only when a header leaves the picture dimensions at zero.
+    videoWidth: pictureWidth || frameWidthMacroblocks * 16,
+    videoHeight: pictureHeight || frameHeightMacroblocks * 16,
+  };
+}
+
+// The number of frames a Theora granule position encodes. Theora packs the last
+// keyframe's frame number in the high bits and the count of frames since that
+// keyframe in the low bits (the split point is KFGSHIFT), and their sum is the
+// absolute frame position. A BigInt because a granule position is a full 64-bit
+// field. From bitstream revision 1 on (Theora 3.2.1+, which is what ffmpeg and
+// every current encoder emit) this sum equals the frame COUNT, i.e. the number
+// of frames presented up to and including the last one completing on the page;
+// revision 0 made it the frame INDEX, one less, so we add one back to compare
+// counts to counts.
+function granuleToFrameCount(granulePosition, keyframeGranuleShift, versionRevision) {
+  const shift = BigInt(keyframeGranuleShift);
+  const mask = (1n << shift) - 1n;
+  const keyframeNumber = granulePosition >> shift;
+  const framesSinceKeyframe = granulePosition & mask;
+  const framePosition = keyframeNumber + framesSinceKeyframe;
+  const count = versionRevision >= 1 ? framePosition : framePosition + 1n;
+  return Number(count);
+}
+
+// Read the frame table of an Ogg file's first (and only) Theora video stream.
+//
+// The options contract, budget behaviour, progress reports, and return shape all
+// mirror readMatroskaFrameTable exactly:
+//   options.timeoutMilliseconds  give up after this long (Infinity: never)
+//   options.maxBytes             refuse a file bigger than this (Infinity: any)
+//   options.onProgress           called ~once per chunk with a progress report
+//                                (same shape as the Matroska pass), and once more
+//                                at 100% when it finishes; a throw from it is
+//                                swallowed so a buggy indicator cannot abort a load.
+//   options.chunkBytes           refill/progress granularity (default 1 MB)
+//
+// Returns {presentationTimes (seconds, presentation order, first frame at t = 0),
+// defaultFrameDuration (seconds), videoWidth, videoHeight}. Throws
+// IndexBudgetExceededError when it runs out of budget, and a plain Error when the
+// file is not a single-Theora-stream Ogg we can trust.
+async function readOggFrameTable(reader, options = {}) {
+  const timeoutMilliseconds = (options.timeoutMilliseconds === undefined)
+    ? Infinity : options.timeoutMilliseconds;
+  const maxBytes = (options.maxBytes === undefined) ? Infinity : options.maxBytes;
+  // Indexing an Ogg means reading all of it (no central index), so an oversized
+  // file is refused up front, before a single byte of the pass — the same gate
+  // the Matroska pass applies.
+  if (reader.size > maxBytes) {
+    throw new IndexBudgetExceededError(
+      `Ogg is ${reader.size} bytes; indexing it means reading all of them, and `
+      + `the caller's limit is ${maxBytes}`);
+  }
+  if (!(timeoutMilliseconds > 0)) {
+    throw new IndexBudgetExceededError('no time allowed to index this Ogg');
+  }
+
+  const onProgress = (typeof options.onProgress === 'function') ? options.onProgress : null;
+
+  const startedAt = performance.now();
+  let lastYieldedAt = startedAt;
+
+  const state = {
+    theoraSerialNumber: null,   // the video stream's bitstream_serial_number
+    header: null,               // parsed Theora identification header
+    // Every completed packet on the Theora stream's pages, counted as it passes.
+    // The video frame count is this minus the three Theora header packets.
+    theoraPacketsCompleted: 0,
+    startOffsetChecked: false,  // have we validated the stream starts at frame 0 yet
+    lastGranuleFrameCount: null,   // granule-derived count on the last page that carried one
+  };
+
+  // The video frames seen so far: total Theora packets minus the three headers,
+  // never negative (before the headers have all passed it reads as zero).
+  const videoFramesSoFar = () => Math.max(0, state.theoraPacketsCompleted - THEORA_HEADER_PACKET_COUNT);
+
+  // A progress report, identical in shape to the Matroska pass's report(): the
+  // only field that needs explaining is framesFound, which here is the best-effort
+  // running video-frame count (completed Theora packets minus the three headers).
+  const report = (bytesRead) => {
+    if (!onProgress) return;
+    const elapsedMs = performance.now() - startedAt;
+    const fraction = reader.size ? Math.min(1, bytesRead / reader.size) : 1;
+    const etaMs = (fraction > 0 && fraction < 1) ? elapsedMs * (1 - fraction) / fraction : 0;
+    try {
+      onProgress({
+        bytesRead, totalBytes: reader.size, fraction, elapsedMs, etaMs,
+        framesFound: videoFramesSoFar(),
+      });
+    } catch (progressError) {
+      // An indicator that throws is the host's bug, not ours; keep indexing.
+    }
+  };
+
+  const cursor = new SequentialByteCursor(reader, {
+    chunkBytes: options.chunkBytes,
+    beforeRefill: async () => {
+      const now = performance.now();
+      if (now - startedAt > timeoutMilliseconds) {
+        throw new IndexBudgetExceededError(
+          `indexing this Ogg did not finish within ${timeoutMilliseconds} ms `
+          + `(read ${cursor.position} of ${reader.size} bytes)`);
+      }
+      report(cursor.position);
+      if (now - lastYieldedAt > 16) {
+        lastYieldedAt = now;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    },
+  });
+
+  // Walk every page in file order. Pages are laid out contiguously, so after
+  // skipping one page's body the cursor sits exactly on the next page's capture
+  // pattern; a mismatch means we have lost sync, which for our "index or refuse"
+  // contract is a file we hand back rather than guess our way through.
+  while (!cursor.atEnd) {
+    await readOggPage(cursor, state);
+  }
+
+  if (state.theoraSerialNumber === null) {
+    throw new Error('no Theora video stream in this Ogg file');
+  }
+
+  const videoFrames = videoFramesSoFar();
+  if (videoFrames <= 0) {
+    throw new Error('the Theora stream in this Ogg file carries no video frames');
+  }
+
+  // Final reconciliation: the packet count and the last granule position are the
+  // container's two independent accounts of how many frames there are, and they
+  // must agree (±1, to absorb whether the very last packet's page had already
+  // written its granule). A larger gap is a stream we would mis-index.
+  if (state.lastGranuleFrameCount !== null
+      && Math.abs(state.lastGranuleFrameCount - videoFrames) > 1) {
+    throw new Error(
+      `Theora granule positions and packet count disagree: granules say `
+      + `${state.lastGranuleFrameCount} frames, packets say ${videoFrames}`);
+  }
+
+  const { frameRateNumerator, frameRateDenominator, videoWidth, videoHeight } = state.header;
+  const frameDurationSeconds = frameRateDenominator / frameRateNumerator;
+  // presentationTimes[n] = n * FRD / FRN. Built from the real per-frame packet
+  // count above, not assumed from a declared rate — Theora's constant frame
+  // duration is a fact about the codec, but "how many frames" is a fact about
+  // this file, which is what we counted.
+  const presentationTimes = new Array(videoFrames);
+  for (let n = 0; n < videoFrames; n++) {
+    presentationTimes[n] = n * frameRateDenominator / frameRateNumerator;
+  }
+
+  report(reader.size);   // a final 100% tick, so the host can settle the bar
+  return {
+    presentationTimes,
+    defaultFrameDuration: frameDurationSeconds,
+    videoWidth,
+    videoHeight,
+  };
+}
+
+// Read one Ogg page: its 27-byte header, its segment (lacing) table, and — only
+// for a Theora page — the packet accounting its lacing values imply. The body is
+// otherwise skipped, exactly like a Matroska block's payload. Leaves the cursor
+// on the start of the next page.
+async function readOggPage(cursor, state) {
+  // The fixed part of the header is 27 bytes; page_segments (byte 26) then says
+  // how many lacing values follow.
+  await cursor.ensure(27);
+  if (cursor.peek(0) !== 0x4F || cursor.peek(1) !== 0x67
+      || cursor.peek(2) !== 0x67 || cursor.peek(3) !== 0x53) {   // "OggS"
+    throw new Error('lost Ogg page sync (no OggS capture pattern where a page should start)');
+  }
+  const version = cursor.peek(4);
+  if (version !== 0) throw new Error(`unsupported Ogg page version ${version}`);
+  const headerType = cursor.peek(5);
+  // granule_position: 8 bytes little-endian. All-ones (0xFFFF...FFFF, i.e. -1)
+  // means no packet finishes on this page, so it carries no frame position.
+  let granuleAllOnes = true;
+  for (let i = 0; i < 8; i++) if (cursor.peek(6 + i) !== 0xFF) granuleAllOnes = false;
+  const serialNumber = readLittleEndian(cursor, 14, 4);
+  const pageSegments = cursor.peek(26);
+
+  // Pull in the lacing table, then sum it for the body size. Each lacing value
+  // is 0..255; a value < 255 terminates a packet, a value of exactly 255 means
+  // the packet continues into the next segment (or, at the page's end, the next
+  // page). So the number of packets that COMPLETE on this page is simply the
+  // count of lacing values below 255 — page boundaries and continuations fall
+  // out of that count for free.
+  await cursor.ensure(27 + pageSegments);
+  let bodySize = 0;
+  let packetsCompletedThisPage = 0;
+  for (let i = 0; i < pageSegments; i++) {
+    const lacing = cursor.peek(27 + i);
+    bodySize += lacing;
+    if (lacing < 255) packetsCompletedThisPage += 1;
+  }
+  const headerSize = 27 + pageSegments;
+
+  const isBeginOfStream = !!(headerType & OGG_FLAG_BEGIN_OF_STREAM);
+
+  // A beginning-of-stream page opens a logical stream; its first packet is that
+  // codec's identification header. We only need the first 7 bytes to tell whether
+  // it is Theora, and the whole 42-byte header if it is. Non-Theora streams
+  // (Vorbis audio, Skeleton metadata, …) are recognised here only so we can
+  // ignore their pages.
+  if (isBeginOfStream && bodySize >= THEORA_SIGNATURE.length) {
+    await cursor.ensure(headerSize + Math.min(bodySize, THEORA_SIGNATURE.length));
+    let isTheora = true;
+    for (let i = 0; i < THEORA_SIGNATURE.length; i++) {
+      if (cursor.peek(headerSize + i) !== THEORA_SIGNATURE[i]) { isTheora = false; break; }
+    }
+    if (isTheora) {
+      // A second Theora beginning-of-stream page means chained physical streams,
+      // which re-timestamp partway through the file; we refuse them rather than
+      // hand back a timeline that jumps.
+      if (state.theoraSerialNumber !== null) {
+        throw new Error('this Ogg file chains multiple Theora streams; refusing (frame numbers would restart midway)');
+      }
+      // The identification header is a fixed 42 bytes and, per the Ogg mapping,
+      // is the only packet on this page, so it is wholly present here.
+      const headerBytes = new Uint8Array(42);
+      await cursor.ensure(headerSize + 42);
+      for (let i = 0; i < 42; i++) headerBytes[i] = cursor.peek(headerSize + i);
+      state.header = parseTheoraIdentificationHeader(headerBytes);
+      state.theoraSerialNumber = serialNumber;
+    }
+  }
+
+  // Account for this page only if it belongs to the Theora stream. Everything
+  // else (audio, metadata, and any bytes before the Theora BOS) is skipped.
+  if (serialNumber === state.theoraSerialNumber) {
+    state.theoraPacketsCompleted += packetsCompletedThisPage;
+
+    if (!granuleAllOnes) {
+      // Read the granule position as an unsigned 64-bit BigInt (little-endian).
+      let granulePosition = 0n;
+      for (let i = 7; i >= 0; i--) granulePosition = granulePosition * 256n + BigInt(cursor.peek(6 + i));
+      const granuleFrameCount = granuleToFrameCount(
+        granulePosition, state.header.keyframeGranuleShift, state.header.versionRevision);
+      const videoFrames = Math.max(0, state.theoraPacketsCompleted - THEORA_HEADER_PACKET_COUNT);
+
+      // The first page that carries a completed video frame is where we verify
+      // the stream starts at frame 0. If the granule says more frames have
+      // elapsed than we have counted packets for, the stream began partway
+      // through a longer timeline (a trimmed or chained source whose first
+      // granule is nonzero). We cannot tell from the container alone what
+      // presentation time the browser's demuxer will then assign that first
+      // frame — it may honour the nonzero start or normalise it away — so rather
+      // than risk numbering every frame off by the offset, we refuse. (The
+      // presentation table we build always starts at t = 0 by construction; the
+      // danger is only that frame 0 of our table would not be frame 0 of the
+      // browser's.)
+      if (!state.startOffsetChecked && videoFrames >= 1) {
+        state.startOffsetChecked = true;
+        const startOffset = granuleFrameCount - videoFrames;
+        if (Math.abs(startOffset) > 1) {
+          throw new Error(
+            `this Ogg Theora stream does not start at frame 0 (its first frames' `
+            + `granule implies ${granuleFrameCount} elapsed frames where only `
+            + `${videoFrames} packets have been seen); refusing rather than risk shifted indices`);
+        }
+      }
+
+      state.lastGranuleFrameCount = granuleFrameCount;
+    }
+  }
+
+  // Skip the body and land on the next page. advance() only moves the cursor;
+  // the body bytes are never fetched unless they were a Theora header above.
+  cursor.advance(headerSize + bodySize);
+}
+// A build faster than this is not worth caching: a classic single-moov MP4
+// indexes in a few range reads and would only churn the cache, while a
+// full-file pass (WebM, fragmented MP4, Ogg) that took this long once is
+// exactly the cost the cache exists to not pay twice. Matches the npimage
+// heuristic. Overridable per call (options.cacheMinimumBuildMilliseconds),
+// which the tests use to force tiny fixtures through the cache path.
+const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
+
+// ==================================================================
+// ContainerIndex — everything the container tells us, with nothing decoded.
 //
 // This is the piece both engines want and neither can get from a <video>
 // element: the real per-frame presentation timestamp table (B-frame safe,
-// variable-frame-rate safe), plus the sample table, the display rotation, and
-// the decoder configuration. Building it reads only the moov — a few range
-// requests, no frame bytes, no VideoDecoder — so it works in browsers that have
-// no WebCodecs at all, which is exactly what makes the <video> fallback
-// frame-exact rather than fps-guessing.
+// variable-frame-rate safe), plus (where the container carries them) the sample
+// table, the display rotation, and the decoder configuration. Building it never
+// decodes a frame, so it works in browsers that have no WebCodecs at all, which
+// is exactly what makes the <video> fallback frame-exact rather than fps-guessing.
 //
-// Two containers, two ways in, one table out. ISOBMFF (mp4/m4v/mov) goes
-// through mp4box, which reads the moov and hands back a full sample table:
-// timestamps, byte ranges, keyframes, decoder configuration — everything, from a
-// few range requests. WebM/Matroska goes through readMatroskaFrameTable above,
-// which streams the file to collect the timestamps alone. So a WebM index is
-// deliberately a lesser thing: it carries the per-frame PTS table (which is what
-// makes the <video> path exact, and the whole point of the exercise) but no
-// sample table and no decoder configuration, so WebCodecs cannot decode from it.
-// `supportsWebCodecs` is how the ladder in createBestEngine tells them apart.
+// Three containers, three ways in, one table out.
 //
-// Anything else (Ogg, HLS) still fails here, and the <video> element still plays
-// it without an exact index. That is the intended degradation, not a bug.
+//   * ISOBMFF (mp4/m4v/mov) goes through mp4box. A classic single-`moov` file is
+//     the cheap case: a few range reads hand back a full sample table (times,
+//     byte ranges, keyframes, decoder configuration) however long the clip is. A
+//     FRAGMENTED file (fMP4/CMAF: the samples live in `moof` boxes scattered the
+//     length of the file, not in the `moov`) is not cheap — its sample table is
+//     empty at `onReady`, so we keep feeding the whole file through mp4box, and
+//     that full-file pass takes the same budget/progress contract as the WebM and
+//     Ogg scans below.
+//   * WebM/Matroska goes through readMatroskaFrameTable, which streams the file to
+//     collect the timestamps alone. So a WebM index is deliberately a lesser
+//     thing: it carries the per-frame presentation-time table (which is what makes
+//     the <video> path exact, and the whole point of the exercise) but no sample
+//     table and no decoder configuration.
+//   * Ogg/Theora goes through readOggFrameTable, likewise a full-file pass for the
+//     timestamps alone, and likewise no sample table or decoder configuration —
+//     Ogg plays only through the native <video> path (Firefox), never WebCodecs.
+//
+// `supportsWebCodecs` is how the ladder in createBestEngine tells the ISOBMFF
+// index (decodable) from the WebM and Ogg ones (native-only).
+//
+// Anything else (HLS and other segmented delivery, raw elementary streams) still
+// fails here, and the <video> element cannot play those either. That is the
+// intended refusal, not a bug.
 // ==================================================================
 class ContainerIndex {
   constructor(reader) {
     this.reader = reader;
     this.timescale = 1;
-    this.containerFormat = null;     // 'isobmff' | 'matroska'
+    this.containerFormat = null;     // 'isobmff' | 'matroska' | 'ogg'
 
     // Decode-order sample table (no frame bytes): {offset, size, isSync, cts,
     // duration}. The byte ranges the decoder will later fetch on demand.
@@ -633,6 +1485,21 @@ class ContainerIndex {
     this.videoHeight = 0;
     this.numFrames = 0;
     this.duration = 0;               // seconds (sum of real frame durations)
+    // True when a trimming edit list excluded samples from the display tables
+    // (the sample table still holds them for the decoder). Recorded because not
+    // every browser honors a trim the same way — Gecko presents the untrimmed
+    // frames, a whole-frame shift no runtime check can see — and the native
+    // engine refuses the combination rather than mislabel every frame.
+    this.trimmedByEditList = false;
+
+    // Set by fromSource: true when this index was hydrated from the IndexedDB
+    // cache rather than parsed out of the container, and (on a build that was
+    // stored) the promise of the best-effort cache write, so a caller that wants
+    // to observe the store — a test, mainly — can await it. Neither affects the
+    // index's contents: a hydrated index answers every query identically to a
+    // freshly built one, or it would not have been trusted.
+    this.fromCache = false;
+    this.cacheWritePromise = null;
   }
 
   // Only an ISOBMFF index has what a VideoDecoder needs (the byte ranges of
@@ -641,22 +1508,64 @@ class ContainerIndex {
   // the WebCodecs engine.
   get supportsWebCodecs() { return !!(this.samples && this.decoderConfig); }
 
-  // options.timeoutMilliseconds / options.maxBytes bound the WebM pass (see
-  // readMatroskaFrameTable); they are ignored for ISOBMFF, which is a handful of
-  // range reads however long the clip is.
+  // options.timeoutMilliseconds / options.maxBytes / options.onProgress /
+  // options.chunkBytes bound and report the full-file passes (WebM, Ogg, and a
+  // FRAGMENTED MP4 — see readMatroskaFrameTable / readOggFrameTable /
+  // _demuxIsobmff). They are inert for a classic single-`moov` MP4, which is a
+  // handful of range reads however long the clip is.
   static async load(reader, options = {}) {
     const index = new ContainerIndex(reader);
     if (await ContainerIndex._isMatroska(reader)) await index._demuxMatroska(reader, options);
-    else await index._demuxIsobmff(reader);
+    else if (await ContainerIndex._isOgg(reader)) await index._demuxOgg(reader, options);
+    else await index._demuxIsobmff(reader, options);
     return index;
   }
 
   // Build an index straight from a source, for hosts that want the frame table
-  // without instantiating an engine.
+  // without instantiating an engine. This is also where the index cache lives:
+  // an expensive build (a full-file pass over a WebM, fragmented MP4, or Ogg)
+  // is stored in IndexedDB and reused when the SAME clip is opened again.
+  //
+  // Sameness is proven, never assumed — a stale cached index is a WRONG index,
+  // the silent off-by-one this library exists to prevent — so the key is the
+  // source's full identity ((name, size, lastModified) for a File; URL + size +
+  // strong ETag/Last-Modified for a URL; see deriveIndexCacheKey), and anything
+  // doubtful is a miss and a rebuild. Every cache failure degrades to
+  // rebuilding, never to guessing. options.cache: false skips the cache
+  // entirely; options.cacheMinimumBuildMilliseconds overrides the store
+  // threshold (tests force it to 0 so tiny fixtures exercise the cache path).
   static async fromSource(source, options = {}) {
     const reader = createRangeReader(source);
     await reader.init();
-    return await ContainerIndex.load(reader, options);
+
+    const cacheKey = (options.cache === false)
+      ? null : deriveIndexCacheKey(source, reader);
+    if (cacheKey) {
+      const payload = await loadCachedIndexPayload(cacheKey);
+      if (payload) {
+        const cachedIndex = new ContainerIndex(reader);
+        // hydrate can still refuse (a schema mismatch that slipped the version
+        // check); that is a miss like any other, and we fall through to a build.
+        if (hydrateContainerIndex(cachedIndex, payload)) {
+          cachedIndex.fromCache = true;
+          return cachedIndex;
+        }
+      }
+    }
+
+    const buildStartedAt = performance.now();
+    const index = await ContainerIndex.load(reader, options);
+    const buildMilliseconds = performance.now() - buildStartedAt;
+    const minimumBuildMilliseconds = (options.cacheMinimumBuildMilliseconds === undefined)
+      ? CACHE_MINIMUM_BUILD_MILLISECONDS : options.cacheMinimumBuildMilliseconds;
+    if (cacheKey && buildMilliseconds >= minimumBuildMilliseconds) {
+      // Fire-and-forget: the write never throws and the caller is not made to
+      // wait on bookkeeping. The promise is exposed for tests that must not
+      // race it.
+      index.cacheWritePromise =
+        storeCachedIndexPayload(cacheKey, serializeContainerIndex(index));
+    }
+    return index;
   }
 
   // WebM and MP4 are told apart by their first bytes, not by a file extension or
@@ -666,6 +1575,15 @@ class ContainerIndex {
     const magic = new Uint8Array(await reader.read(0, 3));
     return magic[0] === 0x1A && magic[1] === 0x45
       && magic[2] === 0xDF && magic[3] === 0xA3;   // EBML
+  }
+
+  // Ogg is likewise told apart by its first bytes, not an extension: every Ogg
+  // file (and every page in it) begins with the "OggS" capture pattern.
+  static async _isOgg(reader) {
+    if (reader.size < 4) return false;
+    const magic = new Uint8Array(await reader.read(0, 3));
+    return magic[0] === 0x4F && magic[1] === 0x67
+      && magic[2] === 0x67 && magic[3] === 0x53;   // "OggS"
   }
 
   // Largest display frame whose presentation time is <= t (binary search over
@@ -723,31 +1641,49 @@ class ContainerIndex {
     return (start + end) / 2;
   }
 
-  async _demuxIsobmff(reader) {
+  async _demuxIsobmff(reader, options = {}) {
     if (typeof MP4Box === 'undefined') throw new Error('mp4box.js is not loaded');
     const file = MP4Box.createFile(false);   // false: discard mdat bytes
     let info = null, demuxError = null;
     file.onReady = (i) => { info = i; };
     file.onError = (e) => { demuxError = new Error('mp4box: ' + e); };
 
-    // Feed the container until the moov (index) is parsed. appendBuffer returns
-    // the next byte offset it wants, which jumps past the mdat when the moov
-    // sits at the end of the file — so we never read frame bytes here.
-    const CHUNK = 1 << 18;   // 256 KB
+    // Phase 1 — feed the container until the moov (index) is parsed. appendBuffer
+    // returns the next byte offset it wants, which jumps past the mdat when the
+    // moov sits at the end of the file — so we never read frame bytes here. This
+    // is the whole cost for a classic single-`moov` MP4, and it stays exactly as
+    // cheap as before: a few range reads, no budget, no progress ticks, no yields.
+    const READY_CHUNK = 1 << 18;   // 256 KB
     let offset = 0;
     while (info === null && demuxError === null && offset < reader.size) {
-      const end = Math.min(offset + CHUNK, reader.size) - 1;
+      const end = Math.min(offset + READY_CHUNK, reader.size) - 1;
       const buffer = await reader.read(offset, end);
       if (!buffer.byteLength) break;
       buffer.fileStart = offset;
       offset = file.appendBuffer(buffer);
     }
-    file.flush();
     if (demuxError) throw demuxError;
-    if (!info) throw new Error('no moov found (not a valid MP4?)');
+    if (!info) { file.flush(); throw new Error('no moov found (not a valid MP4?)'); }
 
     const videoTrack = info.videoTracks && info.videoTracks[0];
-    if (!videoTrack) throw new Error('no video track in file');
+    if (!videoTrack) { file.flush(); throw new Error('no video track in file'); }
+
+    // Is this a fragmented MP4 (fMP4/CMAF)? Its samples live in `moof` boxes
+    // scattered the length of the file rather than in the `moov`, so at onReady
+    // the sample table is empty and the real work is still ahead. mp4box reports
+    // the presence of an `mvex` box as info.isFragmented; as a belt-and-braces
+    // check we also treat an empty video sample table with file still unread as
+    // fragmented (a classic file's table is already complete here, even a
+    // faststart one whose mdat we have not touched).
+    const readySampleCount = file.getTrackSamplesInfo(videoTrack.id).length;
+    const isFragmented = !!info.isFragmented || (readySampleCount === 0 && offset < reader.size);
+
+    if (isFragmented) {
+      await this._demuxFragmentedIsobmff(reader, file, videoTrack, options,
+        () => demuxError, offset);
+    }
+    file.flush();
+    if (demuxError) throw demuxError;
 
     this.decoderConfig = {
       codec: videoTrack.codec,
@@ -771,6 +1707,123 @@ class ContainerIndex {
     this._buildTables(file.getTrackSamplesInfo(videoTrack.id),
       this._editListWindow(videoTrack));
     this.containerFormat = 'isobmff';
+  }
+
+  // Phase 2 of the ISOBMFF open, for a fragmented file only: feed the whole file
+  // through mp4box so every `moof` box is parsed and the sample table is complete
+  // before _demuxIsobmff reads it. This is the expensive path a classic MP4 never
+  // touches, so it carries the same budget/progress/yield contract as the WebM and
+  // Ogg passes (see readMatroskaFrameTable). Still no frame bytes are decoded —
+  // createFile(false) discards mdat payloads and appendBuffer skips past them — so
+  // this reads the container's structure, not its pixels.
+  //
+  // getDemuxError() surfaces a late mp4box parse error from _demuxIsobmff's onError
+  // closure; startOffset is where phase 1 left the cursor (just past the moov).
+  async _demuxFragmentedIsobmff(reader, file, videoTrack, options, getDemuxError, startOffset) {
+    const maxBytes = (options.maxBytes === undefined) ? Infinity : options.maxBytes;
+    // Refuse an oversized file BEFORE the full-file pass, the same gate the
+    // Matroska and Ogg scans apply — reading all of it is exactly the cost.
+    if (reader.size > maxBytes) {
+      throw new IndexBudgetExceededError(
+        `fragmented MP4 is ${reader.size} bytes; indexing it means reading all of `
+        + `them, and the caller's limit is ${maxBytes}`);
+    }
+    const timeoutMilliseconds = (options.timeoutMilliseconds === undefined)
+      ? Infinity : options.timeoutMilliseconds;
+    if (!(timeoutMilliseconds > 0)) {
+      throw new IndexBudgetExceededError('no time allowed to index this fragmented MP4');
+    }
+
+    const onProgress = (typeof options.onProgress === 'function') ? options.onProgress : null;
+    const chunkBytes = options.chunkBytes || (1 << 20);   // 1 MB, like the Matroska pass
+
+    const startedAt = performance.now();
+    let lastYieldedAt = startedAt;
+
+    // The same report shape the Matroska/Ogg passes emit. framesFound is
+    // best-effort: the number of video samples mp4box has parsed from `moof` boxes
+    // so far (a cheap read of the track's growing sample array; 0 before any
+    // appear).
+    const report = (bytesRead) => {
+      if (!onProgress) return;
+      const elapsedMs = performance.now() - startedAt;
+      const fraction = reader.size ? Math.min(1, bytesRead / reader.size) : 1;
+      const etaMs = (fraction > 0 && fraction < 1) ? elapsedMs * (1 - fraction) / fraction : 0;
+      try {
+        onProgress({
+          bytesRead, totalBytes: reader.size, fraction, elapsedMs, etaMs,
+          framesFound: file.getTrackSamplesInfo(videoTrack.id).length,
+        });
+      } catch (progressError) {
+        // A throwing indicator is the host's bug, not ours; keep indexing.
+      }
+    };
+
+    // appendBuffer returns the next byte offset it wants (often skipping an mdat);
+    // follow it exactly as phase 1 does. If it fails to advance, step to the end of
+    // the chunk ourselves so a stubborn file cannot stall the pass.
+    let offset = startOffset;
+    while (getDemuxError() === null && offset < reader.size) {
+      const now = performance.now();
+      if (now - startedAt > timeoutMilliseconds) {
+        throw new IndexBudgetExceededError(
+          `indexing this fragmented MP4 did not finish within ${timeoutMilliseconds} ms `
+          + `(read ${offset} of ${reader.size} bytes)`);
+      }
+      // A chunk of progress: report it, then let the event loop breathe so a large
+      // local file cannot freeze the page (awaiting the read usually yields, but a
+      // fast disk can resolve quickly enough to starve rendering).
+      report(offset);
+      if (now - lastYieldedAt > 16) {
+        lastYieldedAt = now;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      const end = Math.min(offset + chunkBytes, reader.size) - 1;
+      const buffer = await reader.read(offset, end);
+      if (!buffer.byteLength) break;
+      buffer.fileStart = offset;
+      const next = file.appendBuffer(buffer);
+      offset = (next > offset) ? next : end + 1;
+    }
+    report(reader.size);   // a final 100% tick, so the host can settle the bar
+  }
+
+  // Ogg/Theora: the timestamps and nothing else (see readOggFrameTable), the same
+  // shape as the Matroska path. samples, keyframeDecodeIndices and decoderConfig
+  // stay null, so supportsWebCodecs reports false and the clip plays only through
+  // the native <video> element (Firefox).
+  async _demuxOgg(reader, options) {
+    const table = await readOggFrameTable(reader, options);
+    this.containerFormat = 'ogg';
+    this.videoWidth = table.videoWidth;
+    this.videoHeight = table.videoHeight;
+    // Ogg carries no display rotation matrix (and the <video> element applies
+    // none either, so the two agree).
+    this.rotation = 0;
+
+    // readOggFrameTable already returns times in presentation order with the first
+    // frame at t = 0 (Theora is constant-frame-duration, so there is no B-frame
+    // reordering to undo — unlike the Matroska path, which must sort). Build the
+    // display tables directly.
+    const times = table.presentationTimes;
+    const n = times.length;
+    this.presentationTimes = new Float64Array(n);
+    this.frameDurations = new Float64Array(n);
+    for (let d = 0; d < n; d++) this.presentationTimes[d] = times[d];
+    // A frame lasts until the next one starts; the last frame has no next one, so
+    // it falls back to the codec's constant frame duration (then, defensively, to
+    // the previous frame's, then to a nominal 30fps) — mirroring the Matroska path.
+    for (let d = 0; d < n - 1; d++) {
+      this.frameDurations[d] = this.presentationTimes[d + 1] - this.presentationTimes[d];
+    }
+    if (n) {
+      this.frameDurations[n - 1] = table.defaultFrameDuration
+        || (n > 1 ? this.frameDurations[n - 2] : 1 / 30);
+    }
+
+    this.numFrames = n;
+    this.duration = n
+      ? this.presentationTimes[n - 1] + this.frameDurations[n - 1] : 0;
   }
 
   // The composition-time window the container's edit list actually presents, in
@@ -919,6 +1972,7 @@ class ContainerIndex {
     // timeline whose origin is the first frame the viewer sees.
     const order = presented.slice().sort((a, b) => this.samples[a].cts - this.samples[b].cts);
     const p = order.length;
+    this.trimmedByEditList = p < n;
     const cts0 = p ? this.samples[order[0]].cts : 0;
     this.presentationTimes = new Float64Array(p);
     this.frameDurations = new Float64Array(p);
@@ -1675,128 +2729,6 @@ class VideoEngine extends EventTarget {
 }
 
 // ==================================================================
-// frame-rate-check — verify a declared constant frame rate against the video's
-// real frame timestamps, so a clip we could not index never SILENTLY plays with
-// guessed frame numbers.
-//
-// When a container cannot be indexed (not MP4/MOV, not WebM/MKV — Ogg, HLS, and
-// anything else), the native <video> engine has no per-frame timestamp table and
-// falls back to mapping frames as `mediaTime * declaredFrameRate`. That mapping
-// is exact only if the clip really is constant-frame-rate at exactly that rate,
-// and nothing so far checked whether it is. This module is that check.
-//
-// The tool is `requestVideoFrameCallback`, whose `mediaTime` is the EXACT
-// presentation timestamp of the frame on screen. Seeking a paused element to a
-// chosen time and reading the landed mediaTime lets us sample the real timestamp
-// lattice on our own timeline (seek latency is bounded by group-of-pictures
-// length, not clip duration — so this costs the same on a 10-second or a 2-hour
-// clip), and a truly constant-frame-rate clip has every frame k at time
-// anchor + k/rate. Two failure modes matter and the probe plan below targets
-// both:
-//
-//   * a WRONG or DRIFTING rate (e.g. 30 declared for a 29.97 clip, or a variable
-//     clip that skips a frame): any dropped or extra frame shifts every LATER
-//     frame by a whole slot permanently, so the residual grows toward the end of
-//     the clip. Sampling spread across the clip — and decisively at the last
-//     slot — catches an integer frame-count mismatch a near-the-start sample
-//     would miss.
-//   * a HIGHER true rate (60 declared as 30, telecine): every declared grid
-//     point still sits on a real frame, so the intruders hide exactly BETWEEN
-//     the points a single midpoint probe would check. Sampling two points INSIDE
-//     one predicted frame's interval and requiring both to resolve to the same
-//     frame flushes them out.
-//
-// This is falsification, not proof: passing every probe cannot prove constant
-// frame rate (a pathological rate hiding entirely between the sample points
-// survives — only decoding every frame proves it), but it disproves the
-// realistic wrong-rate, dropped-frame, and doubled-rate cases. The engine treats
-// a pass as "not disproven, proceed" and never upgrades frameIndexIsExact on the
-// strength of it.
-// ==================================================================
-
-// The tolerance, in seconds, within which a presented timestamp must sit on the
-// declared-rate grid to count as on it. A quarter of a frame: tight enough that a
-// whole-frame mislabel (the thing we are guarding against) always exceeds it,
-// loose enough to absorb the container's sub-millisecond timestamp rounding.
-function declaredRateTolerance(rate) {
-  return 0.25 / rate;
-}
-
-// How many frames a clip of this many seconds holds at this rate — the frame
-// count the declared-rate mapping implies, used to place the spread probe points
-// (and, at the last slot, to catch a clip that holds fewer frames than its
-// duration-times-rate would suggest).
-function predictedFrameCount(durationSeconds, rate) {
-  if (!(rate > 0) || !(durationSeconds > 0)) return 1;
-  return Math.max(1, Math.round(durationSeconds * rate));
-}
-
-// The seek plan: where to seek (in seconds from the first frame's timestamp) and
-// which frame a constant-rate clip must present there. Each step is
-// { frameUnits, seekOffsetSeconds, expectedFrameIndex, expectedTimeSeconds };
-// the engine seeks to anchor + seekOffsetSeconds, reads the landed mediaTime, and
-// requires |landed - anchor - expectedTimeSeconds| <= declaredRateTolerance.
-//
-// `frameUnits` is the seek position measured in declared-frame widths; the
-// expected frame is floor(frameUnits), so two sub-frame points in the same
-// interval (0.33 and 0.66) share an expected frame and disagree only if a hidden
-// higher-rate boundary splits them.
-function buildDeclaredRateProbePlan(rate, predictedFrames) {
-  if (!(rate > 0)) return [];
-  const frameDuration = 1 / rate;
-  const lastFrame = Math.max(0, (predictedFrames | 0) - 1);
-  const points = new Set();
-
-  // Inside the first frame: catches a doubled/telecined rate whose extra frame
-  // boundary falls between these two points (a single midpoint would miss it).
-  points.add(0.33);
-  points.add(0.66);
-
-  // Consecutive early frames pin the base interval spacing precisely.
-  points.add(1.5);
-  points.add(2.5);
-  points.add(3.5);
-
-  // Spread across the clip. A single dropped or extra frame shifts every later
-  // frame by one whole slot permanently, so the residual GROWS toward the end;
-  // sampling at 1/4, 1/2, 3/4 (each as a .33/.66 pair, to also catch a rate that
-  // changes partway) and decisively at the last slot catches any integer
-  // frame-count mismatch.
-  for (const fraction of [0.25, 0.5, 0.75]) {
-    const anchorFrame = Math.round(fraction * lastFrame);
-    points.add(anchorFrame + 0.33);
-    points.add(anchorFrame + 0.66);
-  }
-  points.add(lastFrame + 0.5);
-
-  return Array.from(points)
-    .filter((frameUnits) => frameUnits >= 0 && Math.floor(frameUnits) <= lastFrame)
-    .sort((a, b) => a - b)
-    .map((frameUnits) => ({
-      frameUnits,
-      seekOffsetSeconds: frameUnits * frameDuration,
-      expectedFrameIndex: Math.floor(frameUnits),
-      expectedTimeSeconds: Math.floor(frameUnits) * frameDuration,
-    }));
-}
-
-// Does a landed timestamp (measured from the first frame's timestamp) sit within
-// tolerance of where a constant-rate clip would present the expected frame?
-function probeStepPasses(observedTimeFromAnchor, expectedTimeSeconds, rate) {
-  return Math.abs(observedTimeFromAnchor - expectedTimeSeconds) <= declaredRateTolerance(rate);
-}
-
-// The runtime check, for a frame presented during ordinary playback: snap the
-// timestamp to the nearest declared-rate slot and report whether it landed on it.
-// A clip that is constant-rate at the declared rate keeps every presented frame
-// on a slot; sustained misses mean the mapping is wrong.
-function isPresentedTimeOnGrid(observedTimeFromAnchor, rate) {
-  const frameIndex = Math.round(observedTimeFromAnchor * rate);
-  if (frameIndex < 0) return { onGrid: false, frameIndex, residual: Infinity };
-  const residual = Math.abs(observedTimeFromAnchor - frameIndex / rate);
-  return { onGrid: residual <= declaredRateTolerance(rate), frameIndex, residual };
-}
-// ==================================================================
 // NativeVideoEngine — a <video> element behind the same surface as VideoEngine.
 //
 // Observational, not authoritative: the browser decides which frame is on
@@ -1817,14 +2749,14 @@ function isPresentedTimeOnGrid(observedTimeFromAnchor, rate) {
 //    stall it pins the overlay to the visible frame, so motion degrades to
 //    whole-frame steps but stays in sync with the equally stuttering video.
 //
-// 2. The container index, when we have one. `mediaTime` is an exact timestamp,
+// 2. The container index, which is mandatory. `mediaTime` is an exact timestamp,
 //    but turning a timestamp into a frame *index* needs the table of every
 //    frame's PTS, which a <video> element never exposes. Given a ContainerIndex
 //    we binary-search it and the index is exact on variable-frame-rate clips —
-//    MP4 and WebM alike, which is the whole reason both are indexed. Without one
-//    (a container we cannot read at all, or a WebM whose indexing pass ran out
-//    of time) we fall back to `mediaTime * framesPerSecond`, which is exact only
-//    if the clip really is constant-frame-rate.
+//    MP4 and WebM alike, which is the whole reason both are indexed. This engine
+//    has no inexact mode to fall back to: load() requires both an index (built
+//    here if the caller did not supply one) and the presented-frame clock, and
+//    refuses the clip otherwise rather than report guessed frame numbers.
 // ==================================================================
 class NativeVideoEngine extends EventTarget {
   constructor(videoElement) {
@@ -1832,8 +2764,12 @@ class NativeVideoEngine extends EventTarget {
     this.video = videoElement;
     this.ready = false;
     this.numFrames = 0;
-    this.framesPerSecond = 30;     // only used when there is no container index
     this.rotation = 0;
+    // Latched true if the runtime watcher later catches the index disagreeing
+    // with the frames the element presents during playback (see
+    // _checkPresentedFrame). Mirrors VideoEngine.failed: the API stays functional
+    // but frameIndexIsExact goes false and a fatal errormessage fires.
+    this.failed = false;
 
     this._index = null;
     // Seconds to add to a container-index time to get a time on the element's
@@ -1842,28 +2778,14 @@ class NativeVideoEngine extends EventTarget {
     this._timeOffset = 0;
     this._indexStrikes = 0;        // consecutive presented frames that missed the table
 
-    // Declared-frame-rate verification (only when there is no index and a rate
-    // was supplied — see load()'s verifyDeclaredRate). The anchor is the first
-    // frame's real timestamp, against which the k/rate grid is measured; strikes
-    // count consecutive presented frames that miss it during playback; _probing
-    // suppresses the runtime watcher while the load-time seek-probe drives its own
-    // seeks; _frameMappingInexact latches once playback disproves the rate.
-    this._verifyDeclaredRateEnabled = false;
-    this._declaredAnchor = null;
-    this._declaredStrikes = 0;
-    this._probing = false;
-    this._probeResolver = null;
-    this._frameMappingInexact = false;
-
     this._loop = true;
     this._rate = 1;                // reapplied after each load (src reset clears it)
     this._objectUrl = null;
 
     // The presented-frame clock: the exact PTS of the frame currently on screen
     // and the wall-clock moment it was presented. Both stay null/0 until the
-    // first frame presents, and forever where requestVideoFrameCallback is
-    // unsupported (pre-15.4 Safari), in which case mapping falls back to raw
-    // currentTime.
+    // first frame presents. requestVideoFrameCallback is required (load() refuses
+    // without it), so unlike VideoEngine there is no clockless mode here.
     this._presentedMediaTime = null;
     this._presentedAt = 0;
     this._presentWaiters = [];
@@ -1871,6 +2793,12 @@ class NativeVideoEngine extends EventTarget {
     videoElement.muted = true;
     videoElement.playsInline = true;   // iOS: play inline, no auto-fullscreen
     videoElement.addEventListener('dblclick', (e) => e.preventDefault());
+
+    // Reset the runtime index-vs-reality strike counter the instant a seek
+    // begins: post-seek presented frames are not evidence against the table (see
+    // _checkPresentedFrame). Registered once on the element so it cannot pile up
+    // across load()s.
+    videoElement.addEventListener('seeking', () => { this._indexStrikes = 0; });
 
     this.hasPresentedFrameClock = 'requestVideoFrameCallback' in videoElement;
     this._clockStopped = false;
@@ -1925,60 +2853,56 @@ class NativeVideoEngine extends EventTarget {
     this.video.currentTime = clamped + this._timeOffset;
   }
 
-  // What this engine got, for dev labels and host-side diagnostics.
+  // What this engine got, for dev labels and host-side diagnostics. Always the
+  // exact pairing now — the only native tier that exists.
   get tier() {
-    const index = this._index ? 'container index' : 'declared frame rate';
-    const clock = this.hasPresentedFrameClock ? 'presented clock' : 'currentTime clock';
-    return `native (${index}, ${clock})`;
+    return 'native (container index, presented clock)';
   }
-  // Same contract as VideoEngine.codecString. Null when no index is available
-  // or the index carries no decoder configuration (WebM's does not).
+  // Same contract as VideoEngine.codecString. Null when the index carries no
+  // decoder configuration (WebM's does not).
   get codecString() {
     return (this._index && this._index.decoderConfig)
       ? this._index.decoderConfig.codec : null;
   }
-  // True only when frame indices come from the container's real timestamps.
-  // With a declared frame rate they are exact for constant-frame-rate clips and
-  // approximate otherwise, and a host that must not mislabel a frame (an
-  // annotation tool, say) should check this and say so. Never promoted on the
-  // strength of the declared-rate probe: sampling can disprove constant frame
-  // rate but cannot prove it (see frame-rate-check.js), so the honest answer for
-  // a declared-rate clip stays false.
-  get frameIndexIsExact() { return this._index !== null; }
+  // Informational only, never a mapping input: the clip's average frame rate,
+  // derived from the index (numFrames / duration). A host may show it; frame
+  // indices come from the index's real per-frame timestamps, not from this.
+  // Zero when the index is unavailable or reports no duration.
+  get framesPerSecond() {
+    if (!this._index || !this._index.duration) return 0;
+    return this._index.numFrames / this._index.duration;
+  }
 
-  // True once a declared-frame-rate clip is caught mid-playback presenting frames
-  // that no longer sit on the declared grid — i.e. the rate the host supplied is
-  // wrong and the frame numbers this engine reports are unreliable. Stays false
-  // for indexed clips (their numbers come from real timestamps) and for a
-  // declared-rate clip whose timestamps have so far stayed on the grid. A host
-  // can poll this or listen for the fatal 'errormessage' (detail.inexact) it is
-  // set alongside.
-  get frameMappingInexact() { return this._frameMappingInexact; }
+  // Average frame duration in seconds, for slack/tolerance computations that need
+  // a per-frame scale. Derived straight from the index and guarded against a zero
+  // frame count so tolerances never blow up to Infinity.
+  _averageFrameDuration() {
+    if (!this._index || !this._index.numFrames) return 0;
+    return this._index.duration / this._index.numFrames;
+  }
+
+  // The permanent invariant guard. True for every engine createBestEngine hands
+  // back — it never returns an unindexed native engine. Goes false only if the
+  // runtime watcher later catches the index disagreeing with the frames the
+  // element actually presents during playback (see _checkPresentedFrame), which
+  // also latches `failed` and fires a fatal errormessage.
+  get frameIndexIsExact() { return this._index !== null && !this.failed; }
 
   frameAtTime(t) {
-    if (this._index) return this._index.frameAtTime(t);
-    const n = Math.floor(t * this.framesPerSecond);
-    return Math.max(0, Math.min(Math.max(0, this.numFrames - 1), n));
+    return this._index.frameAtTime(t);
   }
 
   // Frame index + fraction, for a time on the *element's* timeline.
   _frameFloatAtVideoTime(videoSeconds) {
-    if (this._index) {
-      return this._index.frameFloatAtTime(videoSeconds - this._timeOffset);
-    }
-    return videoSeconds * this.framesPerSecond;
+    return this._index.frameFloatAtTime(videoSeconds - this._timeOffset);
   }
 
   // The frame on screen, from its own presentation timestamp. Null until one has
-  // been presented (or forever, without requestVideoFrameCallback). Integer and
-  // exact with a container index; with a declared frame rate it is a float,
-  // exact only if the clip really is constant-frame-rate.
+  // been presented. Integer and exact, read from the container index.
   _presentedFrame() {
     if (this._presentedMediaTime === null) return null;
     const t = this._presentedMediaTime - this._timeOffset;
-    return this._index
-      ? this._index.frameOfPresentedTime(t)
-      : t * this.framesPerSecond;
+    return this._index.frameOfPresentedTime(t);
   }
 
   get currentFrameFloat() {
@@ -2011,11 +2935,8 @@ class NativeVideoEngine extends EventTarget {
     n = Math.max(0, Math.min(Math.max(0, this.numFrames - 1), n | 0));
     // Seek to the midpoint of the frame's display interval, not its start: the
     // start sits exactly on the boundary the browser rounds at, so aiming there
-    // can land on frame n-1. With an index the interval is the frame's real
-    // one; without, it is the constant-frame-rate approximation.
-    const midpoint = this._index
-      ? this._index.midpointOfFrame(n) + this._timeOffset
-      : (n + 0.5) / this.framesPerSecond;
+    // can land on frame n-1. The interval is the frame's real one, from the index.
+    const midpoint = this._index.midpointOfFrame(n) + this._timeOffset;
     this.video.currentTime = midpoint;
   }
 
@@ -2032,85 +2953,77 @@ class NativeVideoEngine extends EventTarget {
     }
   }
 
-  // Set the frame rate to map frames with when there is no container index
-  // (a host that knows the clip's rate from elsewhere — a sidecar pose file,
-  // say). Ignored when an index is present, which is strictly better.
-  setFrameRate(framesPerSecond, numFrames) {
-    if (this._index) return;
-    this.framesPerSecond = framesPerSecond || 30;
-    this.numFrames = numFrames
-      || Math.round((this.video.duration || 0) * this.framesPerSecond);
-  }
-
-  // options.index: a ContainerIndex for this source. options.frameRate /
-  // options.numFrames: the declared fallback mapping, used only when no index
-  // is available.
+  // options.index: a ContainerIndex already built for this source (createBestEngine
+  // builds one up front and hands the same one to whichever engine plays, so the
+  // container is never parsed twice). Omit it and the engine builds its own. The
+  // index is mandatory: this engine has no inexact mode without it. The import of
+  // ContainerIndex is safe because the shipped bundle orders container-index
+  // before this file (mirroring VideoEngine.load).
   async load(source, options = {}) {
     this._teardown();
     this._startPresentedFrameClock();   // in case a previous destroy() stopped it
+    // Enforce item 1b's invariant at the engine level too, since a host can
+    // construct a NativeVideoEngine directly rather than through createBestEngine.
+    // Without requestVideoFrameCallback there is no exact presented-frame clock to
+    // tell us which frame is on screen, and this engine no longer has any inexact
+    // mapping to fall back to — so refuse rather than play inexactly.
+    if (!this.hasPresentedFrameClock) {
+      throw new Error('NativeVideoEngine: this browser lacks requestVideoFrameCallback, '
+        + 'so there is no exact presented-frame clock and no inexact mode to fall back '
+        + 'to. Use a current browser (Safari 15.4+, Firefox 132+, or any recent '
+        + 'Chromium).');
+    }
     try {
-      this._index = options.index || null;
-      if (this._index) {
-        this.numFrames = this._index.numFrames;
-        this.rotation = this._index.rotation;
-        // An average rate, so that a host reading framesPerSecond gets a sane
-        // number and so the declared mapping is usable if the index is later
-        // rejected as inconsistent (see _checkPresentedFrame).
-        this.framesPerSecond = this._index.duration
-          ? this._index.numFrames / this._index.duration : 30;
-      } else {
-        this.framesPerSecond = options.frameRate || 30;
-        this.numFrames = options.numFrames || 0;
-        this.rotation = 0;
+      this._index = options.index || await ContainerIndex.fromSource(source);
+      this.numFrames = this._index.numFrames;
+      this.rotation = this._index.rotation;
+
+      // Gecko does not honor a trimming edit list: it presents the untrimmed
+      // frames while reporting the trimmed duration, so the element shows frame
+      // k where the table (and every other browser) shows frame k + trim. That
+      // is a whole-frame shift, which no residual or duration check can see —
+      // the shifted timestamps still land exactly on table entries — so it must
+      // be refused up front, the same way the WebKit reachability guard below
+      // refuses that browser's inconsistent trimmed timeline. The WebCodecs path
+      // decodes the trim itself and plays it frame-exact on Firefox, so the auto
+      // ladder still plays these clips there; only the native fallback refuses.
+      if (this._index.trimmedByEditList && detectBrowserEngine() === 'gecko') {
+        throw new Error('NativeVideoEngine: this browser (Gecko) presents a clip '
+          + 'with a trimming edit list untrimmed, shifting every frame relative to '
+          + 'the container\'s presentation window, so exact frame numbers are '
+          + 'impossible on the native path. The clip is refused here rather than '
+          + 'mislabeled; the WebCodecs path plays the trim frame-exact.');
       }
 
       await this._loadElement(source);
 
-      if (this._index && !this._indexDescribesElement()) this._index = null;
-
-      if (this._index) {
-        await this._calibrateTimeOffset();
-        // The calibrated offset can push the table past the range the element
-        // will actually seek to. WebKit runs currentTime on the MEDIA timeline
-        // for a trimming edit list (so the offset it calibrates is the trim) but
-        // reports the shorter EDITED duration, which leaves the late frames
-        // unreachable — a seek to them clamps. Trusting the index then would hand
-        // back exact frame numbers for frames the element can never show. Drop to
-        // the declared rate, which is honestly approximate rather than confidently
-        // wrong. (Chromium keeps currentTime and duration on the same timeline, so
-        // this never fires there and its trimmed clips stay frame-exact.)
-        if (this._index && !this._calibratedTimelineReachable()) {
-          console.warn('NativeVideoEngine: the calibrated container timeline runs '
-            + 'past what this element will seek to (an edit-list clip whose '
-            + 'currentTime and duration disagree, seen on WebKit). Falling back to '
-            + 'the declared frame rate rather than report frame numbers the element '
-            + 'cannot reach.');
-          this._index = null;
-          this._timeOffset = 0;
-        }
+      // The container's frame table must describe the same content the element
+      // presents; a trimming edit list makes it describe frames the element never
+      // shows, which would shift every reported index. Refuse if so — but only
+      // after the element's duration has settled (see the race handling inside).
+      if (!(await this._indexDescribesElement())) {
+        throw new Error('NativeVideoEngine: the container\'s frame table does not '
+          + 'describe what this element presents — the element\'s duration is '
+          + 'shorter, the signature of a trimming edit list that cuts frames the '
+          + 'decoder still needs but never shows. Reporting frame numbers from the '
+          + 'table would shift every index, so the clip is refused rather than '
+          + 'played with wrong frame numbers.');
       }
-      if (!this._index) {
-        if (options.frameRate) this.framesPerSecond = options.frameRate;
-        this.numFrames = options.numFrames
-          || Math.round(this.duration * this.framesPerSecond);
-        // No container index means frames are mapped from the declared rate,
-        // which is exact only if the clip really is constant-frame-rate at that
-        // rate. Verify it against the real presented timestamps before handing
-        // back an engine that would otherwise report guessed frame numbers
-        // silently: a disproven rate throws out of load() (createBestEngine turns
-        // that into a clear bail), and a rate that survives the probe is then
-        // policed for the rest of playback by _checkDeclaredRate.
-        //
-        // Gate on options.frameRate, not framesPerSecond: the probe verifies a
-        // rate the HOST asserted. An index dropped mid-load (a trimming edit list
-        // the element mis-times, a WebM whose scan fell short) leaves framesPerSecond
-        // set to the index's own average, but the host never claimed that as a
-        // constant rate — so there is nothing of theirs to verify or bail on, and
-        // the pre-existing honest-approximate fallback stands.
-        if (options.verifyDeclaredRate && options.frameRate > 0) {
-          await this._verifyDeclaredFrameRate();
-          this._verifyDeclaredRateEnabled = true;
-        }
+
+      await this._calibrateTimeOffset();
+      // WebKit runs currentTime on the MEDIA timeline for a trimming edit list (so
+      // the calibrated offset is the trim) but reports the shorter EDITED duration,
+      // which leaves the late frames past the end and unreachable — a seek to them
+      // clamps. Trusting the index then would report exact frame numbers for frames
+      // the element can never show, so refuse rather than be confidently wrong.
+      // (Chromium keeps currentTime and duration on the same timeline, so this
+      // never fires there and its trimmed clips play fine.)
+      if (!this._calibratedTimelineReachable()) {
+        throw new Error('NativeVideoEngine: the calibrated container timeline runs '
+          + 'past what this element will seek to (an edit-list clip whose currentTime '
+          + 'and duration disagree, seen on WebKit), so its late frames are '
+          + 'unreachable. The clip is refused rather than played with frame numbers '
+          + 'the element cannot reach.');
       }
 
       this.ready = true;
@@ -2161,17 +3074,58 @@ class NativeVideoEngine extends EventTarget {
   // presented duration equal to the table's. A trimming one makes the element's
   // duration shorter by everything it cut, which is at least a GOP. Anything
   // beyond a couple of frames of container rounding, we do not trust the table.
-  _indexDescribesElement() {
-    const elementDuration = this.video.duration;
-    if (!isFinite(elementDuration) || elementDuration <= 0) return true;
-    const slack = 2 / this.framesPerSecond;
-    if (Math.abs(this._index.duration - elementDuration) <= slack) return true;
+  //
+  // Async, and it rides out a known Chromium race before believing a
+  // disagreement: right after 'loadeddata', video.duration for an edit-list clip
+  // is transiently the (shorter) MEDIA duration and only later updates to the
+  // longer edit-list-extended value (see the long note in
+  // test/frame-index-test.mjs around MAX_ATTEMPTS). Under the old design this
+  // race caused an occasional silent drop to the declared rate; now that a
+  // disagreement is fatal, believing the transient would instead spuriously
+  // REFUSE a perfectly good clip, which is unacceptable. So on an initial
+  // disagreement we wait for the element's duration to settle and re-check,
+  // throwing only if it still disagrees.
+  async _indexDescribesElement() {
+    const agrees = () => {
+      const elementDuration = this.video.duration;
+      if (!isFinite(elementDuration) || elementDuration <= 0) return true;
+      const slack = 2 * this._averageFrameDuration();
+      return Math.abs(this._index.duration - elementDuration) <= slack;
+    };
+    if (agrees()) return true;
+    await this._waitForDurationToSettle(700);
+    if (agrees()) return true;
     console.warn('NativeVideoEngine: the container\'s frame table spans '
-      + `${this._index.duration.toFixed(3)}s but the element will present `
-      + `${elementDuration.toFixed(3)}s, so the table describes frames the `
-      + 'element never shows (a trimming edit list?). Falling back to the '
-      + 'declared frame rate rather than report shifted frame numbers.');
+      + `${this._index.duration.toFixed(3)}s but the element presents `
+      + `${(this.video.duration || 0).toFixed(3)}s even after its duration `
+      + 'settled, so the table describes frames the element never shows (a '
+      + 'trimming edit list?).');
     return false;
+  }
+
+  // Wait until the element's reported duration stops changing, up to a timeout.
+  // Resolves on the first 'durationchange' after now, or when a short poll sees
+  // the value change, or on timeout — whichever comes first. Used only to ride
+  // out the Chromium edit-list duration race above before judging agreement.
+  _waitForDurationToSettle(timeoutMilliseconds) {
+    return new Promise((resolve) => {
+      const startDuration = this.video.duration;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        this.video.removeEventListener('durationchange', onChange);
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolve();
+      };
+      const onChange = () => finish();
+      const poll = setInterval(() => {
+        if (this.video.duration !== startDuration) finish();
+      }, 50);
+      const timer = setTimeout(finish, timeoutMilliseconds);
+      this.video.addEventListener('durationchange', onChange);
+    });
   }
 
   // Does the calibrated timeline stay within the range the element will seek to?
@@ -2190,165 +3144,8 @@ class NativeVideoEngine extends EventTarget {
     const n = this._index.numFrames;
     if (!n) return true;
     const lastFrameStart = this._index.presentationTimes[n - 1];
-    const slack = 1.5 / this.framesPerSecond;
+    const slack = 1.5 * this._averageFrameDuration();
     return this._timeOffset + lastFrameStart <= elementDuration + slack;
-  }
-
-  // Whether the element can be seeked at all. A live stream or a container the
-  // browser cannot random-access cannot be probed; seekable stays empty until the
-  // element knows, so an empty range means "cannot verify", not "seekable to 0".
-  _elementIsSeekable() {
-    const ranges = this.video.seekable;
-    if (!ranges || ranges.length === 0) return false;
-    try { return ranges.end(ranges.length - 1) > ranges.start(0); }
-    catch (e) { return false; }
-  }
-
-  // Try to disprove a declared constant frame rate against the clip's real frame
-  // timestamps, on our own timeline (paused seeks, no playthrough — seek latency
-  // is bounded by group-of-pictures length, not clip duration). Seeks to the
-  // points frame-rate-check plans and requires each landed timestamp to sit on the
-  // k/rate grid; a single miss beyond tolerance means the rate is wrong or the
-  // clip is variable, and we throw rather than hand back guessed frame numbers.
-  //
-  // Returns without throwing where we simply cannot check — no presented-frame
-  // clock, an unseekable source, or no frame to anchor on — because the host
-  // explicitly accepted declared-rate mapping by supplying a rate; we add a safety
-  // net where one is possible and never make that opted-into case worse.
-  async _verifyDeclaredFrameRate() {
-    if (!this.hasPresentedFrameClock) {
-      console.warn('NativeVideoEngine: cannot verify the declared frame rate — this '
-        + 'browser has no requestVideoFrameCallback, so there are no frame timestamps '
-        + 'to check. Frame numbers are exact only if the clip is constant-frame-rate.');
-      return;
-    }
-    if (!this._elementIsSeekable()) {
-      console.warn('NativeVideoEngine: cannot verify the declared frame rate — the '
-        + 'source is not seekable. Frame numbers are exact only if the clip is '
-        + 'constant-frame-rate.');
-      return;
-    }
-    const anchor = await this._nextPresentedMediaTime(2000);
-    if (anchor === null) {
-      console.warn('NativeVideoEngine: cannot verify the declared frame rate — no frame '
-        + 'was presented to anchor on. Frame numbers are exact only if the clip is '
-        + 'constant-frame-rate.');
-      return;
-    }
-    this._declaredAnchor = anchor;
-
-    const rate = this.framesPerSecond;
-    const duration = this.video.duration;
-    const frames = predictedFrameCount(
-      (isFinite(duration) && duration > 0) ? duration : (this.numFrames / rate) || 1, rate);
-    const plan = buildDeclaredRateProbePlan(rate, frames);
-    const tolerance = declaredRateTolerance(rate);
-
-    this._probing = true;
-    let disproof = null;
-    try {
-      // Calibrate the signal before trusting it. Seek to a point safely inside
-      // frame 0 (0.4 of a frame in — still frame 0 for any true rate up to ~2.5x
-      // the declared one) and check the reported timestamp is frame 0's, i.e. the
-      // anchor. A browser that reports a seeked frame's real presentation timestamp
-      // (Chromium, WebKit) returns the anchor; Firefox instead ECHOES the time we
-      // seeked to, which would make every probe look like a disproof. When the
-      // timestamps are unreadable this way we cannot verify — so proceed with the
-      // declared rate honestly rather than bail on a signal known to be unreliable
-      // (the same clock imprecision that makes Firefox drop the container index).
-      const calibrated = await this._seekAndReadPresentedTime(anchor + 0.4 / rate);
-      if (calibrated === null || Math.abs(calibrated - anchor) > tolerance) {
-        console.warn('NativeVideoEngine: cannot verify the declared frame rate — this '
-          + "browser's requestVideoFrameCallback does not report a seeked frame's "
-          + 'presentation timestamp (it echoes the seek target), so the real frame '
-          + 'timestamps are unreadable. Frame numbers are exact only if the clip is '
-          + 'constant-frame-rate.');
-        this._declaredAnchor = null;   // the same clock drives the runtime watcher; leave it off too
-        return;
-      }
-      for (const step of plan) {
-        const landed = await this._seekAndReadPresentedTime(anchor + step.seekOffsetSeconds);
-        if (landed === null) continue;   // inconclusive seek; do not hold it against the rate
-        const residual = Math.abs((landed - anchor) - step.expectedTimeSeconds);
-        if (residual > tolerance) { disproof = { step, landed, residual }; break; }
-      }
-    } finally {
-      this._probing = false;
-      // Leave the element on its first frame so the host starts from a clean state.
-      try { this.video.currentTime = anchor; } catch (e) { /* seek back not available */ }
-    }
-
-    if (disproof) {
-      const { step, landed, residual } = disproof;
-      this._frameMappingInexact = true;
-      throw new Error(
-        `declared frame rate ${rate} fps is inconsistent with this video's real frame `
-        + `timestamps: seeking to ${(anchor + step.seekOffsetSeconds).toFixed(4)}s presented a `
-        + `frame at ${landed.toFixed(4)}s, but a ${rate} fps clip would present frame `
-        + `${step.expectedFrameIndex} at ${(anchor + step.expectedTimeSeconds).toFixed(4)}s `
-        + `(off by ${(residual * 1000).toFixed(1)} ms). The clip is variable-frame-rate or the `
-        + 'declared rate is wrong, so frame numbers cannot be trusted. Pass '
-        + 'allowApproximate: true to play it anyway without frame accuracy.');
-    }
-  }
-
-  // Seek the paused element to a time and resolve with the timestamp of the frame
-  // that ends up on screen — or null if the seek could not be read. Registers the
-  // one-shot resolver BEFORE moving the playhead so it cannot miss the repaint,
-  // and treats "seek settled but no new frame painted within a grace window" (the
-  // same frame still covers the target — exactly what two probes inside one frame
-  // should see) as the frame already on screen rather than a failure.
-  _seekAndReadPresentedTime(target, timeoutMs = 3000, graceMs = 150) {
-    const before = this._presentedMediaTime;
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (value) => {
-        if (settled) return;
-        settled = true;
-        this._probeResolver = null;
-        this.video.removeEventListener('seeked', onSeeked);
-        clearTimeout(overall);
-        resolve(value);
-      };
-      // A repaint after the seek resolves with the new frame's timestamp.
-      this._probeResolver = (mediaTime) => finish(mediaTime);
-      // The seek completing with no repaint within a short grace means the same
-      // frame still covers the target; report the frame already on screen.
-      const onSeeked = () => setTimeout(() => finish(before), graceMs);
-      this.video.addEventListener('seeked', onSeeked);
-      // A seek that never settles (an unseekable region) is inconclusive.
-      const overall = setTimeout(() => finish(null), timeoutMs);
-      try { this.video.currentTime = target; }
-      catch (e) { finish(null); }
-    });
-  }
-
-  // The declared-rate sibling of _checkPresentedFrame: for a clip mapped from a
-  // declared rate, each presented frame's timestamp must sit on the k/rate grid.
-  // Sustained misses mean the rate is wrong — the clip changed rate partway, or
-  // the load-time probe's samples happened to miss the irregularity — so latch the
-  // inexact flag and emit a fatal errormessage the host can bail on. Suppressed
-  // while the load-time probe is driving its own seeks.
-  _checkDeclaredRate() {
-    if (this._index || this._probing || !this._verifyDeclaredRateEnabled) return;
-    if (this._frameMappingInexact) return;   // already reported
-    if (this._declaredAnchor === null || this._presentedMediaTime === null) return;
-    const rate = this.framesPerSecond;
-    const { onGrid, residual } = isPresentedTimeOnGrid(
-      this._presentedMediaTime - this._declaredAnchor, rate);
-    if (onGrid) { this._declaredStrikes = 0; return; }
-    if (++this._declaredStrikes < 5) return;   // tolerate a transient straggler
-    this._frameMappingInexact = true;
-    console.warn('NativeVideoEngine: presented frames no longer sit on the declared '
-      + `${rate} fps grid (off by ${(residual * 1000).toFixed(1)} ms); the clip is not `
-      + 'constant-frame-rate at that rate, so frame numbers are unreliable.');
-    this.dispatchEvent(new CustomEvent('errormessage', { detail: {
-      message: 'This video is not constant-frame-rate at the declared rate; '
-        + 'frame numbers are unreliable.',
-      fatal: true,
-      inexact: true,
-      declaredFrameRate: rate,
-    } }));
   }
 
   // Find the constant offset between the container index's timeline and the
@@ -2365,12 +3162,15 @@ class NativeVideoEngine extends EventTarget {
   async _calibrateTimeOffset() {
     const mediaTime = await this._nextPresentedMediaTime(2000);
     if (mediaTime === null) {
-      // No presented frame to anchor on (no requestVideoFrameCallback, or it
-      // never fired). The timelines coincide for ordinary clips, so assume they
-      // do — but say so, because an edit list would now silently shift every
-      // frame number.
-      console.warn('NativeVideoEngine: no presented frame to calibrate the '
-        + 'container timeline against; assuming it matches the element\'s.');
+      // The presented-frame clock exists (load() refuses without it) but no frame
+      // presented within the timeout — a transient, not a missing feature: an
+      // autoplay-blocked or not-yet-painting element. The timelines coincide for
+      // ordinary clips, so assume a zero offset, but say so, because an edit list
+      // would then silently shift every frame number.
+      console.warn('NativeVideoEngine: no presented frame within the calibration '
+        + 'timeout; assuming the container timeline matches the element\'s. If this '
+        + 'clip carries an edit list, frame numbers may be shifted until a frame '
+        + 'presents.');
       this._timeOffset = 0;
       return;
     }
@@ -2399,15 +3199,7 @@ class NativeVideoEngine extends EventTarget {
     this._presentedMediaTime = metadata.mediaTime;
     this._presentedAt = now;
 
-    // The load-time seek-probe, if one is waiting, takes this frame first.
-    if (this._probeResolver) {
-      const resolveProbe = this._probeResolver;
-      this._probeResolver = null;
-      resolveProbe(metadata.mediaTime);
-    }
-
     this._checkPresentedFrame();
-    this._checkDeclaredRate();
 
     const waiters = this._presentWaiters;
     this._presentWaiters = [];
@@ -2417,25 +3209,44 @@ class NativeVideoEngine extends EventTarget {
   }
 
   // A presented frame's mediaTime IS some frame's exact PTS, so once calibrated
-  // it must land essentially on an entry of our table. Persistent misses mean
-  // the table does not describe what the element is actually playing (a
-  // different track, or a container we mis-parsed), and indexing from it would
-  // report confidently wrong frame numbers — worse than admitting we are
-  // guessing. Drop to the declared-frame-rate mapping instead.
+  // it must land essentially on an entry of our table. Persistent misses DURING
+  // PLAYBACK mean the table does not describe what the element is actually
+  // presenting (a different track, or a container we mis-parsed), and indexing
+  // from it would report confidently wrong frame numbers.
+  //
+  // Only playback frames count. We skip while the element is paused or seeking,
+  // and the constructor's 'seeking' listener resets the strike counter, because
+  // after a programmatic seek Firefox's requestVideoFrameCallback echoes the seek
+  // TARGET rather than the presented frame's true presentation timestamp — so a
+  // post-seek readback is not evidence against the table. During real playback
+  // mediaTime is exact on every engine, so a sustained miss there is real. (This
+  // deliberately replaces the old behavior, where Firefox's post-seek echoes
+  // could deterministically knock out the index.)
+  //
+  // There is no fallback mapping to drop to anymore, so on strike-out we do NOT
+  // null the index: we keep it in place so the API stays functional and let the
+  // host decide what to do. Instead we latch `failed` (which turns
+  // frameIndexIsExact false, mirroring VideoEngine) and fire a fatal errormessage.
   _checkPresentedFrame() {
-    if (!this._index) return;
+    if (!this._index || this.failed) return;
+    if (this.video.paused || this.video.seeking) return;
     const t = this._presentedMediaTime - this._timeOffset;
     const n = this._index.frameOfPresentedTime(t);
     const residual = Math.abs(t - this._index.presentationTimes[n]);
-    const tolerance = 0.25 * (this._index.frameDurations[n] || 1 / this.framesPerSecond);
+    const tolerance = 0.25
+      * (this._index.frameDurations[n] || this._averageFrameDuration() || 1);
     if (residual <= tolerance) { this._indexStrikes = 0; return; }
     if (++this._indexStrikes < 5) return;   // tolerate a transient straggler
-    console.warn('NativeVideoEngine: the container index disagrees with the '
-      + 'frames the element is presenting; falling back to the declared frame '
-      + 'rate. Frame indices are now exact only if the clip is '
-      + 'constant-frame-rate.');
-    this._index = null;
-    this._timeOffset = 0;
+    this.failed = true;
+    const message = 'This video\'s container index disagrees with the frames the '
+      + 'element is presenting during playback, so its reported frame numbers can '
+      + 'no longer be trusted.';
+    console.warn('NativeVideoEngine: ' + message);
+    this.dispatchEvent(new CustomEvent('errormessage', { detail: {
+      message,
+      fatal: true,
+      inexact: true,
+    } }));
   }
 
   update() {}          // the <video> element advances its own clock
@@ -2463,12 +3274,7 @@ class NativeVideoEngine extends EventTarget {
     this._index = null;
     this._timeOffset = 0;
     this._indexStrikes = 0;
-    this._verifyDeclaredRateEnabled = false;
-    this._declaredAnchor = null;
-    this._declaredStrikes = 0;
-    this._probing = false;
-    this._probeResolver = null;
-    this._frameMappingInexact = false;
+    this.failed = false;
     this._hideError();
   }
 
@@ -2481,88 +3287,14 @@ class NativeVideoEngine extends EventTarget {
 }
 
 // ==================================================================
-// decode-support — which (browser engine, codec) pairs WebCodecs lies about.
-//
-// WebCodecs decode support tracks the BROWSER ENGINE, not the device, and its
-// feature detection is not always honest. The dangerous class is the "dishonest
-// yes": WebKit (desktop Safari and every iOS browser — they are all WebKit
-// underneath) answers VideoDecoder.isConfigSupported() = true for 10-bit HEVC
-// (the iPhone's own HDR camera format), decodes the first keyframe, and then the
-// decoder dies once sustained decoding starts. That death lands AFTER load()
-// resolved — past createBestEngine's load-time fallback — so the user sees the
-// clip play for a second or two and then stop.
-//
-// The reactive net for this (v1.7.0) is engine.failed + a fatal errormessage a
-// host can rebuild from. This module is the PROACTIVE half: recognize the
-// combination up front and route straight to the <video> element, which decodes
-// the same clip fine (it uses the platform's own AVFoundation path, not
-// WebCodecs). No crash, no flash, and the container index still makes the native
-// path frame-exact.
-//
-// The matrix here is empirical (real-device testing; see the decode-support-matrix
-// agent skill). It is deliberately TIGHT — a false positive needlessly gives up
-// the WebCodecs owned-clock path — so it names only combinations confirmed to
-// crash, and the reactive net still backs up anything it misses.
-// ==================================================================
-
-// The browser's underlying engine, inferred from navigator. WebCodecs bugs live
-// in the engine, so this — not the device or the browser brand — is what decides
-// whether a decode config can be trusted.
-//
-//   'webkit'  desktop Safari AND all iOS browsers (Chrome/Firefox/Edge on iOS
-//             are WebKit-backed by platform mandate). navigator.vendor is
-//             'Apple Computer, Inc.' for every one of them.
-//   'blink'   Chrome/Edge/Brave/Opera off iOS. navigator.vendor is 'Google Inc.'
-//   'gecko'   Firefox off iOS. navigator.vendor is '' (fall back to the UA).
-//   'unknown' anything we cannot place; treated as trustworthy (no routing).
-function detectBrowserEngine(nav) {
-  const navigatorObject = nav
-    || (typeof navigator !== 'undefined' ? navigator : null);
-  if (!navigatorObject) return 'unknown';
-  const vendor = navigatorObject.vendor || '';
-  if (vendor === 'Apple Computer, Inc.') return 'webkit';
-  if (vendor === 'Google Inc.') return 'blink';
-  const userAgent = navigatorObject.userAgent || '';
-  if (/firefox|gecko\//i.test(userAgent)) return 'gecko';
-  return 'unknown';
-}
-
-// Is this codec string 10-bit HEVC — the format WebKit's WebCodecs accepts and
-// then fails on? Covers HEVC Main 10 (general_profile_idc 2, the iPhone HDR
-// default) declared as hvc1/hev1, and Dolby Vision (dvh1/dvhe), which is
-// HEVC-based and always at least 10-bit. Range-Extensions profiles that reach
-// 10-bit through a different profile idc are exotic and not matched from the
-// codec string alone; the reactive fatal-fallback still covers those.
-function isTenBitHevc(codecString) {
-  if (!codecString) return false;
-  const parts = String(codecString).split('.');
-  const fourCharCode = parts[0].toLowerCase();
-  // Dolby Vision (HEVC-based) is always >= 10-bit.
-  if (fourCharCode === 'dvhe' || fourCharCode === 'dvh1') return true;
-  if (fourCharCode === 'hvc1' || fourCharCode === 'hev1') {
-    // hvc1.<profile>.<compat>.<tier><level>.<constraints...>; the profile field
-    // may carry a one-letter profile-space prefix (A/B/C) before the number.
-    const profileField = (parts[1] || '').replace(/^[ABC]/i, '');
-    return parseInt(profileField, 10) === 2;   // 2 == HEVC Main 10
-  }
-  return false;
-}
-
-// Should createBestEngine skip the WebCodecs engine for this (codec, engine)
-// pair because WebCodecs would accept it and then die mid-stream? True only for
-// the confirmed dishonest-yes combinations; everything else goes down the normal
-// ladder (try WebCodecs, fall back on an honest rejection).
-function webCodecsMayFailMidStream(codecString, browserEngine) {
-  return browserEngine === 'webkit' && isTenBitHevc(codecString);
-}
-// ==================================================================
 // createBestEngine — walk the ladder and return a loaded engine.
 //
 // The container index is built once, up front, and handed to whichever engine
-// ends up playing: it is what WebCodecs decodes from, and it is also what lifts
-// the <video> path from an assumed frame rate to exact per-frame timestamps. So
-// it is worth building even when WebCodecs is nowhere in sight, and it is never
-// built twice.
+// ends up playing: it is what WebCodecs decodes from, and it is also what gives
+// the <video> path exact per-frame timestamps. So it is worth building even when
+// WebCodecs is nowhere in sight, and it is never built twice. An index is
+// mandatory: a container we cannot index is refused, since this engine reports
+// only true frame indices, never inferred ones.
 //
 //   createBestEngine(source, {canvas, video})  ->  VideoEngine | NativeVideoEngine
 //
@@ -2581,26 +3313,15 @@ async function createBestEngine(source, options = {}) {
     // Passed through to VideoEngine; ignored by the <video> element, which does
     // its own buffering. See the VideoEngine constructor.
     windowAhead,
-    declaredFrameRate = 0,
-    declaredNumFrames = 0,
-    // Guarantee-or-bail for frame accuracy. A clip we cannot index (not MP4/MOV,
-    // not WebM/MKV) has no per-frame timestamp table, so the native engine can
-    // only map frames from a declared rate — exact only if the clip really is
-    // constant-frame-rate at that rate. By default such a clip must come with a
-    // declaredFrameRate (which is then VERIFIED against the real frame timestamps
-    // and rejected if inconsistent, rather than trusted); a clip with neither an
-    // index nor a rate throws rather than play with silently guessed frame
-    // numbers. Set allowApproximate: true to opt out of both — play the clip
-    // best-effort with whatever mapping is available and no frame-accuracy
-    // guarantee — for a host that genuinely does not need exact frame numbers.
-    allowApproximate = false,
     // How long the WebM index is allowed to take. Building it means reading the
     // whole file (Matroska keeps no central sample table), which is quick from
-    // disk and as slow as the network from a URL — so it gets a deadline, and a
-    // clip that blows through it falls back to the declared frame rate rather
-    // than making the host wait. Infinity to let it run as long as it needs;
-    // indexMaxBytes refuses outsized files before reading a byte of them.
-    // Neither touches the MP4 path, which is a few range reads either way.
+    // disk and as slow as the network from a URL — so it gets a deadline. A clip
+    // that blows through it is now REFUSED (the throw below) rather than played
+    // with guessed frame numbers; the index cache (added separately) is what
+    // softens the repeat-visit cost of a full-file parse. Infinity to let it run
+    // as long as it needs; indexMaxBytes refuses outsized files before reading a
+    // byte of them. Neither touches the MP4 path, which is a few range reads
+    // either way.
     indexTimeoutMilliseconds = 10000,
     indexMaxBytes = Infinity,
     // Called ~once per megabyte while a WebM is being indexed (the one pass long
@@ -2620,6 +3341,9 @@ async function createBestEngine(source, options = {}) {
   } = options;
 
   let index = (providedIndex !== undefined) ? providedIndex : null;
+  // The build error, kept so the refusal below can name what actually went wrong
+  // (an unsupported container, mp4box.js absent, or the WebM pass timing out).
+  let indexBuildError = null;
   if (providedIndex === undefined) {
     try {
       index = await ContainerIndex.fromSource(source, {
@@ -2628,12 +3352,27 @@ async function createBestEngine(source, options = {}) {
         onProgress,
       });
     } catch (err) {
-      console.warn('exact-video-engine: could not index this container (not '
-        + 'ISOBMFF or WebM, mp4box.js not loaded, or the WebM pass ran out of '
-        + 'time). The <video> element may still play it, but only from a declared '
-        + 'frame rate — a clip with neither an index nor a declaredFrameRate bails '
-        + 'below rather than guess frame numbers.', err);
+      indexBuildError = err;
     }
+  }
+
+  // Index or refuse. Every engine this function returns reports true per-frame
+  // indices read from the container, never numbers inferred from an assumed
+  // frame rate — so a container we could not index has no engine we are willing
+  // to hand back. This fires when the build failed above or when the caller
+  // explicitly passed index: null. A WebM whose indexing pass exceeded
+  // indexTimeoutMilliseconds lands here too: it now refuses rather than falling
+  // back to a declared rate, and the index cache (added separately) is what
+  // softens the cost the next time the same clip is opened.
+  if (!index) {
+    let message = 'createBestEngine: no index could be built for this container; '
+      + 'it is not a format we can index (supported: MP4/MOV, WebM/MKV, and Ogg). '
+      + 'Without a per-frame timestamp table there is no way to report exact frame '
+      + 'numbers, so this clip is refused rather than played with guesses.';
+    if (indexBuildError && indexBuildError.message) {
+      message += ` (underlying error: ${indexBuildError.message})`;
+    }
+    throw new Error(message);
   }
 
   // Proactively route away from WebCodecs for combinations it is known to
@@ -2674,27 +3413,24 @@ async function createBestEngine(source, options = {}) {
     throw new Error('createBestEngine: no <video> element supplied to fall back to');
   }
 
-  // Guarantee-or-bail: a clip with no container index and no declared frame rate
-  // could only be played with frame numbers guessed from an assumed rate. Rather
-  // than hand back an engine that silently reports guesses, refuse — unless the
-  // host has explicitly accepted best-effort playback with allowApproximate.
-  if (!index && !allowApproximate && !(declaredFrameRate > 0)) {
-    throw new Error('createBestEngine: this container could not be indexed for '
-      + 'frame-exact playback (it is not MP4/MOV or WebM/MKV), and no '
-      + 'declaredFrameRate was supplied to fall back to, so frame numbers would be '
-      + 'guesses. Pass declaredFrameRate to accept declared-rate mapping (it is '
-      + 'verified against the real frame timestamps and rejected if inconsistent), '
-      + 'or allowApproximate: true to play it best-effort without frame accuracy.');
+  // The native <video> path reads which frame is on screen out of
+  // requestVideoFrameCallback's presented-frame clock, whose mediaTime is the
+  // exact presentation timestamp of the displayed frame. Without that clock there
+  // is no way to know which indexed frame the element is actually showing (raw
+  // currentTime keeps advancing through decoder stalls while the picture is
+  // frozen, and refreshes at coarse uneven intervals on older WebKit), so a
+  // perfect index is not enough — refuse rather than report inexact frame
+  // numbers. This gate is only on the native fallback: the WebCodecs path above
+  // owns its own clock and needs no requestVideoFrameCallback, so it is never
+  // gated on it.
+  if (!('requestVideoFrameCallback' in video)) {
+    throw new Error('createBestEngine: this browser lacks requestVideoFrameCallback, '
+      + 'which the exact native <video> path requires to know which frame is on '
+      + 'screen. Please use a current browser (Safari 15.4+, Firefox 132+, or any '
+      + 'recent Chromium).');
   }
 
   const engine = new NativeVideoEngine(video);
-  await engine.load(source, {
-    index,
-    frameRate: declaredFrameRate,
-    numFrames: declaredNumFrames,
-    // With no index and a declared rate, verify that rate against the clip's real
-    // frame timestamps and throw if it is wrong (unless the host opted out).
-    verifyDeclaredRate: !allowApproximate,
-  });
+  await engine.load(source, { index });
   return engine;
 }

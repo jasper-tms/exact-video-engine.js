@@ -10,19 +10,24 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/midsize.mp4 ] || [ ! -f test/clips/hd.mp4 ] \
         || [ ! -f test/clips/counter-trimming-elst.mp4 ] \
         || [ ! -f test/clips/counter-hevc10.mp4 ] \
+        || [ ! -f test/clips/counter-vfr-fragmented.mp4 ] \
         || [ ! -f test/clips/corrupt-pure-garbage.bin ]; then
     bash test/make-test-clips.sh
 fi
+# The Ogg fixtures need an ffmpeg with libtheora, which not every machine has;
+# make-test-clips.sh skips them with a warning when there is none, and the tests
+# that want them skip themselves when the files are absent.
 
 # Node-only unit tests: no browser, no server. These run in plain Node directly
-# against the src/ modules, up front and cheaply. The Matroska parser (and its
-# WebM indexing progress reports), the known-bad-codec routing decision, and the
-# trimming-edit-list arithmetic are all pure enough to check without a browser.
+# against the src/ modules, up front and cheaply. The Matroska and Ogg parsers
+# (and the WebM indexing progress reports), the known-bad-codec routing decision,
+# and the trimming-edit-list arithmetic are all pure enough to check without a
+# browser.
 node_status=0
 node test/matroska-progress-test.mjs || node_status=1
 node test/decode-support-test.mjs || node_status=1
 node test/edit-list-test.mjs || node_status=1
-node test/frame-rate-check-test.mjs || node_status=1
+node test/ogg-table-test.mjs || node_status=1
 
 # test/serve.py, not `python3 -m http.server`: the latter ignores Range headers
 # and answers 200 with the whole file, which the engine reads over Range. That is
@@ -57,17 +62,17 @@ done
 # a Chromium-specific decoder error surface (decoder-failure), and the task they
 # verify is engine bookkeeping that is not browser-specific — so running them
 # under one engine is enough and porting them would only add contortions.
-echo "=== chromium-only: startup, memory, decoder-failure, known-bad-codec, declared-rate ==="
+echo "=== chromium-only: startup, memory, decoder-failure, known-bad-codec, index-cache ==="
 node test/startup-test.mjs || status=1
 node test/memory-test.mjs || status=1
 node test/decoder-failure-test.mjs || status=1
 # known-bad-codec spoofs navigator.vendor to exercise the WebKit routing path from
 # Chromium (the decision is codec-string-based, so no real HEVC decode is needed).
 node test/known-bad-codec-test.mjs || status=1
-# declared-rate drives the seek-probe that verifies (or bails on) a declared frame
-# rate for un-indexable clips; it forces the path with index:null on the counter
-# clips, so it needs a standard <video>/rVFC surface, not a specific decode path.
-node test/declared-rate-verify-test.mjs || status=1
+# index-cache exercises the IndexedDB cache: hit returns identical tables, any
+# changed or absent validator is a miss and rebuild. IndexedDB behaves the same
+# across engines, so one engine covers it.
+node test/cache-test.mjs || status=1
 
 # Chromium-only too, but for a different reason: robustness-test pins that
 # malformed and truncated inputs fail softly (bounded time, no page crash). That
