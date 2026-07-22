@@ -1,14 +1,6 @@
 ---
 name: decode-support-matrix
-description: MUST load before diagnosing any exact-video-engine.js playback or
-  decode failure — especially a video that plays on desktop but fails on
-  iPhone/mobile ("Decoder failure" mid-playback), or any question about which
-  codecs each backend (WebCodecs VideoEngine vs native <video>) can decode.
-  Contains the empirically tested codec support matrix (10-bit HEVC, Dolby
-  Vision, High 10 H.264, WebM), why isConfigSupported lies on WebKit, which
-  failures the automatic fallback does and does not catch, and what format to
-  transcode uploads to. Code inspection alone gives wrong answers here; this
-  matrix comes from real-device testing.
+description: MUST load before diagnosing any exact-video-engine.js playback or decode failure — especially a clip that plays on desktop but fails on iPhone with a mid-playback "Decoder failure" — or any question about which codecs each backend (WebCodecs vs native <video>) can decode. Answer from the tested matrix here, not from code inspection.
 ---
 
 # Decode support by backend
@@ -17,7 +9,7 @@ The engine has two backends behind one interface: `VideoEngine` (WebCodecs —
 demuxes with mp4box, decodes every frame itself) and `NativeVideoEngine`
 (`<video>` element — the browser decodes and presents). `createBestEngine()`
 picks per clip. This skill records which real-world video formats each backend
-can actually decode, established by hands-on testing (2026-07, engine v1.6.x).
+can actually decode (tested 2026-07, engine v1.6.x).
 
 ## Frame-exactness is decided by the index, not the decoder
 
@@ -91,13 +83,12 @@ WebKit reports the same *"Decoder failure"* string for two different problems:
 | H.264 High 10 (no hardware decoder exists anywhere) | honest no at load → auto-fallback to native, invisible | works (software decode) | works (software decode) |
 | WebM (VP8/VP9) | never attempted (no mp4box index) | never attempted | works where the browser plays WebM |
 
-Findings behind the HEVC Main 10 row (bisected with single-variable variant
-files): stripping the Dolby Vision RPUs alone does **not** fix it; re-encoding
-to 8-bit HEVC **does**; so the trigger is 10-bit HEVC in WebKit's WebCodecs
-path, not Dolby Vision and not the .MOV container (see the two-classes
-section above for the one alternative not yet ruled out). The same phone
-plays the same file perfectly through `<video>` (AVFoundation) — the hardware
-is fine, the WebCodecs plumbing is not.
+Behind the HEVC Main 10 row: stripping the Dolby Vision RPUs alone does **not**
+fix it; re-encoding to 8-bit HEVC **does** — so the trigger is 10-bit depth in
+WebKit's WebCodecs path, not Dolby Vision and not the .MOV container (the
+two-classes section above has the one alternative not yet ruled out). The same
+phone plays the same file perfectly through `<video>` (AVFoundation), so the
+hardware is fine and only the WebCodecs plumbing is not.
 
 ## Practical guidance
 
@@ -129,10 +120,8 @@ is fine, the WebCodecs plumbing is not.
   owned playhead — and relies on the fatal fallback.
 - To reproduce iOS WebKit decode bugs without a phone: desktop **Safari** is
   the same WebKit + VideoToolbox stack (Apple Silicon also has HEVC Main 10
-  hardware). **Confirmed 2026-07-13**: a 10-bit HEVC clip that hit "Decoder
-  failure" on iPhone failed identically in desktop Safari — with a full Web
-  Inspector available. This also means the dishonest-yes class is not
-  mobile-specific: it is WebKit-wide, so "works on desktop" only means
+  hardware) and gives you a full Web Inspector. The dishonest-yes class is not
+  mobile-specific — it is WebKit-wide, so "works on desktop" only means
   "works on desktop *Chrome*".
 - Bit depth is the common thread of trouble: no browser gets universal
   hardware 10-bit decode, so 10-bit clips always land on some fallback tier
