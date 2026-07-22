@@ -2,6 +2,7 @@ import { createRangeReader } from './range-readers.js';
 import { deriveIndexCacheKey, loadCachedIndexPayload, storeCachedIndexPayload, serializeContainerIndex, hydrateContainerIndex } from './index-cache.js';
 import { readMatroskaFrameTable, IndexBudgetExceededError } from './matroska.js';
 import { readOggFrameTable } from './ogg.js';
+import { readAviFrameTable } from './avi.js';
 
 // A build faster than this is not worth caching: a classic single-moov MP4
 // indexes in a few range reads and would only churn the cache, while a
@@ -21,7 +22,7 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 // decodes a frame, so it works in browsers that have no WebCodecs at all, which
 // is exactly what makes the <video> fallback frame-exact rather than fps-guessing.
 //
-// Three containers, three ways in, one table out.
+// Four containers, four ways in, one table out.
 //
 //   * ISOBMFF (mp4/m4v/mov) goes through mp4box. A classic single-`moov` file is
 //     the cheap case: a few range reads hand back a full sample table (times,
@@ -39,9 +40,20 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 //   * Ogg/Theora goes through readOggFrameTable, likewise a full-file pass for the
 //     timestamps alone, and likewise no sample table or decoder configuration —
 //     Ogg plays only through the native <video> path (Firefox), never WebCodecs.
+//   * AVI (RIFF/`AVI `) goes through readAviFrameTable, and is the odd one out: it
+//     builds a FULL decode-order sample table plus a decoderConfig, exactly like
+//     the ISOBMFF path, NOT a timestamps-only table like WebM/Ogg. It must, because
+//     no browser plays AVI through a <video> element — there is no native tier for
+//     it — so the WebCodecs engine is the only way an AVI ever plays, and that
+//     engine needs the sample table and the decoder configuration. Building the
+//     table does not read the frame bytes (the idx1 / OpenDML index enumerates
+//     them), only the header, the index, and the first keyframe (for the H.264
+//     SPS/PPS, from which the AVCC decoder configuration is built).
+//     An AVI whose codec WebCodecs cannot decode yields no decoderConfig and is
+//     refused cleanly, since it has no native fallback to land on.
 //
-// `supportsWebCodecs` is how the ladder in createBestEngine tells the ISOBMFF
-// index (decodable) from the WebM and Ogg ones (native-only).
+// `supportsWebCodecs` is how the ladder in createBestEngine tells the decodable
+// indexes (ISOBMFF and AVI) from the native-only ones (WebM and Ogg).
 //
 // Anything else (HLS and other segmented delivery, raw elementary streams) still
 // fails here, and the <video> element cannot play those either. That is the
@@ -51,7 +63,7 @@ export class ContainerIndex {
   constructor(reader) {
     this.reader = reader;
     this.timescale = 1;
-    this.containerFormat = null;     // 'isobmff' | 'matroska' | 'ogg'
+    this.containerFormat = null;     // 'isobmff' | 'matroska' | 'ogg' | 'avi'
 
     // Decode-order sample table (no frame bytes): {offset, size, isSync, cts,
     // duration}. The byte ranges the decoder will later fetch on demand.
@@ -65,6 +77,11 @@ export class ContainerIndex {
     this.microsToDisplay = null;     // Map<chunkTimestampMicros, displayIndex>
 
     this.decoderConfig = null;
+    // True when this.samples carry an Annex B bitstream (AVI's H.264) that the
+    // decode path must convert to length-prefixed AVCC before feeding the decoder,
+    // which is configured in AVCC mode (decoderConfig.description present). False
+    // for containers whose samples are already length-prefixed (ISOBMFF).
+    this.samplesAreAnnexB = false;
     this.rotation = 0;               // 0/90/180/270
     this.videoWidth = 0;             // upright display dimensions (rotation applied)
     this.videoHeight = 0;
@@ -102,6 +119,7 @@ export class ContainerIndex {
     const index = new ContainerIndex(reader);
     if (await ContainerIndex._isMatroska(reader)) await index._demuxMatroska(reader, options);
     else if (await ContainerIndex._isOgg(reader)) await index._demuxOgg(reader, options);
+    else if (await ContainerIndex._isAvi(reader)) await index._demuxAvi(reader, options);
     else await index._demuxIsobmff(reader, options);
     return index;
   }
@@ -169,6 +187,18 @@ export class ContainerIndex {
     const magic = new Uint8Array(await reader.read(0, 3));
     return magic[0] === 0x4F && magic[1] === 0x67
       && magic[2] === 0x67 && magic[3] === 0x53;   // "OggS"
+  }
+
+  // AVI is a RIFF file whose form type is `AVI `: bytes 0..3 are "RIFF" and bytes
+  // 8..11 are "AVI " (bytes 4..7 are the RIFF size, which we do not need here).
+  // Read the 12 bytes that carry both, guarding on the file being that long.
+  static async _isAvi(reader) {
+    if (reader.size < 12) return false;
+    const magic = new Uint8Array(await reader.read(0, 11));
+    return magic[0] === 0x52 && magic[1] === 0x49
+      && magic[2] === 0x46 && magic[3] === 0x46    // "RIFF"
+      && magic[8] === 0x41 && magic[9] === 0x56
+      && magic[10] === 0x49 && magic[11] === 0x20; // "AVI "
   }
 
   // Largest display frame whose presentation time is <= t (binary search over
@@ -481,6 +511,71 @@ export class ContainerIndex {
     this.numFrames = n;
     this.duration = n
       ? this.presentationTimes[n - 1] + this.frameDurations[n - 1] : 0;
+  }
+
+  // AVI: unlike the WebM and Ogg paths above, this builds a FULL decode-order
+  // sample table and a decoderConfig — the ISOBMFF shape, not the timestamps-only
+  // one — because AVI has no native <video> fallback, so the WebCodecs engine is
+  // the only tier that can ever play it (see readAviFrameTable and the class
+  // comment). AVI is constant-frame-rate with no B-frames, so each frame's
+  // composition time is synthesized as frameIndex * dwScale in a timescale of
+  // dwRate, and there is no edit list to apply (editWindow = null).
+  //
+  // A clip whose codec we cannot form a decoderConfig for (uncompressed, MJPEG,
+  // …) arrives here with decoderConfig === null; we throw a clear error rather
+  // than build a half-index that would leave supportsWebCodecs false with nothing
+  // to fall back to. createBestEngine turns that into the same clean refusal any
+  // unindexable clip gets.
+  async _demuxAvi(reader, options) {
+    const table = await readAviFrameTable(reader, options);
+    this.containerFormat = 'avi';
+
+    if (!table.decoderConfig) {
+      throw new Error(
+        `this AVI's video codec (${JSON.stringify(table.fourCc)}) is not one WebCodecs `
+        + 'can decode, and AVI has no native <video> fallback, so the clip is refused. '
+        + '(Uncompressed and MJPEG AVI are intentionally out of scope.)');
+    }
+
+    // Synthesize the decode-order sample records _buildTables consumes. The frame
+    // rate is the rational dwRate/dwScale, so composition time and duration live
+    // in a timescale of dwRate: frame n at cts = n * dwScale, each frame lasting
+    // dwScale ticks, giving presentation times of exactly n * dwScale / dwRate
+    // seconds.
+    const scale = table.frameRateDenominator;   // dwScale
+    const rate = table.frameRateNumerator;       // dwRate
+    const samples = table.frames.map((frame, frameIndex) => ({
+      offset: frame.offset,
+      size: frame.size,
+      is_sync: frame.isSync,
+      cts: frameIndex * scale,
+      duration: scale,
+      timescale: rate,
+    }));
+
+    // AVI carries no display rotation matrix, and there is no <video> element to
+    // apply one anyway.
+    this.rotation = 0;
+    this.videoWidth = table.videoWidth;
+    this.videoHeight = table.videoHeight;
+    this.decoderConfig = {
+      codec: table.decoderConfig.codec,
+      codedWidth: table.decoderConfig.codedWidth,
+      codedHeight: table.decoderConfig.codedHeight,
+      optimizeForLatency: true,
+    };
+    // AVI's H.264 is configured in AVCC mode: the description is an `avcC` built
+    // from the first keyframe's SPS/PPS, and the samples (Annex B in the file) are
+    // converted to AVCC in the decode path. WebKit's WebCodecs claims to support
+    // Annex-B-no-description and then fails the decode, so AVCC is the only path
+    // that works on every engine (see src/avi.js and the decode-support-matrix
+    // skill).
+    if (table.decoderConfig.description !== undefined) {
+      this.decoderConfig.description = table.decoderConfig.description;
+    }
+    this.samplesAreAnnexB = !!table.samplesAreAnnexB;
+
+    this._buildTables(samples, null);
   }
 
   _codecDescription(file, trackId) {

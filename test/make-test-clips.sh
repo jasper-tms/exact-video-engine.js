@@ -258,3 +258,55 @@ PYTHON
 echo "Wrote regression fixtures:"
 ls clips/counter-fragmented.mp4 clips/counter-audio-first.webm \
     clips/counter-trimming-elst.mp4 clips/corrupt-*
+
+# ==================================================================
+# AVI container fixtures (added for the AVI-indexing work). AVI has no native
+# <video> tier, so an AVI whose codec WebCodecs can decode plays ONLY through the
+# WebCodecs engine, and one whose codec it cannot must be refused cleanly. These
+# clips exercise both index flavors (legacy idx1 and OpenDML) and both outcomes.
+# Self-contained block so it stays cleanly separable.
+# ==================================================================
+
+# 1. Classic idx1 AVI, H.264, constant 30 fps — the counter clip (frame n's bar
+# at x = 5n, 150x90) muxed to AVI. ffmpeg writes H.264 into AVI as an Annex B
+# bitstream with SPS/PPS in-band on each keyframe and a legacy idx1 at the end,
+# which is the WebCodecs-decodable happy path. Same coding choices as
+# counter-cfr.mp4 (High 8-bit 4:2:0, no B-frames) so every browser's WebCodecs
+# decodes it and the bar edges stay a hard step for the pixel readback.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -f avi clips/counter-idx1.avi
+
+# 2. OpenDML (indx super-index + ix00) AVI, H.264 — the same 30 frames, but with
+# the hierarchical index the real >2 GB capture files use. ffmpeg only emits an
+# OpenDML index for very large files, so make-opendml-avi.py rewrites the idx1
+# clip above into an OpenDML one (frame bytes copied verbatim, index structure
+# replaced, no idx1). See that script for the exact byte layout it produces.
+python3 make-opendml-avi.py clips/counter-idx1.avi clips/counter-opendml.avi
+
+# 3. A second frame rate AND non-multiple-of-16 dimensions, to catch rate/scale
+# and stride assumptions: 25 fps, 170x94, H.264 idx1. Parser-only (the browser
+# pixel walk uses the 150x90 counter above), so the odd geometry is free to be
+# awkward. 25 frames at 1/25 s spacing is what the table test pins.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "color=c=black:s=170x94:d=1:r=25,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -f avi clips/counter-avi-25fps.avi
+
+# 4. Uncompressed rawvideo AVI (biCompression 0 / BI_RGB, the pal8 shape that
+# motivated the task) — the honest-no case. WebCodecs has no raw-frame decoder and
+# a raw backend is a separate future task, so the engine must refuse this cleanly
+# (a clear error, no crash, bounded time), NOT play it. Small and short; its pixels
+# do not matter, only that its codec is undecodable.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "color=c=black:s=48x32:d=0.3:r=10,format=pal8" \
+    -c:v rawvideo -f avi clips/counter-rawvideo.avi
+
+# 5. MJPEG AVI — a second undecodable-by-WebCodecs case (most browsers ship no
+# MJPEG VideoDecoder). Also refused cleanly. Cheap to add, so it is.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "color=c=black:s=48x32:d=0.3:r=10,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+    -c:v mjpeg -f avi clips/counter-mjpeg.avi
+
+echo "Wrote AVI fixtures:"
+ls clips/counter-idx1.avi clips/counter-opendml.avi clips/counter-avi-25fps.avi \
+    clips/counter-rawvideo.avi clips/counter-mjpeg.avi

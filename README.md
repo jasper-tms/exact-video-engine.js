@@ -50,7 +50,8 @@ quietly mismaps every variable-frame-rate clip.
 That table can be read straight out of the container, with nothing decoded.
 `ContainerIndex` builds it — from the `moov` for MP4 (mp4box.js, a few range
 requests), by scanning the clusters for WebM, the `moof` fragments for
-fragmented MP4, and the pages for Ogg (see below) — and it is handed to
+fragmented MP4, the pages for Ogg, and the `idx1` / OpenDML index for AVI (see
+below) — and it is handed to
 whichever engine ends up playing. Given it, the `<video>` path binary-searches
 `mediaTime` into an exact frame index and is frame-exact on variable-frame-rate
 clips.
@@ -60,7 +61,7 @@ browser:
 
 | | Index from | Presentation | Frame index |
 | --- | --- | --- | --- |
-| 1. WebCodecs | container (MP4) | engine-owned canvas | exact |
+| 1. WebCodecs | container (MP4 or AVI) | engine-owned canvas | exact |
 | 2. `<video>` + index | container (MP4, WebM, or Ogg) | browser | exact |
 
 Step 2 is the one that usually does not exist. It covers browsers without
@@ -83,7 +84,9 @@ show — rather than play a clip it would have to guess about:
 
 - **A container we cannot parse** (HLS/MPEG-TS or other segmented delivery, live
   streams, raw elementary streams, or anything else that is not MP4/MOV,
-  WebM/MKV, or Ogg). No table can exist, so no engine is returned.
+  WebM/MKV, Ogg, or AVI). No table can exist, so no engine is returned. (An AVI
+  whose *codec* WebCodecs cannot decode — uncompressed, MJPEG — is refused here
+  too: AVI has no native fallback, so an index it cannot decode from is useless.)
 - **An indexing pass that ran out of its budget** (`indexTimeoutMilliseconds` /
   `indexMaxBytes`, see the WebM section). A partial table is a wrong table.
 - **A browser without `requestVideoFrameCallback`, when the clip must play
@@ -201,6 +204,37 @@ headers and counting frame packets, no decoding, budget and progress and cache
 included. An Ogg index carries timestamps but no sample table, so like WebM it
 plays through the `<video>` element — in browsers that still ship a Theora
 decoder.
+
+### AVI
+
+AVI (`RIFF`/`AVI `) is indexed by the engine's own RIFF parser, `src/avi.js`,
+and is the one container that is **WebCodecs-only, with no native fallback**:
+Chromium and Firefox refuse AVI through a `<video>` element outright, and while
+some builds of WebKit happen to play it, that is not something to rely on across
+browsers. So AVI gets no tier 2, and an AVI index is useless unless it can drive
+tier 1 — which is why `src/avi.js` (unlike the WebM and Ogg scans) builds a full
+decode-order sample table *and* a decoder configuration, the same shape mp4box
+produces for MP4. A decodable AVI plays through WebCodecs; an AVI whose codec
+WebCodecs cannot decode is refused, since there is nothing to fall back to.
+
+Indexing an AVI does **not** read the whole file: its index (the legacy `idx1`
+table, or the OpenDML `indx`/`ix##` hierarchical index that files over ~2 GB use)
+enumerates every frame's byte range without touching a frame's payload, so the
+parser reads only the header, the index, and the first keyframe (for the H.264
+SPS). It still honors the same deadline, byte ceiling, progress reporting, and
+cache treatment as the full-file scans, and refuses rather than hangs on a
+malformed file — it simply spends far less of the budget in the normal case.
+
+Only H.264 is supported today. AVI stores it as an Annex B bitstream, but the
+engine does not feed WebCodecs that directly: WebKit's decoder answers
+`isConfigSupported()` = true for an Annex-B (no-`description`) config and then
+fails the actual decode — a dishonest yes. So the engine configures the decoder
+in length-prefixed **AVCC** mode instead (an `avcC` description built from the
+first keyframe's SPS/PPS) and converts each frame from Annex B to AVCC before
+decoding. AVCC is the form every engine — Chromium, Firefox, and WebKit/Safari —
+decodes, so this is the path that works everywhere without leaning on any native
+AVI support. Uncompressed (`rawvideo`) and MJPEG AVI are intentionally out of
+scope and refused cleanly; a raw-frame backend is a separate future task.
 
 ### The index cache
 

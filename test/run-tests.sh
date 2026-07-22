@@ -11,6 +11,8 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-trimming-elst.mp4 ] \
         || [ ! -f test/clips/counter-hevc10.mp4 ] \
         || [ ! -f test/clips/counter-vfr-fragmented.mp4 ] \
+        || [ ! -f test/clips/counter-idx1.avi ] \
+        || [ ! -f test/clips/counter-opendml.avi ] \
         || [ ! -f test/clips/corrupt-pure-garbage.bin ]; then
     bash test/make-test-clips.sh
 fi
@@ -28,6 +30,7 @@ node test/matroska-progress-test.mjs || node_status=1
 node test/decode-support-test.mjs || node_status=1
 node test/edit-list-test.mjs || node_status=1
 node test/ogg-table-test.mjs || node_status=1
+node test/avi-table-test.mjs || node_status=1
 
 # test/serve.py, not `python3 -m http.server`: the latter ignores Range headers
 # and answers 200 with the whole file, which the engine reads over Range. That is

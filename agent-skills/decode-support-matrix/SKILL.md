@@ -82,6 +82,50 @@ WebKit reports the same *"Decoder failure"* string for two different problems:
 | **HEVC Main 10** (iPhone HDR default, with or without Dolby Vision profile 8) | **dishonest yes: claims support, decodes frame 0, dies mid-stream** | works | works |
 | H.264 High 10 (no hardware decoder exists anywhere) | honest no at load → auto-fallback to native, invisible | works (software decode) | works (software decode) |
 | WebM (VP8/VP9) | never attempted (no mp4box index) | never attempted | works where the browser plays WebM |
+| H.264 8-bit **in AVI** (engine ships AVCC + `avcC`; see the AVI section) | works | works | AVI is WebCodecs-only — no native tier used |
+
+## AVI-in-WebCodecs: WebKit needs AVCC, not Annex B (a second dishonest yes)
+
+AVI (added v2.1) is the one container the WebCodecs backend reaches WITHOUT
+mp4box: `src/avi.js` parses the RIFF/`idx1`/OpenDML index itself and builds a
+full sample table plus a `decoderConfig`. The engine treats AVI as **WebCodecs-
+only**: Chromium and Firefox refuse AVI through a `<video>` element outright, so
+there is no reliable native tier, and `createBestEngine` never uses one for AVI.
+
+ffmpeg writes H.264-in-AVI as an **Annex B** bitstream (NAL start codes, SPS/PPS
+in-band on each keyframe). The naive config — the `avc1.PPCCLL` codec string with
+**no `description`**, which is how WebCodecs signals Annex B input — decodes on
+Chromium and Firefox but is a **dishonest yes on WebKit**: `isConfigSupported()`
+returns `supported: true`, and then the actual decode of the first Annex B chunk
+fails. (Confirmed 2026-07 on Playwright's Linux WebKit: `isConfigSupported` true,
+`VideoDecoder.decode` errors.) This is the same shape as the 10-bit-HEVC dishonest
+yes above — support-check passes, decode does not.
+
+So `src/avi.js` does NOT feed Annex B. It configures the decoder in **AVCC mode**:
+it builds an `avcC` `description` from the first keyframe's SPS and PPS
+(`buildDecoderConfig`), and `VideoEngine` converts each frame's Annex B to
+length-prefixed AVCC before decoding (`convertAnnexBToAvcc`, gated on the index's
+`samplesAreAnnexB` flag). AVCC is the format every engine — Chromium, Firefox, and
+WebKit/VideoToolbox — decodes natively, so this is the one path that works
+everywhere and does not depend on any native AVI support.
+
+Tested 2026-07 (engine v2.1), counter clip muxed to AVI (High 8-bit 4:2:0), both
+idx1 and OpenDML index flavors, `mode: webcodecs`, all 30 frames exact, tier
+`webcodecs` on all three:
+
+| Config | Chromium | Firefox | WebKit (Playwright Linux) |
+|---|---|---|---|
+| Annex B H.264, **no** `description` | works | works | dishonest yes: `isConfigSupported` true, decode fails |
+| **AVCC** H.264 + `avcC` `description` (what the engine ships) | **works** | **works** | **works** |
+
+Not yet tested on a real iOS/macOS Safari device (only Playwright's WebKit, which
+uses GStreamer, not VideoToolbox). AVCC is VideoToolbox's native H.264 form, so it
+should work there too; confirm on a device if one is available and record it.
+
+Aside worth knowing: Playwright's Linux WebKit `<video>` DOES play AVI (it has a
+GStreamer AVI demuxer), which briefly masked the WebCodecs failure as a silent
+native fallback. Real iOS almost certainly does not, which is exactly why the
+engine relies on WebCodecs+AVCC and not on a native AVI tier.
 
 Behind the HEVC Main 10 row: stripping the Dolby Vision RPUs alone does **not**
 fix it; re-encoding to 8-bit HEVC **does** — so the trigger is 10-bit depth in

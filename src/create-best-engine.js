@@ -83,7 +83,7 @@ export async function createBestEngine(source, options = {}) {
   // softens the cost the next time the same clip is opened.
   if (!index) {
     let message = 'createBestEngine: no index could be built for this container; '
-      + 'it is not a format we can index (supported: MP4/MOV, WebM/MKV, and Ogg). '
+      + 'it is not a format we can index (supported: MP4/MOV, WebM/MKV, Ogg, and AVI). '
       + 'Without a per-frame timestamp table there is no way to report exact frame '
       + 'numbers, so this clip is refused rather than played with guesses.';
     if (indexBuildError && indexBuildError.message) {

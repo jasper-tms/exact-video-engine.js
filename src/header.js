@@ -32,8 +32,9 @@
 // timestamp to a frame *index*, which needs the table of every frame's PTS. A
 // <video> element never exposes that table, so we read it out of the container
 // ourselves, without decoding a single frame: from the moov for MP4 (mp4box),
-// the moof fragments for fragmented MP4, the clusters for WebM, and the pages
-// for Ogg. Either way the same table goes to whichever engine ends up playing
+// the moof fragments for fragmented MP4, the clusters for WebM, the pages for
+// Ogg, and the idx1 / OpenDML index for AVI. Either way the same table goes to
+// whichever engine ends up playing
 // (see ContainerIndex), and a full-file pass worth caching lands in IndexedDB
 // so it is paid once per clip (see index-cache). That is what makes the
 // <video> path frame-exact on variable-frame-rate clips rather than merely
@@ -43,12 +44,22 @@
 // browser, choosing between two exact tiers and otherwise refusing:
 //
 //   1. container index + WebCodecs   exact index, exact decode, owned clock
-//                                    (MP4 only, fragmented included: WebM's and
-//                                    Ogg's indexes carry timestamps but no
-//                                    sample table to decode from)
+//                                    (MP4 and AVI: WebM's and Ogg's indexes carry
+//                                    timestamps but no sample table to decode from)
 //   2. container index + <video>     exact index, browser decode + presentation
 //                                    (MP4, WebM, Ogg), read out through the
 //                                    presented-frame clock (requestVideoFrameCallback)
+//
+// AVI is the one container that lives ONLY in tier 1: browsers do not reliably
+// play AVI through a <video> element (Chromium and Firefox refuse it outright), so
+// AVI gets no tier-2 fallback. That is exactly why its index (unlike WebM's and
+// Ogg's) must be a full decode-order sample table with a decoder configuration —
+// the WebCodecs engine is the only tier that plays it — and why an AVI whose codec
+// WebCodecs cannot decode is refused rather than handed to a <video> element that
+// would (on most browsers) reject it too. AVI's H.264 is stored Annex B but
+// decoded in AVCC mode: WebKit's WebCodecs claims to support Annex B and then
+// fails the decode, so the sample table's bytes are converted to length-prefixed
+// AVCC (see src/avi.js) — the one form every engine decodes.
 //
 // There is no third tier. A clip whose container we cannot index, or a native-path
 // browser with no requestVideoFrameCallback (so no exact presented-frame clock),

@@ -140,6 +140,21 @@ const CASES = [
   { file: 'counter-vfr-fragmented.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
   { file: 'counter-vfr-fragmented.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true },
 
+  // AVI, indexed by the engine's own RIFF parser (src/avi.js). AVI has NO native
+  // <video> tier — no browser plays it through a <video> element — so the only
+  // mode is 'webcodecs', and the engine's own H.264 decode is what puts pixels on
+  // screen. counter-idx1.avi carries the legacy idx1 index; counter-opendml.avi
+  // the OpenDML indx/ix00 hierarchical index that the real >2 GB captures use.
+  // Both are the 30 counter frames (bar at x = 5n), so exact frames prove the
+  // engine read the right byte ranges out of the index and decoded the H.264 the
+  // AVI carries. The engine converts AVI's Annex B H.264 to AVCC and configures an
+  // avcC description (WebKit's WebCodecs claims to support Annex-B-no-description
+  // and then fails the decode — see the decode-support matrix), and AVCC decodes
+  // on all three engines, so there is no per-browser override: all three play via
+  // the webcodecs tier, exactly like the MP4 H.264 webcodecs cases.
+  { file: 'counter-idx1.avi', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
+  { file: 'counter-opendml.avi', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
+
   // A WebM whose FIRST track entry is audio and whose second is the video (the
   // 30 counter frames). The Matroska cluster scan must skip the audio track and
   // index only the video blocks; an off-by-one that indexed the first track would

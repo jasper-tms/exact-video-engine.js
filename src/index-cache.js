@@ -280,6 +280,11 @@ export function serializeContainerIndex(index) {
     numFrames: index.numFrames,
     duration: index.duration,
     trimmedByEditList: index.trimmedByEditList,
+    // Whether the sample bytes are Annex B (AVI's H.264) and need converting to
+    // AVCC in the decode path. Absent in pre-AVI payloads, which are all AVCC
+    // ISOBMFF or sample-table-less WebM/Ogg, so the constructor default (false) is
+    // correct for them and no schema bump is required.
+    samplesAreAnnexB: index.samplesAreAnnexB,
   };
 }
 
@@ -311,6 +316,7 @@ export function hydrateContainerIndex(index, payload) {
   index.numFrames = payload.numFrames;
   index.duration = payload.duration;
   index.trimmedByEditList = !!payload.trimmedByEditList;
+  index.samplesAreAnnexB = !!payload.samplesAreAnnexB;
 
   // microsToDisplay is rebuilt, not stored: it is a Map from a sample's
   // composition time (in whole microseconds) to its display index, and it only

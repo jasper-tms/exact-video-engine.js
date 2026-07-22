@@ -1,4 +1,5 @@
 import { ContainerIndex } from './container-index.js';
+import { convertAnnexBToAvcc } from './avi.js';
 
 // Frames the cache holds beyond the read-ahead window's far edge. Decoded
 // frames arrive a little past the target while the playhead is still catching
@@ -46,6 +47,11 @@ export class VideoEngine extends EventTarget {
     this._reader = null;
     this._videoDecoder = null;
     this._decoderConfig = null;
+    // True when the index's samples are an Annex B bitstream (AVI's H.264) that
+    // must be converted to length-prefixed AVCC before the decoder — which is
+    // configured in AVCC mode — will accept them. False for ISOBMFF, whose
+    // samples are already AVCC. Set from the index in _adoptIndex.
+    this._annexBSamples = false;
     // True once the VideoDecoder has reported an unrecoverable error (see
     // _decoderFailed); cleared by load()/_teardown().
     this.failed = false;
@@ -207,6 +213,7 @@ export class VideoEngine extends EventTarget {
     this._index = index;
     this._reader = index.reader;
     this._decoderConfig = index.decoderConfig;
+    this._annexBSamples = !!index.samplesAreAnnexB;
     this._timescale = index.timescale;
     this._samples = index.samples;
     this._keyframeDecodeIndices = index.keyframeDecodeIndices;
@@ -458,11 +465,17 @@ export class VideoEngine extends EventTarget {
           await this._ensureBytes(s.offset, s.size,
             this._cache.has(target) ? 0 : this._bytesThrough(k, targetDecode));
           if (!this._videoDecoder || this._fedThrough !== k - 1) continue;  // restarted mid-read
+          // AVI stores H.264 as Annex B, but the decoder is configured in AVCC
+          // mode (a description is present), so convert this frame's start-code
+          // NAL units to length-prefixed form first. ISOBMFF samples are already
+          // AVCC and pass through untouched.
+          const sampleBytes = this._annexBSamples
+            ? convertAnnexBToAvcc(this._sliceSample(k)) : this._sliceSample(k);
           this._videoDecoder.decode(new EncodedVideoChunk({
             type: s.isSync ? 'key' : 'delta',
             timestamp: Math.round(s.cts * 1e6 / this._timescale),
             duration: Math.round(s.duration * 1e6 / this._timescale),
-            data: this._sliceSample(k),
+            data: sampleBytes,
           }));
           this._fedThrough = k;
           continue;
