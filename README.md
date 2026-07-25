@@ -49,7 +49,7 @@ quietly mismaps every variable-frame-rate clip.
 
 That table can be read straight out of the container, with nothing decoded.
 `ContainerIndex` builds it — from the `moov` for MP4 (mp4box.js, a few range
-requests), by scanning the clusters for WebM, the `moof` fragments for
+requests), by scanning the clusters for WebM/MKV, the `moof` fragments for
 fragmented MP4, the pages for Ogg, and the `idx1` / OpenDML index for AVI (see
 below) — and it is handed to
 whichever engine ends up playing. Given it, the `<video>` path binary-searches
@@ -61,15 +61,14 @@ browser:
 
 | | Index from | Presentation | Frame index |
 | --- | --- | --- | --- |
-| 1. WebCodecs | container (MP4 or AVI) | engine-owned canvas | exact |
-| 2. `<video>` + index | container (MP4, WebM, or Ogg) | browser | exact |
+| 1. WebCodecs | container (MP4, WebM/MKV, or AVI) | engine-owned canvas | exact |
+| 2. `<video>` + index | container (MP4, WebM/MKV, or Ogg) | browser | exact |
 
 Step 2 is the one that usually does not exist. It covers browsers without
 WebCodecs (Safari before 16.4, older Firefox), codecs the platform decoder
-rejects, WebM and Ogg (whose indexes carry timestamps but no sample table for
-WebCodecs to decode from), and any host that needs audio or the battery-friendly
-hardware overlay path — none of which have to settle for guessing at frame
-numbers.
+rejects, Ogg (whose index carries timestamps but no sample table for WebCodecs to
+decode from), and any host that needs audio or the battery-friendly hardware
+overlay path — none of which have to settle for guessing at frame numbers.
 
 There is no step 3. Every engine this library hands back has a real per-frame
 timestamp table; a clip that cannot get one is refused with a clear error.
@@ -88,7 +87,8 @@ show — rather than play a clip it would have to guess about:
   whose *codec* WebCodecs cannot decode — uncompressed, MJPEG — is refused here
   too: AVI has no native fallback, so an index it cannot decode from is useless.)
 - **An indexing pass that ran out of its budget** (`indexTimeoutMilliseconds` /
-  `indexMaxBytes`, see the WebM section). A partial table is a wrong table.
+  `indexMaxBytes`, see the WebM and MKV section). A partial table is a wrong
+  table.
 - **A browser without `requestVideoFrameCallback`, when the clip must play
   natively.** Even a perfect index cannot say which frame a `<video>` element is
   showing without the presented-frame clock, so the native path refuses rather
@@ -96,8 +96,16 @@ show — rather than play a clip it would have to guess about:
   stalls while the picture is frozen). The clock has shipped everywhere current
   — Safari 15.4+, Firefox 132+, any recent Chromium — and the WebCodecs path
   owns its own clock, so this refusal only bites genuinely outdated browsers,
-  and only for clips WebCodecs cannot take (WebM/Ogg, or MP4 with no
-  WebCodecs).
+  and only for clips WebCodecs cannot take (Ogg, a Matroska codec we cannot
+  configure, or a clip whose codec this browser's `VideoDecoder` rejects).
+- **An element that loads the clip's metadata and then never presents a frame.**
+  A browser that can demux a container but cannot decode what is inside it
+  reports no error at all: it parses the metadata, goes quiet with every byte in
+  hand, and simply never produces a picture (WebKit does this with AV1 in WebM).
+  With no deadline that is an unbounded wait inside `load()` — a spinner that
+  spins forever with nothing to show the user — so the native path gives up after
+  ten seconds *of no progress at all*. Bytes still arriving keep rearming the
+  deadline, so a slow download is never cut off by it.
 - **A container whose table disagrees with what the element actually presents**
   (a trimming edit list the browser mis-times, a truncated file whose tail the
   scan never saw). Caught at load by comparing durations and calibrating the
@@ -132,7 +140,7 @@ to make the same prediction itself (flagging an upload for server-side
 transcoding, say): `detectBrowserEngine()`, `isTenBitHevc(codecString)`, and
 `webCodecsMayFailMidStream(codecString, browserEngine)`.
 
-### WebM
+### WebM and MKV
 
 mp4box only speaks ISOBMFF, so WebM used to land on step 3 and get silently
 wrong frame numbers on any clip that was not really constant-frame-rate. It does
@@ -140,6 +148,27 @@ not have to: Matroska stores every frame's presentation timestamp in plain sight
 (a cluster's timestamp plus each block's signed 16-bit offset from it), so the
 engine reads them itself, skipping every block's payload. No decoding, no
 dependency.
+
+That pass walks past every block *header*, and a block header is also where the
+frame's byte range and its keyframe flag are — so it records those too, and reads
+the track's `CodecID` and `CodecPrivate` for a decoder configuration. A WebM or
+MKV therefore indexes into the same full decode table an MP4 does, and plays
+through WebCodecs: the engine-owned clock, and `bitmapForFrame()` for named-frame
+pixels, on containers that used to get neither. For an `.mkv` on Safari or iOS
+this is the difference between playing and not: WebKit demuxes no Matroska at
+all, so the clip used to be indexed perfectly and then refused by the only
+element that could have shown it.
+
+Five codecs get a configuration — H.264, HEVC, VP8, VP9 and AV1 — and the work is
+not the sample table but the codec *string*, which must state the profile, level
+and bit depth exactly. Each codec keeps them somewhere different (the
+`avcC`/`hvcC`/`av1C` in `CodecPrivate`; for VP9, its own first keyframe's
+uncompressed header, plus a level computed from the picture size and frame rate),
+so every field is read rather than assumed — an over-claimed profile is the same
+dishonest yes this library exists to avoid. Anything else in a Matroska file
+(MPEG-4 ASP, a VFW-wrapped oddity) yields no configuration and keeps the
+frame-exact `<video>` tier it always had. That is the difference from AVI, which
+has no such tier and must therefore refuse what it cannot configure.
 
 The catch is that Matroska keeps no central sample table — the timestamps live
 next to the frames, and `Cues` indexes only keyframes — so there is no way to
@@ -201,9 +230,10 @@ ones do.
 Ogg (Theora video) is indexed by the engine's own page scan, `src/ogg.js`,
 the same shape as the Matroska scan: a sequential full-file pass reading page
 headers and counting frame packets, no decoding, budget and progress and cache
-included. An Ogg index carries timestamps but no sample table, so like WebM it
-plays through the `<video>` element — in browsers that still ship a Theora
-decoder.
+included. Unlike the Matroska scan it stops at the timestamps: an Ogg index
+carries no sample table, so Ogg plays only through the `<video>` element — in
+browsers that still ship a Theora decoder. There is nothing lost by that, since
+no browser's WebCodecs decodes Theora either.
 
 ### AVI
 
@@ -212,10 +242,10 @@ and is the one container that is **WebCodecs-only, with no native fallback**:
 Chromium and Firefox refuse AVI through a `<video>` element outright, and while
 some builds of WebKit happen to play it, that is not something to rely on across
 browsers. So AVI gets no tier 2, and an AVI index is useless unless it can drive
-tier 1 — which is why `src/avi.js` (unlike the WebM and Ogg scans) builds a full
-decode-order sample table *and* a decoder configuration, the same shape mp4box
-produces for MP4. A decodable AVI plays through WebCodecs; an AVI whose codec
-WebCodecs cannot decode is refused, since there is nothing to fall back to.
+tier 1 — so an AVI whose codec WebCodecs cannot decode is refused, since there is
+nothing to fall back to. (The Matroska scan builds the same shape of table, but
+refuses nothing on those grounds: a Matroska codec we cannot configure still has
+the `<video>` tier.)
 
 Indexing an AVI does **not** read the whole file: its index (the legacy `idx1`
 table, or the OpenDML `indx`/`ix##` hierarchical index that files over ~2 GB use)
@@ -261,7 +291,7 @@ Cheap indexes (a classic MP4's few range reads) are never stored.
 
 ```html
 <!-- mp4box.js must be loaded first to index MP4s (it provides the MP4Box and
-     DataStream globals). WebM indexing is built in and needs nothing. -->
+     DataStream globals). WebM/MKV, Ogg and AVI indexing are built in. -->
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch. -->
 <script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.0.0/exact-video-engine.js"></script>
@@ -326,7 +356,7 @@ plays through.
 | `displayElement` | The canvas or `<video>` the engine presents into. |
 | `tier` | What this engine got, e.g. `webcodecs` or `native (container index, presented clock)`. Useful for a dev label. |
 | `frameIndexIsExact` | True on every engine `createBestEngine` returns (a clip that could not be indexed is refused instead). Goes false only if the runtime watcher later catches the table disagreeing with the frames actually presented, alongside a fatal `errormessage`. |
-| `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when the index carries no decoder configuration (WebM, Ogg). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. |
+| `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when the index carries no decoder configuration (Ogg, or a Matroska codec we do not configure). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. |
 | `failed` | True once the engine can no longer stand behind its output: an unrecoverable `VideoDecoder` error (`VideoEngine`), or the container index caught disagreeing with the presented frames during playback (`NativeVideoEngine`). Both also emit a fatal `errormessage`. |
 | `destroy()` | Release resources when done (decoders are a limited browser resource). |
 | `resizeCanvas()` | Re-size the canvas backing store to its parent and repaint (`VideoEngine`); a no-op on `NativeVideoEngine`, where CSS `object-fit` handles it. `update()` already does this every tick, so you rarely need to call it — a pane that gains its size *after* the clip loads (a host that reveals the player only once it is ready) is handled without you having to get the timing right. |
@@ -337,7 +367,8 @@ plays through.
 for a frame (coded orientation, possibly downscaled for display — apply
 `rotation` yourself). `NativeVideoEngine` has no equivalent: a `<video>` element
 cannot hand back a frame you can name. Hosts that need pixels should check
-`frameIndexIsExact` first.
+`tier` first — the WebCodecs engine is what has them, and which clips reach it
+depends on the browser as well as the container.
 
 This is also how you use `VideoEngine` with no UI at all — to pull a thumbnail
 out of a video someone is uploading, say. Hand it a canvas that is not in the
@@ -410,7 +441,7 @@ changes which frames are *available*, only how many are held in memory at once.
 
 Also exported: `ContainerIndex` (`ContainerIndex.fromSource(source, {timeoutMilliseconds,
 maxBytes})` builds the frame table on its own, for hosts that want the timestamps
-without an engine — it sniffs MP4 vs WebM vs Ogg from the bytes, and reports
+without an engine — it sniffs MP4 vs Matroska vs Ogg vs AVI from the bytes, and reports
 which it found in `containerFormat` and whether the result is rich enough to
 decode from in `supportsWebCodecs`), and `UrlRangeReader` / `FileRangeReader`,
 the random-access byte readers.
@@ -542,14 +573,26 @@ lands.
 **Frame index** walks every frame of the counter clips through each engine and
 checks that asking for frame `n` both puts frame `n` on screen and reports
 frame `n` back. Ground truth is the pixels: each frame identifies itself by the
-position of a white bar, so nothing is taken on trust from a clock. The clips
-are chosen to make the index's exactness falsifiable:
+position of a white bar, so nothing is taken on trust from a clock. Each case
+also pins which *tier* the ladder landed on, because a case that checked only
+frames would pass just as happily on the fallback — which is exactly what the
+WebM cases used to do. The clips are chosen to make the index's exactness
+falsifiable:
 
 - `counter-vfr.mp4` is variable-frame-rate: no assumed constant rate maps it
   correctly, so all 30 frames landing right proves the real timestamp table is
   in charge.
 - `counter-vfr.webm` is the same 30 frames in a container mp4box cannot parse,
-  so it exercises the engine's own Matroska scan.
+  so it exercises the engine's own Matroska scan — on both tiers, since that scan
+  now feeds WebCodecs as well.
+- `counter-vfr.mkv` is those frames as H.264 in Matroska: playable *only* through
+  WebCodecs on WebKit, which demuxes no Matroska at all, so it fails outright if
+  the Matroska sample table regresses.
+- `counter-vp8.webm` and `counter-av1.webm` cover the other codec strings the
+  Matroska path derives. AV1 is also the suite's one asserted *refusal*: WebKit
+  decodes it in neither WebCodecs nor `<video>`, and the engine must say so
+  promptly rather than wait on an element that reports no error and never
+  presents a frame.
 - `counter-vfr-fragmented.mp4` is the same 30 frames with the sample table
   scattered across `moof` fragments, so it exercises the fragmented-MP4 pass.
 - `counter-cfr.ogv` exercises the Ogg page scan, in browsers that still decode
@@ -557,6 +600,17 @@ are chosen to make the index's exactness falsifiable:
 - `counter-elst.mp4` carries an edit list, so its first frame presents at
   `mediaTime` 0.133 rather than 0. It passes only if the timeline calibration is
   genuinely finding that offset instead of getting away with a zero one.
+
+**Matroska table** (plain Node) checks the half of that index a browser walk
+cannot see: that every frame's recorded byte range lies inside the file, that no
+two overlap, that length-prefixed samples tile exactly into NAL units (a range
+off by one byte cannot), and that each codec string comes out exactly right —
+`vp09.00.10.08`, `hvc1.1.6.L30.90`, `av01.0.00M.08`. A subtly wrong sample table
+can still decode into right-looking frames, which is why this is not left to the
+pixel walk. It is also where HEVC-in-Matroska is covered at all: Playwright's
+Chromium ships no HEVC decoder and its WebKit fails 8-bit HEVC identically in MP4
+and MKV, so a browser case would pin a property of the test browsers rather than
+of this engine.
 
 The refusal side — a WebM given no indexing time must be refused with a clear
 error, not approximated — is pinned by **robustness**, and the **index cache**

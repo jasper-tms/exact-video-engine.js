@@ -31,6 +31,12 @@ import { detectBrowserEngine } from './decode-support.js';
 //    here if the caller did not supply one) and the presented-frame clock, and
 //    refuses the clip otherwise rather than report guessed frame numbers.
 // ==================================================================
+// How long the <video> element may go with no sign of progress — no bytes
+// arriving, no frame, no error — before load() gives up on it (see
+// _loadElement, which rearms this on every 'progress' event, so a slow download
+// is never cut off by it).
+const LOAD_STALL_MILLISECONDS = 10000;
+
 export class NativeVideoEngine extends EventTarget {
   constructor(videoElement) {
     super();
@@ -132,7 +138,8 @@ export class NativeVideoEngine extends EventTarget {
     return 'native (container index, presented clock)';
   }
   // Same contract as VideoEngine.codecString. Null when the index carries no
-  // decoder configuration (WebM's does not).
+  // decoder configuration (Ogg's does not, nor a Matroska track whose codec we
+  // could not configure).
   get codecString() {
     return (this._index && this._index.decoderConfig)
       ? this._index.decoderConfig.codec : null;
@@ -308,13 +315,31 @@ export class NativeVideoEngine extends EventTarget {
     }
   }
 
+  // Hand the clip to the element and wait for its first frame ('loadeddata'), an
+  // error, or a stall.
+  //
+  // The stall case is not theoretical and is not covered by 'error': a browser
+  // that can DEMUX a container but cannot DECODE what is inside it parses the
+  // metadata, reports no error at all, and simply never produces a frame. (WebKit
+  // does exactly this with AV1 in WebM: readyState stops at HAVE_METADATA,
+  // networkState goes idle with every byte already in hand, and nothing further
+  // ever happens.) With no deadline that is an unbounded await inside load() —
+  // the host's spinner spins forever, with no error to show and no fallback to
+  // take. So the wait is bounded, and the bound is on a LACK OF PROGRESS rather
+  // than on wall-clock time: a media element fires 'progress' while bytes are
+  // arriving, so a genuinely slow download keeps rearming the deadline and is
+  // never cut off, while an element that has gone quiet without a frame is
+  // refused with an error naming the likely cause.
   _loadElement(source) {
     const url = (typeof source === 'string')
       ? source : (this._objectUrl = URL.createObjectURL(source));
     return new Promise((resolve, reject) => {
+      let timer = null;
       const cleanup = () => {
+        clearTimeout(timer);
         this.video.removeEventListener('loadeddata', onLoaded);
         this.video.removeEventListener('error', onError);
+        this.video.removeEventListener('progress', onProgress);
       };
       const onLoaded = () => {
         cleanup();
@@ -324,8 +349,23 @@ export class NativeVideoEngine extends EventTarget {
         resolve();
       };
       const onError = () => { cleanup(); reject(new Error('native <video> load failed')); };
+      const onStalled = () => {
+        const readyState = this.video.readyState;
+        cleanup();
+        reject(new Error('NativeVideoEngine: this browser loaded the clip\'s metadata '
+          + `but never presented a frame (readyState ${readyState}), and reported no `
+          + 'error — the signature of a container it can demux carrying a codec it '
+          + 'cannot decode. The clip is refused rather than left loading forever.'));
+      };
+      const armStallTimer = () => {
+        clearTimeout(timer);
+        timer = setTimeout(onStalled, LOAD_STALL_MILLISECONDS);
+      };
+      const onProgress = () => armStallTimer();   // bytes arriving: keep waiting
       this.video.addEventListener('loadeddata', onLoaded);
       this.video.addEventListener('error', onError);
+      this.video.addEventListener('progress', onProgress);
+      armStallTimer();
       this.video.src = url;
       this.video.load();
     });

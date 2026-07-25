@@ -29,10 +29,17 @@
 // ==================================================================
 
 // Bump this on ANY change to the serialized payload's shape (a renamed field, a
-// new required field, a changed representation). A stored payload whose
-// schemaVersion does not match is treated as a miss, so an old entry from a
-// previous build can never be hydrated into a struct it no longer fits.
-export const INDEX_CACHE_SCHEMA_VERSION = 1;
+// new required field, a changed representation) — or to what a given container's
+// payload MEANS. A stored payload whose schemaVersion does not match is treated
+// as a miss, so an old entry from a previous build can never be hydrated into a
+// struct it no longer fits.
+//
+// 2: Matroska indexes gained a sample table and a decoderConfig. Version 1
+//    entries for a WebM/MKV are structurally valid but semantically stale — they
+//    carry timestamps alone, which would pin a cached clip to the <video> tier
+//    forever while a freshly built index of the same file plays through
+//    WebCodecs. A miss and a rebuild is the honest answer.
+export const INDEX_CACHE_SCHEMA_VERSION = 2;
 
 const DATABASE_NAME = 'exact-video-engine-index-cache';
 const DATABASE_VERSION = 1;
@@ -269,8 +276,8 @@ export function serializeContainerIndex(index) {
     frameDurations: index.frameDurations,
     displayToDecode: index.displayToDecode,
     // Decode-order sample table: an array of small plain objects
-    // ({offset, size, isSync, cts, duration}), or null for a WebM/Ogg index
-    // that has timestamps but no sample table. Stored as-is either way.
+    // ({offset, size, isSync, cts, duration}), or null for an index that has
+    // timestamps but no sample table (Ogg). Stored as-is either way.
     samples: index.samples,
     keyframeDecodeIndices: index.keyframeDecodeIndices,
     decoderConfig,
@@ -281,9 +288,8 @@ export function serializeContainerIndex(index) {
     duration: index.duration,
     trimmedByEditList: index.trimmedByEditList,
     // Whether the sample bytes are Annex B (AVI's H.264) and need converting to
-    // AVCC in the decode path. Absent in pre-AVI payloads, which are all AVCC
-    // ISOBMFF or sample-table-less WebM/Ogg, so the constructor default (false) is
-    // correct for them and no schema bump is required.
+    // AVCC in the decode path. False for every other container we index —
+    // ISOBMFF and Matroska both store length-prefixed samples.
     samplesAreAnnexB: index.samplesAreAnnexB,
   };
 }
@@ -323,9 +329,9 @@ export function hydrateContainerIndex(index, payload) {
   // exists for an ISOBMFF index that has a sample table. Rebuild it exactly as
   // container-index.js's _buildTables does — key Math.round(cts * 1e6 /
   // timescale), value the display index — so a hydrated index answers
-  // microsToDisplay lookups identically to a freshly-built one. A WebM/Ogg
-  // index has no samples, so it keeps microsToDisplay null, matching the
-  // freshly-built shape.
+  // microsToDisplay lookups identically to a freshly-built one. An index with no
+  // sample table (Ogg) keeps microsToDisplay null, matching the freshly-built
+  // shape.
   if (payload.samples && payload.displayToDecode) {
     const microsToDisplay = new Map();
     for (let displayIndex = 0; displayIndex < payload.displayToDecode.length; displayIndex++) {

@@ -179,10 +179,10 @@ export class VideoEngine extends EventTarget {
       const index = options.index
         || await ContainerIndex.fromSource(source);
       if (!index.supportsWebCodecs) {
-        // A WebM index: exact timestamps, but no sample table and no decoder
-        // configuration, so there is nothing here to decode from. The clip is
-        // fine — it belongs on NativeVideoEngine, which the same index makes
-        // frame-exact anyway.
+        // An Ogg index, or a Matroska one whose codec we could not configure:
+        // exact timestamps, but nothing here to decode from. The clip is fine —
+        // it belongs on NativeVideoEngine, which the same index makes frame-exact
+        // anyway.
         throw new Error(`this ${index.containerFormat} container carries no `
           + 'sample table for WebCodecs to decode from');
       }

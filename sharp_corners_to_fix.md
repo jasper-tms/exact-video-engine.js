@@ -21,10 +21,11 @@ quietly stops being guaranteed for that clip.
 
 ## Things that silently degrade (no crash, but wrong or fuzzy)
 
-**3. WebM never gets the precise engine.**
-A `.webm` clip only ever plays through the plain browser player, and is only
-frame-accurate if the app finishes reading it in time. It can never hand back
-pixels for a named frame (see #6).
+**FIXED: 3. WebM never gets the precise engine.**
+A `.webm` clip only ever played through the plain browser player: frame-exact
+(index or refuse), but with no owned clock and no way to hand back pixels for a
+named frame. An `.mkv` was worse than inexact — on iPhone/Safari, which cannot
+open Matroska at all, it simply would not play. Ogg is still in this boat.
 
 **FIXED: 4. Big WebM files (or slow connections) time out into approximate mode.**
 Opening a WebM means reading through the whole file. A large one, or a slow
@@ -40,8 +41,13 @@ numbers. No error, just silently not frame-exact.
 
 **6. You can't pull a specific frame's pixels unless you're on the precise engine.**
 Thumbnail generation, "extract frames A–B," grabbing a still off an upload — all
-only work on the precise (MP4-on-capable-browser) path. On iPhone/Safari, on
-WebM, or on any trimmed/unindexed clip, that capability just isn't there.
+only work on the precise path. That path now covers MP4, AVI, and WebM/MKV
+(H.264, HEVC, VP8, VP9, AV1) wherever the browser's decoder can take the codec.
+What is left out: Ogg, anything in a Matroska file we cannot build a decoder
+configuration for, and any clip whose codec this browser decodes only in its
+`<video>` element (10-bit HEVC on Safari, AV1 on Safari). (Trimmed clips no
+longer belong on this list — they get the precise engine wherever it's available
+— and unindexed clips no longer exist: they're refused outright.)
 
 **7. The precise engine has no audio.**
 Frame-exact playback is silent. Anything needing synced sound is stuck on the
@@ -74,6 +80,16 @@ distant cloud bucket, even for a small file.
   browser exposes the trimmed clip's `<video>` timeline inconsistently (WebKit),
   the native path refuses the clip rather than lie (the WebCodecs path plays the
   same trim frame-exact there).
+- [x] **3** — WebM/MKV never gets the precise engine — *fixed.* The Matroska
+  scan already walked past every block header on its way through the file, which
+  is where a frame's byte range and keyframe flag are; it now records them, and
+  reads the track's CodecID/CodecPrivate for a decoder configuration (H.264,
+  HEVC, VP8, VP9, AV1). So a WebM/MKV reaches the WebCodecs engine — owned clock,
+  `bitmapForFrame` — and an `.mkv` plays on Safari/iOS at all, which it did not
+  before. A codec we cannot configure honestly keeps the frame-exact `<video>`
+  tier it always had; nothing is guessed to widen the set. Ogg stays native-only
+  (no browser's WebCodecs decodes Theora, so a sample table would have nothing to
+  feed).
 - [x] **4** — WebM timeouts degrade — *fixed (index or refuse).* A pass that
   blows its budget now refuses with a clear error instead of degrading to
   guessed frame numbers; the host can raise `indexTimeoutMilliseconds`, and the

@@ -32,11 +32,14 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 //     empty at `onReady`, so we keep feeding the whole file through mp4box, and
 //     that full-file pass takes the same budget/progress contract as the WebM and
 //     Ogg scans below.
-//   * WebM/Matroska goes through readMatroskaFrameTable, which streams the file to
-//     collect the timestamps alone. So a WebM index is deliberately a lesser
-//     thing: it carries the per-frame presentation-time table (which is what makes
-//     the <video> path exact, and the whole point of the exercise) but no sample
-//     table and no decoder configuration.
+//   * WebM/Matroska goes through readMatroskaFrameTable, a sequential pass over the
+//     whole file (Matroska keeps no central sample table) that reads every block's
+//     header and skips its payload. It collects the presentation times AND the
+//     frames' byte ranges and keyframe flags, so a Matroska index is a full one:
+//     the <video> path gets its exact timestamps, and WebCodecs gets a sample table
+//     plus a decoderConfig built from the track's CodecID/CodecPrivate — for H.264,
+//     HEVC, VP8, VP9 and AV1. A codec we cannot configure leaves decoderConfig null
+//     and the clip on the <video> tier, which is always available for Matroska.
 //   * Ogg/Theora goes through readOggFrameTable, likewise a full-file pass for the
 //     timestamps alone, and likewise no sample table or decoder configuration —
 //     Ogg plays only through the native <video> path (Firefox), never WebCodecs.
@@ -52,8 +55,9 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 //     An AVI whose codec WebCodecs cannot decode yields no decoderConfig and is
 //     refused cleanly, since it has no native fallback to land on.
 //
-// `supportsWebCodecs` is how the ladder in createBestEngine tells the decodable
-// indexes (ISOBMFF and AVI) from the native-only ones (WebM and Ogg).
+// `supportsWebCodecs` is how the ladder in createBestEngine tells a decodable
+// index (ISOBMFF, AVI, and Matroska with a codec we can configure) from a
+// native-only one (Ogg, and Matroska carrying something more exotic).
 //
 // Anything else (HLS and other segmented delivery, raw elementary streams) still
 // fails here, and the <video> element cannot play those either. That is the
@@ -104,10 +108,11 @@ export class ContainerIndex {
     this.cacheWritePromise = null;
   }
 
-  // Only an ISOBMFF index has what a VideoDecoder needs (the byte ranges of
-  // every sample, and the codec's configuration). A WebM index has timestamps
-  // and nothing else, so it can make the <video> element exact but cannot feed
-  // the WebCodecs engine.
+  // Has this index what a VideoDecoder needs — the byte ranges of every sample,
+  // and the codec's configuration? True for ISOBMFF, AVI, and Matroska whose
+  // codec we could configure; false for Ogg (timestamps only) and for a Matroska
+  // track whose codec we could not, both of which can still make the <video>
+  // element frame-exact.
   get supportsWebCodecs() { return !!(this.samples && this.decoderConfig); }
 
   // options.timeoutMilliseconds / options.maxBytes / options.onProgress /
@@ -403,10 +408,12 @@ export class ContainerIndex {
     report(reader.size);   // a final 100% tick, so the host can settle the bar
   }
 
-  // Ogg/Theora: the timestamps and nothing else (see readOggFrameTable), the same
-  // shape as the Matroska path. samples, keyframeDecodeIndices and decoderConfig
-  // stay null, so supportsWebCodecs reports false and the clip plays only through
-  // the native <video> element (Firefox).
+  // Ogg/Theora: the timestamps and nothing else (see readOggFrameTable) — the one
+  // container here that still indexes to a timestamps-only table. samples,
+  // keyframeDecodeIndices and decoderConfig stay null, so supportsWebCodecs
+  // reports false and the clip plays only through the native <video> element
+  // (Firefox). No browser's WebCodecs decodes Theora, so there would be nothing
+  // to feed a sample table to.
   async _demuxOgg(reader, options) {
     const table = await readOggFrameTable(reader, options);
     this.containerFormat = 'ogg';
@@ -474,9 +481,17 @@ export class ContainerIndex {
     return { start, end: start + spanMediaUnits };
   }
 
-  // WebM: the timestamps and nothing else (see readMatroskaFrameTable). The
-  // fields a decoder would need — samples, keyframeDecodeIndices,
-  // decoderConfig — stay null, and supportsWebCodecs reports false because of it.
+  // WebM/Matroska: a full decode-order sample table, and a decoderConfig
+  // whenever the track's codec is one we can configure honestly (H.264, HEVC,
+  // VP8, VP9, AV1 — see buildMatroskaDecoderConfig). The scan that reads the
+  // timestamps walks past every block header anyway, and a block header is where
+  // the frame's byte range and keyframe flag are, so the decode table costs
+  // almost nothing on top of the table that makes the <video> element exact.
+  //
+  // Where this differs from AVI: a Matroska track whose codec we cannot
+  // configure still yields a perfectly good index, because Matroska HAS a native
+  // tier. decoderConfig stays null, supportsWebCodecs reports false, and the clip
+  // plays frame-exact through the <video> element exactly as it did before.
   async _demuxMatroska(reader, options) {
     const table = await readMatroskaFrameTable(reader, options);
     this.containerFormat = 'matroska';
@@ -485,32 +500,45 @@ export class ContainerIndex {
     // Matroska carries no display rotation matrix (the element applies none
     // either, so the two agree).
     this.rotation = 0;
+    this.decoderConfig = table.decoderConfig;
+    // Matroska stores H.264 and HEVC the way an MP4 does — length-prefixed, with
+    // the parameter sets out of band in CodecPrivate — so unlike AVI there is
+    // nothing to convert before the decoder.
+    this.samplesAreAnnexB = false;
 
-    // Blocks are written in decode order, and a Matroska block's timestamp is
-    // already a *presentation* time, so with B-frames the times can arrive out
-    // of order. Sorting gives display order — the same normalization the
-    // ISOBMFF path does by sorting on composition time.
-    const times = table.presentationTimes.slice().sort((a, b) => a - b);
-    const n = times.length;
-    const firstTime = times[0];
-
-    this.presentationTimes = new Float64Array(n);
-    this.frameDurations = new Float64Array(n);
-    for (let d = 0; d < n; d++) this.presentationTimes[d] = times[d] - firstTime;
-    // Matroska stores no per-frame duration, so a frame lasts until the next one
-    // starts. The last frame has no next one: fall back to the track's declared
-    // DefaultDuration, then to the previous frame's, then to a nominal 30fps.
-    for (let d = 0; d < n - 1; d++) {
-      this.frameDurations[d] = this.presentationTimes[d + 1] - this.presentationTimes[d];
+    // Matroska stores no per-frame duration: a frame lasts until the next one
+    // starts. Synthesize that in the container's own integer tick units, in
+    // PRESENTATION order (blocks are written in decode order, and a Matroska
+    // block's timestamp is already a presentation time, so with B-frames they can
+    // arrive out of order). The last frame has no next one: fall back to the
+    // track's declared DefaultDuration, then to the previous frame's, then to a
+    // nominal 30 fps.
+    const frames = table.frames;
+    const timescale = table.timescale;
+    const displayOrder = frames.map((frame, k) => k)
+      .sort((a, b) => frames[a].ticks - frames[b].ticks);
+    const durations = new Array(frames.length);
+    for (let d = 0; d < displayOrder.length - 1; d++) {
+      durations[displayOrder[d]] =
+        frames[displayOrder[d + 1]].ticks - frames[displayOrder[d]].ticks;
     }
-    if (n) {
-      this.frameDurations[n - 1] = table.defaultFrameDuration
-        || (n > 1 ? this.frameDurations[n - 2] : 1 / 30);
+    if (displayOrder.length) {
+      const last = displayOrder[displayOrder.length - 1];
+      durations[last] = (table.defaultFrameDuration * timescale)
+        || (displayOrder.length > 1 ? durations[displayOrder[displayOrder.length - 2]] : timescale / 30);
     }
 
-    this.numFrames = n;
-    this.duration = n
-      ? this.presentationTimes[n - 1] + this.frameDurations[n - 1] : 0;
+    // The same sample-record shape the ISOBMFF and AVI paths hand to
+    // _buildTables, which does the rest: display order, the decode/display
+    // mappings, and the normalized timelines.
+    this._buildTables(frames.map((frame, k) => ({
+      offset: frame.offset,
+      size: frame.size,
+      is_sync: frame.isSync,
+      cts: frame.ticks,
+      duration: durations[k],
+      timescale,
+    })), null);
   }
 
   // AVI: unlike the WebM and Ogg paths above, this builds a FULL decode-order

@@ -9,7 +9,7 @@ The engine has two backends behind one interface: `VideoEngine` (WebCodecs —
 demuxes with mp4box, decodes every frame itself) and `NativeVideoEngine`
 (`<video>` element — the browser decodes and presents). `createBestEngine()`
 picks per clip. This skill records which real-world video formats each backend
-can actually decode (tested 2026-07, engine v1.6.x).
+can actually decode (tested 2026-07; the container rows through engine v2.2).
 
 ## Frame-exactness is decided by the index, not the decoder
 
@@ -24,9 +24,17 @@ Container indexing is codec-agnostic and separate from decoding:
   a full-file read with the same deadline/byte budget and progress reporting as
   the WebM scan, but a complete index (sample table included), so fragmented
   clips play through WebCodecs like classic ones.
-- **WebM** and **Ogg/Theora** have built-in indexers (timestamps only, no
-  sample table to decode from), so they never get the WebCodecs backend — only
-  frame-exact `<video>` playback.
+- **WebM/Matroska** has a built-in indexer that (since v2.2) builds a FULL
+  decode table — byte ranges and keyframe flags, not just timestamps — plus a
+  decoderConfig from the track's CodecID/CodecPrivate, for H.264, HEVC, VP8, VP9
+  and AV1. So WebM and MKV now reach the WebCodecs backend. A CodecID we cannot
+  configure honestly yields no decoderConfig and keeps the frame-exact `<video>`
+  tier, which Matroska always has — unlike AVI. Matroska stores H.264/HEVC
+  length-prefixed with the parameter sets in CodecPrivate, so there is no Annex B
+  conversion on this path.
+- **Ogg/Theora** still indexes to timestamps only, so it never gets the WebCodecs
+  backend — only frame-exact `<video>` playback. Nothing is lost: no browser's
+  WebCodecs decodes Theora either.
 - No index at all → the clip is REFUSED with a clear error ("index or refuse",
   see the README). There is no approximate mode: `declaredFrameRate` /
   `allowApproximate` no longer exist, and every engine `createBestEngine`
@@ -81,16 +89,32 @@ WebKit reports the same *"Decoder failure"* string for two different problems:
 | HEVC 8-bit | works | works where the platform decodes HEVC | works |
 | **HEVC Main 10** (iPhone HDR default, with or without Dolby Vision profile 8) | **dishonest yes: claims support, decodes frame 0, dies mid-stream** | works | works |
 | H.264 High 10 (no hardware decoder exists anywhere) | honest no at load → auto-fallback to native, invisible | works (software decode) | works (software decode) |
-| WebM (VP8/VP9) | never attempted (no mp4box index) | never attempted | works where the browser plays WebM |
+| VP8 and VP9 **in WebM** | works | works | works where the browser plays WebM |
+| AV1 **in WebM** | honest no at load → falls to native, which also cannot decode it → clip refused | works | Chromium/Firefox play it; WebKit does not |
+| H.264 8-bit **in MKV** | works (the ONLY way it plays there — WebKit demuxes no Matroska) | works | Chromium and Firefox play MKV; WebKit does not |
+| HEVC 8-bit **in MKV** | same as HEVC in MP4 on the same browser — the container is not the variable (see below) | (Playwright's Chromium has no HEVC decoder at all) | Chromium/Firefox demux MKV but still need an HEVC decoder |
 | H.264 8-bit **in AVI** (engine ships AVCC + `avcC`; see the AVI section) | works | works | AVI is WebCodecs-only — no native tier used |
+
+Tested 2026-07-25 (engine v2.2, the Matroska sample table) on Playwright's
+chromium/firefox/webkit, counter clip in each container, all 30 frames exact via
+the `webcodecs` tier except where noted.
+
+**HEVC on Playwright's WebKit fails in MP4 and MKV alike** — `isConfigSupported`
+says yes, frame 0 decodes, frame 1 never arrives — for 8-bit Main, not just the
+10-bit case below. Since the identical clip fails the identical way in both
+containers, this is a property of that WebKit build's HEVC decoding, NOT of the
+Matroska path; do not chase it as a container bug. It is also why the HEVC
+Matroska fixture is a parser-only test rather than a browser walk.
 
 ## AVI-in-WebCodecs: WebKit needs AVCC, not Annex B (a second dishonest yes)
 
-AVI (added v2.1) is the one container the WebCodecs backend reaches WITHOUT
-mp4box: `src/avi.js` parses the RIFF/`idx1`/OpenDML index itself and builds a
-full sample table plus a `decoderConfig`. The engine treats AVI as **WebCodecs-
-only**: Chromium and Firefox refuse AVI through a `<video>` element outright, so
-there is no reliable native tier, and `createBestEngine` never uses one for AVI.
+AVI (added v2.1) reaches the WebCodecs backend without mp4box — `src/avi.js`
+parses the RIFF/`idx1`/OpenDML index itself and builds a full sample table plus a
+`decoderConfig` — as does Matroska since v2.2. What is unique to AVI is that it is
+**WebCodecs-only**: Chromium and Firefox refuse AVI through a `<video>` element
+outright, so there is no reliable native tier, and `createBestEngine` never uses
+one for AVI. (Matroska always has that tier, which is why an unconfigurable codec
+refuses the clip in AVI and merely stays native in Matroska.)
 
 ffmpeg writes H.264-in-AVI as an **Annex B** bitstream (NAL start codes, SPS/PPS
 in-band on each keyframe). The naive config — the `avc1.PPCCLL` codec string with

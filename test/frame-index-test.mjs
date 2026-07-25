@@ -14,7 +14,14 @@
 //
 // counter-vfr.webm: the same claim for a container mp4box cannot parse. Passing
 // here means the engine's own Matroska scan really did read the frame
-// timestamps out of the clusters.
+// timestamps out of the clusters — on the <video> element, and (since the scan
+// also builds a sample table) through WebCodecs, where the same clip's frames
+// must come out right from byte ranges the scan recorded.
+//
+// counter-vfr.mkv: H.264 in Matroska, which no browser under test can play
+// through a <video> element on every engine — WebKit demuxes no Matroska at all.
+// It is only playable because the Matroska index feeds WebCodecs, so this case
+// failing means that path is gone, not merely slower.
 //
 // counter-vfr-fragmented.mp4: the same claim for a fragmented MP4, whose sample
 // table lives in moof boxes scattered through the file rather than a central
@@ -48,9 +55,15 @@ import { launchBrowser, serverBase, browserName } from './harness.mjs';
 // start at the beginning and 10 for counter-elst.mp4, whose head was cut (see
 // make-test-clips.sh). Pinning it is what turns "the frames advance one for
 // one" into "the frames are the right frames".
-// Every case pins TWO things per browser: `exact`, whether all frames land on
-// screen and are reported correctly, and `indexExact`, whether the engine kept
-// the container's real timestamp table (engine.frameIndexIsExact).
+// Every case pins THREE things per browser: `exact`, whether all frames land on
+// screen and are reported correctly; `indexExact`, whether the engine kept the
+// container's real timestamp table (engine.frameIndexIsExact); and `tier`, which
+// engine the ladder landed on. The tier is what keeps a case honest about HOW it
+// passed — the WebM cases below passed for a year on the <video> fallback, and
+// would have gone on passing there after the Matroska sample table was supposed
+// to put them on WebCodecs. A case may instead expect `refused`, for a (clip,
+// browser) pair with no working tier at all, where the engine must error rather
+// than play it wrongly or wait forever.
 //
 // The `chromium` values are the reference. `webkit` and `firefox` inherit them
 // unless they name an override, and every override below is a REAL, empirically
@@ -71,14 +84,20 @@ import { launchBrowser, serverBase, browserName } from './harness.mjs';
 //     are skipped with the reason inline; the behaviour they would show is
 //     covered by a sibling case that does run on WebKit.
 const CASES = [
-  { file: 'counter-cfr.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
-  { file: 'counter-cfr.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true },
+  { file: 'counter-cfr.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  { file: 'counter-cfr.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native' },
 
-  { file: 'counter-vfr.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
-  { file: 'counter-vfr.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true },
+  { file: 'counter-vfr.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  { file: 'counter-vfr.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native' },
 
-  { file: 'counter-elst.mp4', mode: 'webcodecs', firstBar: 10, exact: true, indexExact: true },
+  { file: 'counter-elst.mp4', mode: 'webcodecs', firstBar: 10, exact: true, indexExact: true,
+    tier: 'webcodecs' },
   { file: 'counter-elst.mp4', mode: 'native-index', firstBar: 10, exact: true, indexExact: true,
+    tier: 'native',
     // Skipped on WebKit: the edit list makes the calibrated first seek land
     // inside the frame the element already presents, and WebKit fires no
     // requestVideoFrameCallback for it, so the wait hangs. The edit-list
@@ -95,8 +114,10 @@ const CASES = [
   // presented window, so display frame 0 IS source frame 5 (firstBar 5) and there
   // are 20 frames. Passing on the pixels proves the trim is applied identically on
   // both engines: the same 20 frames, correctly numbered, whichever path plays.
-  { file: 'counter-trimming-elst.mp4', mode: 'webcodecs', firstBar: 5, exact: true, indexExact: true },
+  { file: 'counter-trimming-elst.mp4', mode: 'webcodecs', firstBar: 5, exact: true, indexExact: true,
+    tier: 'webcodecs' },
   { file: 'counter-trimming-elst.mp4', mode: 'native-index', firstBar: 5, exact: true, indexExact: true,
+    tier: 'native',
     // Gecko presents a trimmed clip UNTRIMMED (source frame k where the
     // container's presentation window says k + trim) while reporting the trimmed
     // duration — a whole-frame shift no runtime check can see, empirically
@@ -121,13 +142,43 @@ const CASES = [
   // WebM, which mp4box cannot parse at all: these run on the engine's own
   // Matroska cluster scan. The VFR clip is the one an assumed constant frame
   // rate would mismap; it must be exact from the real cluster timestamps.
-  { file: 'counter-cfr.webm', mode: 'native-index', firstBar: 0, exact: true, indexExact: true },
-  { file: 'counter-vfr.webm', mode: 'native-index', firstBar: 0, exact: true, indexExact: true },
-  // Asking for WebCodecs on a WebM: the index has timestamps but no sample table
-  // to decode from, so the ladder must fall back to the <video> element and keep
-  // the index — exact frames, native tier. (If this ever reports the webcodecs
-  // tier, the gate on supportsWebCodecs has stopped working.)
-  { file: 'counter-vfr.webm', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
+  { file: 'counter-cfr.webm', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native' },
+  { file: 'counter-vfr.webm', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native' },
+
+  // The same clips through WebCodecs. The Matroska scan builds a full decode
+  // table (byte ranges and keyframe flags, not just timestamps) and a decoder
+  // configuration, so a WebM now reaches the engine-owned clock and named-frame
+  // pixels that used to be MP4-only. The `tier` assertion is the point of these
+  // cases: without it they would pass just as well on the <video> fallback, which
+  // is exactly what they used to do.
+  { file: 'counter-vfr.webm', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  // VP8, whose codec string ('vp8') is the one the parser does not have to derive
+  // from anything — and the codec a browser's own MediaRecorder writes.
+  { file: 'counter-vp8.webm', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  // AV1: the codec string comes out of the av1C record, which also serves as the
+  // decoder description. WebKit decodes AV1 in neither WebCodecs nor <video>, so
+  // there the whole ladder runs out and the clip is refused — asserted, not
+  // skipped, because a refusal that took forever instead of failing fast would be
+  // just as broken (the <video> element reaches HAVE_METADATA, reports no error,
+  // and simply never presents a frame; NativeVideoEngine's stall guard is what
+  // turns that into an error).
+  { file: 'counter-av1.webm', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs',
+    webkit: { refused: 'WebKit decodes AV1 in neither WebCodecs nor <video>' } },
+
+  // H.264 in Matroska (.mkv) — the clip that was not merely inexact before this
+  // work but UNPLAYABLE on WebKit, which demuxes no Matroska at all: the engine
+  // built a perfect index and then had only a <video> element that refused the
+  // file. Now the sample table feeds WebCodecs and it plays everywhere. The
+  // variable-rate frames make the timestamps falsifiable, and the pixels landing
+  // right prove the byte ranges: a sample offset off by a byte does not decode to
+  // the correct bar, it decodes to nothing.
+  { file: 'counter-vfr.mkv', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
 
   // Fragmented MP4 (empty_moov: every sample lives in a moof fragment, not the
   // moov). The engine detects fragmentation and reads the whole file so every
@@ -135,10 +186,14 @@ const CASES = [
   // both engines; the VARIABLE-rate twin is the real proof — its frames mismap
   // under any assumed constant rate, so exactness means the per-frame timestamps
   // really came out of the truns.
-  { file: 'counter-fragmented.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
-  { file: 'counter-fragmented.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true },
-  { file: 'counter-vfr-fragmented.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
-  { file: 'counter-vfr-fragmented.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true },
+  { file: 'counter-fragmented.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  { file: 'counter-fragmented.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native' },
+  { file: 'counter-vfr-fragmented.mp4', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  { file: 'counter-vfr-fragmented.mp4', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native' },
 
   // AVI, indexed by the engine's own RIFF parser (src/avi.js). AVI has NO native
   // <video> tier — no browser plays it through a <video> element — so the only
@@ -152,8 +207,10 @@ const CASES = [
   // and then fails the decode — see the decode-support matrix), and AVCC decodes
   // on all three engines, so there is no per-browser override: all three play via
   // the webcodecs tier, exactly like the MP4 H.264 webcodecs cases.
-  { file: 'counter-idx1.avi', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
-  { file: 'counter-opendml.avi', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true },
+  { file: 'counter-idx1.avi', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  { file: 'counter-opendml.avi', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
 
   // A WebM whose FIRST track entry is audio and whose second is the video (the
   // 30 counter frames). The Matroska cluster scan must skip the audio track and
@@ -161,7 +218,8 @@ const CASES = [
   // count audio packets as frames and every mapping here would be wrong. Exact
   // frames prove the scan really keyed on the video track number. firstBar is 0:
   // the video frames are the counter frames, unshifted.
-  { file: 'counter-audio-first.webm', mode: 'native-index', firstBar: 0, exact: true, indexExact: true },
+  { file: 'counter-audio-first.webm', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native' },
 
   // Ogg/Theora, indexed by the engine's own page scan (src/ogg.js). Only the
   // native path exists for Ogg (no sample table for WebCodecs), and only where
@@ -172,22 +230,35 @@ const CASES = [
   // test/ogg-table-test.mjs; what this adds is timeline agreement with a real
   // element's demuxer where one exists.
   { file: 'counter-cfr.ogv', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native',
     skipIfUnplayable: true },
   { file: 'counter-vorbis-audio.ogv', mode: 'native-index', firstBar: 0, exact: true, indexExact: true,
+    tier: 'native',
     skipIfUnplayable: true },
 ];
 
 // Resolve a case's expectation for the browser under test: the base (chromium)
 // values, overridden by any browser-specific entry. Returns null to signal skip.
+//
+// `refused` is an expectation in its own right, not a skip: some (clip, browser)
+// pairs have no tier left — no WebCodecs decoder and no <video> decoder — and the
+// engine must say so with an error rather than play them wrongly or hang waiting
+// for a frame that never comes.
 function expectationFor(testCase) {
   const override = testCase[browserName] || {};
   if (override.skip) {
     console.log(`SKIP ${testCase.file} ${testCase.mode} on ${browserName}: ${override.skip}`);
     return null;
   }
+  if (override.refused) return { refused: override.refused };
   return {
     exact: override.exact !== undefined ? override.exact : testCase.exact,
     indexExact: override.indexExact !== undefined ? override.indexExact : testCase.indexExact,
+    // Which engine the ladder must land on: 'webcodecs' or 'native'. Optional —
+    // a case without it asserts only the frames — but it is what keeps a case
+    // from passing on the wrong tier, which is how a container silently losing
+    // its WebCodecs path would otherwise go unnoticed.
+    tier: override.tier !== undefined ? override.tier : testCase.tier,
   };
 }
 
@@ -243,6 +314,18 @@ for (const testCase of CASES) {
 
   const { result, err } = await runCaseExpectingIndex(file, mode, expectation.indexExact);
 
+  // A case expected to be refused: an error is the pass, and the driver's
+  // per-case timeout (which reports no result at all) is the fail, so a hang
+  // cannot masquerade as a refusal.
+  if (expectation.refused) {
+    const refused = !!err;
+    if (!refused) failures += 1;
+    console.log(`${refused ? 'PASS' : 'FAIL'} ${file} ${mode}: `
+      + `${refused ? 'refused' : 'was NOT refused'} — ${expectation.refused}`
+      + (refused ? '' : ` [${result ? result.tier : 'no result: timed out'}]`));
+    continue;
+  }
+
   if (result && result.unplayable) {
     if (testCase.skipIfUnplayable) {
       console.log(`SKIP ${file} ${mode}: ${browserName} cannot decode ${result.mime}`);
@@ -264,7 +347,10 @@ for (const testCase of CASES) {
   const exact = wrongPixels.length === 0 && wrongReports.length === 0;
   const exactOk = exact === expectation.exact;
   const indexOk = result.frameIndexIsExact === expectation.indexExact;
-  const pass = exactOk && indexOk;
+  // engine.tier reads 'webcodecs' or 'native (container index, presented clock)',
+  // so match on the leading word.
+  const tierOk = !expectation.tier || result.tier.startsWith(expectation.tier);
+  const pass = exactOk && indexOk && tierOk;
   if (!pass) failures += 1;
 
   const count = result.rows.length;
@@ -272,8 +358,9 @@ for (const testCase of CASES) {
     ? `all ${count} frames exact`
     : `${wrongPixels.length}/${count} wrong frame on screen, `
       + `${wrongReports.length}/${count} misreported`;
-  const mismatch = indexOk ? ''
-    : ` — frameIndexIsExact=${result.frameIndexIsExact}, expected ${expectation.indexExact}`;
+  const mismatch = (indexOk ? ''
+    : ` — frameIndexIsExact=${result.frameIndexIsExact}, expected ${expectation.indexExact}`)
+    + (tierOk ? '' : ` — tier '${result.tier}', expected the ${expectation.tier} tier`);
   console.log(`${pass ? 'PASS' : 'FAIL'} ${file} ${mode}: ${detail}`
     + ` [${result.tier}, frameIndexIsExact=${result.frameIndexIsExact}]${mismatch}`);
 

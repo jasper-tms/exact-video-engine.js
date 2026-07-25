@@ -310,3 +310,53 @@ ffmpeg -y -loglevel error -f lavfi \
 echo "Wrote AVI fixtures:"
 ls clips/counter-idx1.avi clips/counter-opendml.avi clips/counter-avi-25fps.avi \
     clips/counter-rawvideo.avi clips/counter-mjpeg.avi
+
+# ==================================================================
+# Matroska codec fixtures (added when the Matroska scan gained a sample table,
+# so WebM/MKV can reach the WebCodecs engine). One clip per codec the parser
+# builds a decoder configuration for, because the hard part is not the sample
+# table — it is deriving a codec STRING that is right: each codec keeps its
+# profile, level and bit depth somewhere different (CodecPrivate for H.264, HEVC
+# and AV1; the first keyframe's own header for VP9; nowhere at all for VP8).
+# Self-contained block so it stays cleanly separable.
+#
+# The VP9 cases are the counter-*.webm clips generated further up, which this
+# work turned from native-only into WebCodecs-decodable.
+# ==================================================================
+
+# 1. H.264 in Matroska — the case that was not merely inexact before but
+# UNPLAYABLE on WebKit, which demuxes no Matroska at all: the engine indexed the
+# clip perfectly and then had only a <video> element that refused it. Now it
+# decodes through WebCodecs on every browser. The variable-rate counter clip
+# (remuxed, frames copied) so exactness cannot come from an assumed frame rate,
+# and so the sample byte ranges are proven by the pixels: a wrong offset decodes
+# to garbage or nothing, not to the right bar.
+ffmpeg -y -loglevel error -i clips/counter-vfr.mp4 -c copy clips/counter-vfr.mkv
+
+# 2. VP8 in WebM — the codec with no setup record and no profile to derive, so
+# its codec string is the plain 'vp8' WebCodecs registers. Also what a browser's
+# own MediaRecorder writes, which makes it a common real-world upload.
+ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
+    -pix_fmt yuv420p -c:v libvpx -b:v 0 -crf 4 -qmin 0 -qmax 20 -g 10 clips/counter-vp8.webm
+
+# 3. AV1 in WebM — the codec string is read out of the av1C record (profile,
+# level, tier, bit depth are fixed bit positions in its first three bytes) and the
+# record doubles as the decoder description. Chromium and Firefox decode it
+# through WebCodecs; WebKit decodes AV1 in neither WebCodecs nor <video>, so it
+# refuses the clip, which frame-index-test.mjs asserts rather than skips.
+ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
+    -pix_fmt yuv420p -c:v libsvtav1 -crf 5 -preset 8 -g 10 clips/counter-av1.webm
+
+# 4. HEVC in Matroska — for the codec-string builder, which has the most to get
+# right of any of them (profile space, the bit-REVERSED compatibility flags, tier,
+# level, and the trailing constraint bytes: 'hvc1.1.6.L30.90'). Deliberately a
+# parser-only fixture, not a browser case: Playwright's Chromium ships no HEVC
+# decoder and its WebKit fails 8-bit HEVC identically in MP4 and MKV, so a browser
+# case here would pin a property of the test browsers rather than of this engine.
+# matroska-table-test.mjs is where it earns its keep.
+ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
+    -pix_fmt yuv420p -c:v libx265 -x265-params log-level=none -crf 5 -g 10 \
+    clips/counter-hevc.mkv
+
+echo "Wrote Matroska codec fixtures:"
+ls clips/counter-vfr.mkv clips/counter-vp8.webm clips/counter-av1.webm clips/counter-hevc.mkv

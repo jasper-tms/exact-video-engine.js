@@ -47,22 +47,24 @@
 // browser, choosing between two exact tiers and otherwise refusing:
 //
 //   1. container index + WebCodecs   exact index, exact decode, owned clock
-//                                    (MP4 and AVI: WebM's and Ogg's indexes carry
-//                                    timestamps but no sample table to decode from)
+//                                    (MP4, AVI, and WebM/MKV whose codec we can
+//                                    configure; Ogg's index carries timestamps
+//                                    but no sample table to decode from)
 //   2. container index + <video>     exact index, browser decode + presentation
-//                                    (MP4, WebM, Ogg), read out through the
+//                                    (MP4, WebM/MKV, Ogg), read out through the
 //                                    presented-frame clock (requestVideoFrameCallback)
 //
 // AVI is the one container that lives ONLY in tier 1: browsers do not reliably
 // play AVI through a <video> element (Chromium and Firefox refuse it outright), so
-// AVI gets no tier-2 fallback. That is exactly why its index (unlike WebM's and
-// Ogg's) must be a full decode-order sample table with a decoder configuration —
-// the WebCodecs engine is the only tier that plays it — and why an AVI whose codec
-// WebCodecs cannot decode is refused rather than handed to a <video> element that
-// would (on most browsers) reject it too. AVI's H.264 is stored Annex B but
-// decoded in AVCC mode: WebKit's WebCodecs claims to support Annex B and then
-// fails the decode, so the sample table's bytes are converted to length-prefixed
-// AVCC (see src/avi.js) — the one form every engine decodes.
+// AVI gets no tier-2 fallback. That is why an AVI whose codec WebCodecs cannot
+// decode is refused rather than handed to a <video> element that would (on most
+// browsers) reject it too, while a Matroska track we cannot configure simply
+// stays on tier 2. AVI's H.264 is stored Annex B but decoded in AVCC mode:
+// WebKit's WebCodecs claims to support Annex B and then fails the decode, so the
+// sample table's bytes are converted to length-prefixed AVCC (see src/avi.js) —
+// the one form every engine decodes. Matroska needs none of that: it stores
+// H.264 and HEVC length-prefixed already, with the parameter sets in
+// CodecPrivate.
 //
 // There is no third tier. A clip whose container we cannot index, or a native-path
 // browser with no requestVideoFrameCallback (so no exact presented-frame clock),
@@ -314,10 +316,17 @@ function createRangeReader(source) {
 // ==================================================================
 
 // Bump this on ANY change to the serialized payload's shape (a renamed field, a
-// new required field, a changed representation). A stored payload whose
-// schemaVersion does not match is treated as a miss, so an old entry from a
-// previous build can never be hydrated into a struct it no longer fits.
-const INDEX_CACHE_SCHEMA_VERSION = 1;
+// new required field, a changed representation) — or to what a given container's
+// payload MEANS. A stored payload whose schemaVersion does not match is treated
+// as a miss, so an old entry from a previous build can never be hydrated into a
+// struct it no longer fits.
+//
+// 2: Matroska indexes gained a sample table and a decoderConfig. Version 1
+//    entries for a WebM/MKV are structurally valid but semantically stale — they
+//    carry timestamps alone, which would pin a cached clip to the <video> tier
+//    forever while a freshly built index of the same file plays through
+//    WebCodecs. A miss and a rebuild is the honest answer.
+const INDEX_CACHE_SCHEMA_VERSION = 2;
 
 const DATABASE_NAME = 'exact-video-engine-index-cache';
 const DATABASE_VERSION = 1;
@@ -554,8 +563,8 @@ function serializeContainerIndex(index) {
     frameDurations: index.frameDurations,
     displayToDecode: index.displayToDecode,
     // Decode-order sample table: an array of small plain objects
-    // ({offset, size, isSync, cts, duration}), or null for a WebM/Ogg index
-    // that has timestamps but no sample table. Stored as-is either way.
+    // ({offset, size, isSync, cts, duration}), or null for an index that has
+    // timestamps but no sample table (Ogg). Stored as-is either way.
     samples: index.samples,
     keyframeDecodeIndices: index.keyframeDecodeIndices,
     decoderConfig,
@@ -566,9 +575,8 @@ function serializeContainerIndex(index) {
     duration: index.duration,
     trimmedByEditList: index.trimmedByEditList,
     // Whether the sample bytes are Annex B (AVI's H.264) and need converting to
-    // AVCC in the decode path. Absent in pre-AVI payloads, which are all AVCC
-    // ISOBMFF or sample-table-less WebM/Ogg, so the constructor default (false) is
-    // correct for them and no schema bump is required.
+    // AVCC in the decode path. False for every other container we index —
+    // ISOBMFF and Matroska both store length-prefixed samples.
     samplesAreAnnexB: index.samplesAreAnnexB,
   };
 }
@@ -608,9 +616,9 @@ function hydrateContainerIndex(index, payload) {
   // exists for an ISOBMFF index that has a sample table. Rebuild it exactly as
   // container-index.js's _buildTables does — key Math.round(cts * 1e6 /
   // timescale), value the display index — so a hydrated index answers
-  // microsToDisplay lookups identically to a freshly-built one. A WebM/Ogg
-  // index has no samples, so it keeps microsToDisplay null, matching the
-  // freshly-built shape.
+  // microsToDisplay lookups identically to a freshly-built one. An index with no
+  // sample table (Ogg) keeps microsToDisplay null, matching the freshly-built
+  // shape.
   if (payload.samples && payload.displayToDecode) {
     const microsToDisplay = new Map();
     for (let displayIndex = 0; displayIndex < payload.displayToDecode.length; displayIndex++) {
@@ -627,7 +635,8 @@ function hydrateContainerIndex(index, payload) {
   return true;
 }
 // ==================================================================
-// Matroska/WebM frame table — the second way to get real timestamps.
+// Matroska/WebM frame table — the second way to get real timestamps, and (since
+// v2.2) a full decode table as well.
 //
 // mp4box only speaks ISOBMFF, so a WebM clip used to land on the assumed
 // constant frame rate, and got silently wrong frame numbers whenever that
@@ -652,6 +661,25 @@ function hydrateContainerIndex(index, payload) {
 // not a loss of exactness for our purpose: the browser's own demuxer computes
 // the `mediaTime` it reports from these very integers, so our table and its
 // clock agree by construction, which is the only thing frame mapping needs.
+//
+// WHY THIS PASS ALSO RECORDS BYTE RANGES. The scan walks past every block
+// header on its way through the file, and a block header is exactly where the
+// frame's byte range and its keyframe flag are. Reading the timestamp and
+// throwing the other two away cost WebM and MKV the WebCodecs engine entirely:
+// they got frame-exact <video> playback and nothing else — no named-frame pixels
+// (bitmapForFrame), no engine-owned clock, and on WebKit, which demuxes no
+// Matroska at all, no playback whatsoever for an MKV this parser had just
+// indexed perfectly. So the pass now builds the ISOBMFF-shaped decode table too
+// (offset, size, isSync per frame, in decode order), and buildMatroskaDecoderConfig
+// turns the track's CodecID and CodecPrivate into a WebCodecs decoder
+// configuration. Both are nearly free on top of a pass that was already touching
+// every block header; the only extra read is the first keyframe's opening bytes
+// for a VP9 track, whose profile and bit depth live in the frame itself.
+//
+// A codec we cannot honestly configure yields no decoderConfig, which leaves the
+// clip exactly where it was before: frame-exact on the <video> element. Unlike
+// AVI (WebCodecs or nothing), Matroska always has that tier to fall back to, so
+// this parser never has to guess at a configuration to keep a clip playable.
 // ==================================================================
 
 // Element IDs, stored with their EBML length marker, exactly as they appear in
@@ -670,11 +698,14 @@ const EBML_ID = {
   video: 0xE0,
   pixelWidth: 0xB0,
   pixelHeight: 0xBA,
+  codecId: 0x86,
+  codecPrivate: 0x63A2,
   cluster: 0x1F43B675,
   clusterTimestamp: 0xE7,
   simpleBlock: 0xA3,
   blockGroup: 0xA0,
   block: 0xA1,
+  referenceBlock: 0xFB,
   cues: 0x1C53BB6B,
   chapters: 0x1043A770,
   tags: 0x1254C367,
@@ -783,6 +814,27 @@ async function readEbmlUnsigned(cursor, byteCount) {
   return value;
 }
 
+// An element's raw bytes, copied out of the cursor's buffer. Used for
+// CodecPrivate (the avcC/hvcC/av1C the decoder configuration is built from),
+// which is a few hundred bytes at most — the copy is deliberate, so the bytes
+// outlive the buffer the next refill overwrites.
+async function readEbmlBytes(cursor, byteCount) {
+  await cursor.ensure(byteCount);
+  const bytes = new Uint8Array(byteCount);
+  for (let i = 0; i < byteCount; i++) bytes[i] = cursor.peek(i);
+  cursor.advance(byteCount);
+  return bytes;
+}
+
+// An ASCII element (CodecID, e.g. 'V_VP9'), with any trailing padding zeros
+// dropped — Matroska allows a writer to pad a string element out.
+async function readEbmlString(cursor, byteCount) {
+  const bytes = await readEbmlBytes(cursor, byteCount);
+  let end = bytes.length;
+  while (end > 0 && bytes[end - 1] === 0) end -= 1;
+  return String.fromCharCode(...bytes.subarray(0, end));
+}
+
 // A progress report for a WebM index pass, handed to options.onProgress. The
 // only long-running index (an MP4's moov is a handful of range reads whatever
 // the clip's length), so this is where a "please wait" indicator earns its
@@ -801,7 +853,9 @@ function formatProgress(progress) {
   return `Indexing… ${percent}% (~${seconds}s left)`;
 }
 
-// Read the timestamps of every frame of the file's first video track.
+// Read the frame table of the file's first video track: every frame's
+// presentation timestamp, byte range, and keyframe flag, plus the track's codec
+// and a WebCodecs decoder configuration where we can build one honestly.
 //
 // options.timeoutMilliseconds  give up after this long (Infinity: never)
 // options.maxBytes             refuse a file bigger than this (Infinity: any)
@@ -810,9 +864,21 @@ function formatProgress(progress) {
 //                              more at 100% when it finishes. A throw from it is
 //                              swallowed so a buggy indicator cannot abort a load.
 //
-// Returns {presentationTimes (seconds, file order), defaultFrameDuration,
-// videoWidth, videoHeight}. Throws IndexBudgetExceededError when it runs out of
-// budget, and a plain Error when the file is not one we can read.
+// Returns:
+//   { presentationTimes,      // seconds, file (decode) order
+//     frames,                 // decode order: {offset, size, isSync, ticks},
+//                             //   offset/size being the frame's own bytes in
+//                             //   the file, ticks its timestamp in timescale units
+//     timescale,              // ticks per second (1000 for the default 1 ms scale)
+//     defaultFrameDuration,   // seconds, from DefaultDuration (0 if absent)
+//     videoWidth, videoHeight,
+//     codecId,                // Matroska CodecID, e.g. 'V_VP9'
+//     decoderConfig }         // WebCodecs configuration, or null for a codec we
+//                             //   cannot configure (the clip then plays through
+//                             //   the <video> element, as it always did)
+//
+// Throws IndexBudgetExceededError when it runs out of budget, and a plain Error
+// when the file is not one we can read.
 async function readMatroskaFrameTable(reader, options = {}) {
   const timeoutMilliseconds = (options.timeoutMilliseconds === undefined)
     ? Infinity : options.timeoutMilliseconds;
@@ -836,8 +902,13 @@ async function readMatroskaFrameTable(reader, options = {}) {
     defaultFrameDuration: 0,
     videoWidth: 0,
     videoHeight: 0,
+    codecId: '',
+    codecPrivate: null,
     clusterTimestamp: 0,
-    presentationTimes: [],
+    // Decode order, one entry per video frame: its timestamp in timescale ticks
+    // (integer, exactly as the container writes it) and the byte range of its
+    // encoded data, which the WebCodecs engine later fetches on demand.
+    frames: [],
   };
 
   // Build and hand a progress report to onProgress, never letting the indicator
@@ -853,7 +924,7 @@ async function readMatroskaFrameTable(reader, options = {}) {
     try {
       onProgress({
         bytesRead, totalBytes: reader.size, fraction, elapsedMs, etaMs,
-        framesFound: state.presentationTimes.length,
+        framesFound: state.frames.length,
       });
     } catch (progressError) {
       // An indicator that throws is the host's bug, not ours; keep indexing.
@@ -906,11 +977,58 @@ async function readMatroskaFrameTable(reader, options = {}) {
     cursor.position = contentStart + size;
   }
 
-  if (!state.presentationTimes.length) {
+  if (!state.frames.length) {
     throw new Error('no video frames found in this WebM');
   }
   report(reader.size);   // a final 100% tick, so the host can settle the bar
-  return state;
+
+  const presentationTimes =
+    state.frames.map((frame) => frame.ticks * state.timestampScaleSeconds);
+
+  // VP9 writes no CodecPrivate in practice, and its profile and bit depth are
+  // needed for the codec string — they live in the first keyframe's own
+  // uncompressed header, so fetch just its opening bytes. One small read, after
+  // a pass that has already been over the whole file.
+  let firstKeyframeBytes = null;
+  if (needsFirstKeyframeBytes(state.codecId)) {
+    const keyframe = state.frames.find((frame) => frame.isSync) || state.frames[0];
+    const wanted = Math.min(keyframe.size, VP9_HEADER_PROBE_BYTES);
+    if (wanted > 0) {
+      firstKeyframeBytes = new Uint8Array(
+        await reader.read(keyframe.offset, keyframe.offset + wanted - 1));
+    }
+  }
+
+  return {
+    presentationTimes,
+    frames: state.frames,
+    timescale: 1 / state.timestampScaleSeconds,
+    defaultFrameDuration: state.defaultFrameDuration,
+    videoWidth: state.videoWidth,
+    videoHeight: state.videoHeight,
+    codecId: state.codecId,
+    decoderConfig: buildMatroskaDecoderConfig({
+      codecId: state.codecId,
+      codecPrivate: state.codecPrivate,
+      videoWidth: state.videoWidth,
+      videoHeight: state.videoHeight,
+      firstKeyframeBytes,
+      frameRate: estimateFrameRate(presentationTimes, state.defaultFrameDuration),
+    }),
+  };
+}
+
+// Frames per second, for the one place a codec string needs it (a VP9 level is
+// defined by luma samples per second as well as per picture). DefaultDuration is
+// authoritative when the track declares it; otherwise the average over the
+// clip's own timestamps, which is what a variable-rate clip's level should be
+// judged on anyway. Falls back to 30 for a single-frame clip.
+function estimateFrameRate(presentationTimes, defaultFrameDuration) {
+  if (defaultFrameDuration > 0) return 1 / defaultFrameDuration;
+  const count = presentationTimes.length;
+  if (count < 2) return 30;
+  const span = presentationTimes[count - 1] - presentationTimes[0];
+  return span > 0 ? (count - 1) / span : 30;
 }
 
 async function readMatroskaSegment(cursor, end, state) {
@@ -966,6 +1084,7 @@ async function readMatroskaTracks(cursor, end, state) {
 async function readMatroskaTrackEntry(cursor, end, state) {
   let trackNumber = null, trackType = null;
   let defaultDuration = 0, width = 0, height = 0;
+  let codecId = '', codecPrivate = null;
 
   while (cursor.position < end && !cursor.atEnd) {
     const id = await readEbmlId(cursor);
@@ -975,6 +1094,8 @@ async function readMatroskaTrackEntry(cursor, end, state) {
 
     if (id === EBML_ID.trackNumber) trackNumber = await readEbmlUnsigned(cursor, size);
     else if (id === EBML_ID.trackType) trackType = await readEbmlUnsigned(cursor, size);
+    else if (id === EBML_ID.codecId) codecId = await readEbmlString(cursor, size);
+    else if (id === EBML_ID.codecPrivate) codecPrivate = await readEbmlBytes(cursor, size);
     else if (id === EBML_ID.defaultDuration) {
       defaultDuration = (await readEbmlUnsigned(cursor, size)) / 1e9;   // ns
     } else if (id === EBML_ID.video) {
@@ -997,6 +1118,8 @@ async function readMatroskaTrackEntry(cursor, end, state) {
   state.defaultFrameDuration = defaultDuration;
   state.videoWidth = width;
   state.videoHeight = height;
+  state.codecId = codecId;
+  state.codecPrivate = codecPrivate;
 }
 
 async function readMatroskaCluster(cursor, end, state) {
@@ -1017,29 +1140,285 @@ async function readMatroskaCluster(cursor, end, state) {
     if (id === EBML_ID.clusterTimestamp) {
       state.clusterTimestamp = await readEbmlUnsigned(cursor, size);
     } else if (id === EBML_ID.simpleBlock) {
-      await readMatroskaBlock(cursor, state);
+      // A SimpleBlock says outright whether it is a keyframe, in the top bit of
+      // its flags byte.
+      await readMatroskaBlock(cursor, contentStart + size, state, null);
     } else if (id === EBML_ID.blockGroup) {
-      // A BlockGroup wraps a Block plus its references; the Block's header is
-      // laid out exactly like a SimpleBlock's, and only its timestamp interests
-      // us (keyframe flags do not: this index never feeds a decoder).
+      // A BlockGroup wraps a Block plus its references. The Block's header is
+      // laid out exactly like a SimpleBlock's but carries NO keyframe flag —
+      // what marks a BlockGroup's frame as a delta is the presence of a
+      // ReferenceBlock beside it, which may appear either side of the Block. So
+      // record the frame first and settle its keyframe flag once the whole group
+      // has been read.
       const groupEnd = contentStart + size;
+      let frameIndex = -1;
+      let sawReferenceBlock = false;
       while (cursor.position < groupEnd && !cursor.atEnd) {
         const childId = await readEbmlId(cursor);
         const childSize = await readEbmlVariableInt(cursor);
         if (childSize === null) throw new Error('unknown-size element in BlockGroup');
         const childStart = cursor.position;
-        if (childId === EBML_ID.block) await readMatroskaBlock(cursor, state);
+        if (childId === EBML_ID.block) {
+          frameIndex = await readMatroskaBlock(cursor, childStart + childSize, state, false);
+        } else if (childId === EBML_ID.referenceBlock) {
+          sawReferenceBlock = true;
+        }
         cursor.position = childStart + childSize;
       }
+      if (frameIndex >= 0 && !sawReferenceBlock) state.frames[frameIndex].isSync = true;
     }
     cursor.position = contentStart + size;
   }
 }
 
+// ==================================================================
+// From a Matroska track to a WebCodecs decoder configuration.
+//
+// Matroska names its codec in CodecID and carries whatever out-of-band setup the
+// decoder needs in CodecPrivate — for H.264 and HEVC that is literally the same
+// `avcC` / `hvcC` bytes an MP4 carries (so frames are length-prefixed here too,
+// and need no Annex B conversion, unlike AVI), and for AV1 the `av1C` record.
+// VP8 and VP9 carry no setup at all: their frames are self-describing.
+//
+// What WebCodecs additionally wants is a fully qualified codec STRING, and that
+// is the only real work: 'vp9' is not a valid VideoDecoder codec, 'vp09.00.31.08'
+// is, and the profile, level, and bit depth in it have to be right. Getting one
+// wrong is not a cosmetic error — an over-claimed profile is exactly the
+// dishonest-yes shape this library exists to avoid — so every field below is READ
+// from the bitstream or the setup record, never assumed, and a codec we cannot
+// read all of yields null. Null is a safe answer here in a way it never is for
+// AVI: the clip keeps the frame-exact <video> tier it has always had.
+// ==================================================================
+
+// How much of the first keyframe to fetch for a VP9 track. Its uncompressed
+// header — the only place VP9 states its profile and bit depth — is within the
+// first dozen bytes; a kilobyte is slack for a frame that opens with anything
+// unexpected, and is one read either way.
+const VP9_HEADER_PROBE_BYTES = 1024;
+
+// Codec setup lives in CodecPrivate for every codec we support except VP9, which
+// keeps its profile and bit depth in the frames themselves.
+function needsFirstKeyframeBytes(codecId) {
+  return codecId === 'V_VP9';
+}
+
+// The WebCodecs decoder configuration for a Matroska video track, or null when
+// the track's codec is one we cannot configure honestly (an unsupported CodecID,
+// or a supported one whose CodecPrivate is missing or malformed).
+function buildMatroskaDecoderConfig(track) {
+  const { codecId, codecPrivate, videoWidth, videoHeight,
+          firstKeyframeBytes, frameRate } = track;
+  if (!videoWidth || !videoHeight) return null;
+
+  const configuration = (codec, description) => {
+    const config = {
+      codec,
+      codedWidth: videoWidth,
+      codedHeight: videoHeight,
+      optimizeForLatency: true,
+    };
+    if (description) config.description = description;
+    return config;
+  };
+
+  if (codecId === 'V_MPEG4/ISO/AVC') {
+    // CodecPrivate IS the avcC box body — the same bytes mp4box hands back for an
+    // MP4 — so the codec string comes out of it exactly as it does there.
+    if (!codecPrivate || codecPrivate.length < 4) return null;
+    const hex = (value) => value.toString(16).padStart(2, '0');
+    return configuration(
+      `avc1.${hex(codecPrivate[1])}${hex(codecPrivate[2])}${hex(codecPrivate[3])}`,
+      codecPrivate);
+  }
+
+  if (codecId === 'V_MPEGH/ISO/HEVC') {
+    const codec = hevcCodecString(codecPrivate);
+    return codec ? configuration(codec, codecPrivate) : null;
+  }
+
+  if (codecId === 'V_VP8') {
+    // VP8 has exactly one profile and one bit depth, so its codec string is the
+    // whole story (WebCodecs registers it as plain 'vp8').
+    return configuration('vp8');
+  }
+
+  if (codecId === 'V_VP9') {
+    const codec = vp9CodecString(firstKeyframeBytes, videoWidth, videoHeight, frameRate);
+    return codec ? configuration(codec) : null;
+  }
+
+  if (codecId === 'V_AV1') {
+    const codec = av1CodecString(codecPrivate);
+    // The av1C record holds the sequence header the decoder needs when the
+    // frames do not repeat it, so pass it through as the description.
+    return codec ? configuration(codec, codecPrivate) : null;
+  }
+
+  return null;   // MPEG-4 ASP, Theora-in-Matroska, VFW-wrapped oddities, ...
+}
+
+// The codec string for an HEVC track, from its `hvcC` record (ISO 14496-15
+// §8.3.3.1), in the form ISO 14496-15 Annex E defines and browsers parse:
+//
+//   hvc1.<profile space><profile idc>.<compatibility flags>.<tier><level>.<constraints>
+//   e.g. hvc1.1.6.L93.B0
+//
+// 'hvc1' rather than 'hev1' because Matroska keeps the parameter sets out of band
+// in CodecPrivate, which is precisely what the two four-character codes
+// distinguish. Returns null if the record is too short to read.
+function hevcCodecString(hvcC) {
+  if (!hvcC || hvcC.length < 13) return null;
+  const profileSpace = ['', 'A', 'B', 'C'][(hvcC[1] >> 6) & 0x03];
+  const tierFlag = (hvcC[1] >> 5) & 0x01;
+  const profileIdc = hvcC[1] & 0x1F;
+
+  // The 32 compatibility flags are written most-significant-bit first and read
+  // back reversed, then printed as hex with no leading zeros (so the common
+  // 0x60000000 becomes '6').
+  let compatibility = 0;
+  for (let i = 0; i < 32; i++) {
+    const bit = (hvcC[2 + (i >> 3)] >> (7 - (i & 7))) & 1;
+    compatibility = (compatibility >>> 1) | (bit << 31);
+  }
+
+  // The six constraint bytes, trailing zero bytes dropped, each in hex with no
+  // leading zeros.
+  let lastNonZero = -1;
+  for (let i = 0; i < 6; i++) if (hvcC[6 + i] !== 0) lastNonZero = i;
+  const constraints = [];
+  for (let i = 0; i <= lastNonZero; i++) {
+    constraints.push(hvcC[6 + i].toString(16).toUpperCase());
+  }
+
+  const parts = [
+    `hvc1.${profileSpace}${profileIdc}`,
+    (compatibility >>> 0).toString(16),
+    `${tierFlag ? 'H' : 'L'}${hvcC[12]}`,
+  ];
+  return parts.concat(constraints).join('.');
+}
+
+// The codec string for an AV1 track, from its `av1C` record (AV1 Codec ISO Media
+// File Format Binding §2.3.3), in the form the AV1 codec-string registry defines:
+//
+//   av01.<profile>.<level><tier>.<bit depth>    e.g. av01.0.05M.08
+//
+// Every field is a fixed bit position in the record's first three bytes, so this
+// is a read, not an inference. Returns null if the record is too short.
+function av1CodecString(av1C) {
+  if (!av1C || av1C.length < 3) return null;
+  const profile = (av1C[1] >> 5) & 0x07;
+  const levelIndex = av1C[1] & 0x1F;
+  const tier = (av1C[2] >> 7) & 0x01;
+  const highBitDepth = (av1C[2] >> 6) & 0x01;
+  const twelveBit = (av1C[2] >> 5) & 0x01;
+  // Profile 2 is the only one that reaches 12-bit; elsewhere high_bitdepth means
+  // 10-bit and nothing else.
+  const bitDepth = (profile === 2 && highBitDepth)
+    ? (twelveBit ? 12 : 10) : (highBitDepth ? 10 : 8);
+  return `av01.${profile}.${String(levelIndex).padStart(2, '0')}`
+    + `${tier ? 'H' : 'M'}.${String(bitDepth).padStart(2, '0')}`;
+}
+
+// The codec string for a VP9 track: 'vp09.<profile>.<level>.<bit depth>'.
+//
+// VP9 carries no setup record in practice, so the profile and bit depth are read
+// out of the first keyframe's uncompressed header — the same bytes the decoder
+// itself reads — and the level is computed from the picture size and frame rate
+// against the level table in the VP9 specification (Annex A), which is what a
+// level means. Returns null if the frame is not a readable VP9 keyframe.
+function vp9CodecString(firstKeyframeBytes, width, height, frameRate) {
+  const header = parseVp9KeyframeHeader(firstKeyframeBytes);
+  if (!header) return null;
+  const level = vp9Level(width, height, frameRate);
+  return `vp09.${String(header.profile).padStart(2, '0')}`
+    + `.${String(level).padStart(2, '0')}`
+    + `.${String(header.bitDepth).padStart(2, '0')}`;
+}
+
+// Profile and bit depth from a VP9 keyframe's uncompressed header (VP9 bitstream
+// specification §6.2), which is plain bits at the very start of the frame:
+// frame_marker(2) = 2, then the two profile bits, then — for a keyframe — a sync
+// code, then the colour configuration whose first bit (profiles 2 and 3 only)
+// says 10- or 12-bit. Returns null for anything that is not a VP9 keyframe.
+function parseVp9KeyframeHeader(bytes) {
+  if (!bytes || bytes.length < 6) return null;
+  const reader = new BitReader(bytes);
+  if (reader.read(2) !== 2) return null;                  // frame_marker
+  const profileLowBit = reader.read(1);
+  const profileHighBit = reader.read(1);
+  const profile = (profileHighBit << 1) | profileLowBit;
+  if (profile === 3) reader.read(1);                      // reserved_zero
+  if (reader.read(1)) return null;                        // show_existing_frame
+  if (reader.read(1) !== 0) return null;                  // frame_type: 0 = key
+  reader.read(1);                                         // show_frame
+  reader.read(1);                                         // error_resilient_mode
+  if (reader.read(24) !== 0x498342) return null;          // frame_sync_code
+  let bitDepth = 8;
+  if (profile >= 2) bitDepth = reader.read(1) ? 12 : 10;  // ten_or_twelve_bit
+  return { profile, bitDepth };
+}
+
+// The VP9 level table (VP9 specification Annex A): each level caps a luma sample
+// RATE and a luma picture SIZE, and a stream's level is the lowest one that fits
+// both. Levels are written in the codec string as the level number times ten
+// (level 3.1 is '31').
+const VP9_LEVELS = [
+  { level: 10, maxSampleRate: 829440, maxPictureSize: 36864 },
+  { level: 11, maxSampleRate: 2764800, maxPictureSize: 73728 },
+  { level: 20, maxSampleRate: 4608000, maxPictureSize: 122880 },
+  { level: 21, maxSampleRate: 9216000, maxPictureSize: 245760 },
+  { level: 30, maxSampleRate: 20736000, maxPictureSize: 552960 },
+  { level: 31, maxSampleRate: 36864000, maxPictureSize: 983040 },
+  { level: 40, maxSampleRate: 83558400, maxPictureSize: 2228224 },
+  { level: 41, maxSampleRate: 160432128, maxPictureSize: 2228224 },
+  { level: 50, maxSampleRate: 311951360, maxPictureSize: 8912896 },
+  { level: 51, maxSampleRate: 588251136, maxPictureSize: 8912896 },
+  { level: 52, maxSampleRate: 1176502272, maxPictureSize: 8912896 },
+  { level: 60, maxSampleRate: 1176502272, maxPictureSize: 35651584 },
+  { level: 61, maxSampleRate: 2353004544, maxPictureSize: 35651584 },
+  { level: 62, maxSampleRate: 4706009088, maxPictureSize: 35651584 },
+];
+
+function vp9Level(width, height, frameRate) {
+  const pictureSize = width * height;
+  const sampleRate = pictureSize * (frameRate > 0 ? frameRate : 30);
+  for (const entry of VP9_LEVELS) {
+    if (sampleRate <= entry.maxSampleRate && pictureSize <= entry.maxPictureSize) {
+      return entry.level;
+    }
+  }
+  return VP9_LEVELS[VP9_LEVELS.length - 1].level;   // beyond the table: the top level
+}
+
+// Most-significant-bit-first bit reader, for the handful of bitstream headers
+// read here (VP9's frame header). Reads up to 24 bits at a time, which is all
+// any field above needs.
+class BitReader {
+  constructor(bytes) { this.bytes = bytes; this.position = 0; }
+  read(bitCount) {
+    let value = 0;
+    for (let i = 0; i < bitCount; i++) {
+      const bit = (this.bytes[this.position >> 3] >> (7 - (this.position & 7))) & 1;
+      value = (value << 1) | bit;
+      this.position += 1;
+    }
+    return value;
+  }
+}
+
 // A block header: track number (variable-length), then the frame's timestamp as
-// a signed 16-bit offset from its cluster's, then flags. The payload after it is
-// the encoded frame, which we never read.
-async function readMatroskaBlock(cursor, state) {
+// a signed 16-bit offset from its cluster's, then flags. Everything after the
+// header, up to blockEnd, is the encoded frame — we record where it is and how
+// long it is, and never read a byte of it here.
+//
+// keyframeFlagOverride: null for a SimpleBlock, whose flags byte states outright
+// whether the frame is a keyframe; false for a BlockGroup's Block, which has no
+// such flag (the caller decides from the group's ReferenceBlock).
+//
+// Returns the index of the frame recorded in state.frames, or -1 for a block
+// belonging to another track.
+async function readMatroskaBlock(cursor, blockEnd, state, keyframeFlagOverride) {
   const trackNumber = await readEbmlVariableInt(cursor);
   await cursor.ensure(3);
   const relative = ((cursor.peek(0) << 8) | cursor.peek(1)) << 16 >> 16;   // signed
@@ -1047,15 +1426,22 @@ async function readMatroskaBlock(cursor, state) {
   cursor.advance(3);
 
   if (state.videoTrackNumber === null) throw new Error('WebM cluster before Tracks');
-  if (trackNumber !== state.videoTrackNumber) return;   // audio, subtitles, ...
+  if (trackNumber !== state.videoTrackNumber) return -1;   // audio, subtitles, ...
   // Lacing packs several frames into one block under a single timestamp, so
-  // their individual times would have to be invented from DefaultDuration. It is
-  // an audio feature and essentially never used for video; refuse rather than
-  // hand back timestamps we made up.
+  // their individual times would have to be invented from DefaultDuration — and
+  // their byte ranges parsed out of a lacing header. It is an audio feature and
+  // essentially never used for video; refuse rather than hand back timestamps we
+  // made up.
   if (flags & 0x06) throw new Error('this WebM laces its video blocks');
 
-  state.presentationTimes.push(
-    (state.clusterTimestamp + relative) * state.timestampScaleSeconds);
+  const offset = cursor.position;   // the frame's own bytes start here
+  state.frames.push({
+    offset,
+    size: blockEnd - offset,
+    isSync: (keyframeFlagOverride === null) ? !!(flags & 0x80) : keyframeFlagOverride,
+    ticks: state.clusterTimestamp + relative,
+  });
+  return state.frames.length - 1;
 }
 
 // ==================================================================
@@ -2138,11 +2524,14 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 //     empty at `onReady`, so we keep feeding the whole file through mp4box, and
 //     that full-file pass takes the same budget/progress contract as the WebM and
 //     Ogg scans below.
-//   * WebM/Matroska goes through readMatroskaFrameTable, which streams the file to
-//     collect the timestamps alone. So a WebM index is deliberately a lesser
-//     thing: it carries the per-frame presentation-time table (which is what makes
-//     the <video> path exact, and the whole point of the exercise) but no sample
-//     table and no decoder configuration.
+//   * WebM/Matroska goes through readMatroskaFrameTable, a sequential pass over the
+//     whole file (Matroska keeps no central sample table) that reads every block's
+//     header and skips its payload. It collects the presentation times AND the
+//     frames' byte ranges and keyframe flags, so a Matroska index is a full one:
+//     the <video> path gets its exact timestamps, and WebCodecs gets a sample table
+//     plus a decoderConfig built from the track's CodecID/CodecPrivate — for H.264,
+//     HEVC, VP8, VP9 and AV1. A codec we cannot configure leaves decoderConfig null
+//     and the clip on the <video> tier, which is always available for Matroska.
 //   * Ogg/Theora goes through readOggFrameTable, likewise a full-file pass for the
 //     timestamps alone, and likewise no sample table or decoder configuration —
 //     Ogg plays only through the native <video> path (Firefox), never WebCodecs.
@@ -2158,8 +2547,9 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 //     An AVI whose codec WebCodecs cannot decode yields no decoderConfig and is
 //     refused cleanly, since it has no native fallback to land on.
 //
-// `supportsWebCodecs` is how the ladder in createBestEngine tells the decodable
-// indexes (ISOBMFF and AVI) from the native-only ones (WebM and Ogg).
+// `supportsWebCodecs` is how the ladder in createBestEngine tells a decodable
+// index (ISOBMFF, AVI, and Matroska with a codec we can configure) from a
+// native-only one (Ogg, and Matroska carrying something more exotic).
 //
 // Anything else (HLS and other segmented delivery, raw elementary streams) still
 // fails here, and the <video> element cannot play those either. That is the
@@ -2210,10 +2600,11 @@ class ContainerIndex {
     this.cacheWritePromise = null;
   }
 
-  // Only an ISOBMFF index has what a VideoDecoder needs (the byte ranges of
-  // every sample, and the codec's configuration). A WebM index has timestamps
-  // and nothing else, so it can make the <video> element exact but cannot feed
-  // the WebCodecs engine.
+  // Has this index what a VideoDecoder needs — the byte ranges of every sample,
+  // and the codec's configuration? True for ISOBMFF, AVI, and Matroska whose
+  // codec we could configure; false for Ogg (timestamps only) and for a Matroska
+  // track whose codec we could not, both of which can still make the <video>
+  // element frame-exact.
   get supportsWebCodecs() { return !!(this.samples && this.decoderConfig); }
 
   // options.timeoutMilliseconds / options.maxBytes / options.onProgress /
@@ -2509,10 +2900,12 @@ class ContainerIndex {
     report(reader.size);   // a final 100% tick, so the host can settle the bar
   }
 
-  // Ogg/Theora: the timestamps and nothing else (see readOggFrameTable), the same
-  // shape as the Matroska path. samples, keyframeDecodeIndices and decoderConfig
-  // stay null, so supportsWebCodecs reports false and the clip plays only through
-  // the native <video> element (Firefox).
+  // Ogg/Theora: the timestamps and nothing else (see readOggFrameTable) — the one
+  // container here that still indexes to a timestamps-only table. samples,
+  // keyframeDecodeIndices and decoderConfig stay null, so supportsWebCodecs
+  // reports false and the clip plays only through the native <video> element
+  // (Firefox). No browser's WebCodecs decodes Theora, so there would be nothing
+  // to feed a sample table to.
   async _demuxOgg(reader, options) {
     const table = await readOggFrameTable(reader, options);
     this.containerFormat = 'ogg';
@@ -2580,9 +2973,17 @@ class ContainerIndex {
     return { start, end: start + spanMediaUnits };
   }
 
-  // WebM: the timestamps and nothing else (see readMatroskaFrameTable). The
-  // fields a decoder would need — samples, keyframeDecodeIndices,
-  // decoderConfig — stay null, and supportsWebCodecs reports false because of it.
+  // WebM/Matroska: a full decode-order sample table, and a decoderConfig
+  // whenever the track's codec is one we can configure honestly (H.264, HEVC,
+  // VP8, VP9, AV1 — see buildMatroskaDecoderConfig). The scan that reads the
+  // timestamps walks past every block header anyway, and a block header is where
+  // the frame's byte range and keyframe flag are, so the decode table costs
+  // almost nothing on top of the table that makes the <video> element exact.
+  //
+  // Where this differs from AVI: a Matroska track whose codec we cannot
+  // configure still yields a perfectly good index, because Matroska HAS a native
+  // tier. decoderConfig stays null, supportsWebCodecs reports false, and the clip
+  // plays frame-exact through the <video> element exactly as it did before.
   async _demuxMatroska(reader, options) {
     const table = await readMatroskaFrameTable(reader, options);
     this.containerFormat = 'matroska';
@@ -2591,32 +2992,45 @@ class ContainerIndex {
     // Matroska carries no display rotation matrix (the element applies none
     // either, so the two agree).
     this.rotation = 0;
+    this.decoderConfig = table.decoderConfig;
+    // Matroska stores H.264 and HEVC the way an MP4 does — length-prefixed, with
+    // the parameter sets out of band in CodecPrivate — so unlike AVI there is
+    // nothing to convert before the decoder.
+    this.samplesAreAnnexB = false;
 
-    // Blocks are written in decode order, and a Matroska block's timestamp is
-    // already a *presentation* time, so with B-frames the times can arrive out
-    // of order. Sorting gives display order — the same normalization the
-    // ISOBMFF path does by sorting on composition time.
-    const times = table.presentationTimes.slice().sort((a, b) => a - b);
-    const n = times.length;
-    const firstTime = times[0];
-
-    this.presentationTimes = new Float64Array(n);
-    this.frameDurations = new Float64Array(n);
-    for (let d = 0; d < n; d++) this.presentationTimes[d] = times[d] - firstTime;
-    // Matroska stores no per-frame duration, so a frame lasts until the next one
-    // starts. The last frame has no next one: fall back to the track's declared
-    // DefaultDuration, then to the previous frame's, then to a nominal 30fps.
-    for (let d = 0; d < n - 1; d++) {
-      this.frameDurations[d] = this.presentationTimes[d + 1] - this.presentationTimes[d];
+    // Matroska stores no per-frame duration: a frame lasts until the next one
+    // starts. Synthesize that in the container's own integer tick units, in
+    // PRESENTATION order (blocks are written in decode order, and a Matroska
+    // block's timestamp is already a presentation time, so with B-frames they can
+    // arrive out of order). The last frame has no next one: fall back to the
+    // track's declared DefaultDuration, then to the previous frame's, then to a
+    // nominal 30 fps.
+    const frames = table.frames;
+    const timescale = table.timescale;
+    const displayOrder = frames.map((frame, k) => k)
+      .sort((a, b) => frames[a].ticks - frames[b].ticks);
+    const durations = new Array(frames.length);
+    for (let d = 0; d < displayOrder.length - 1; d++) {
+      durations[displayOrder[d]] =
+        frames[displayOrder[d + 1]].ticks - frames[displayOrder[d]].ticks;
     }
-    if (n) {
-      this.frameDurations[n - 1] = table.defaultFrameDuration
-        || (n > 1 ? this.frameDurations[n - 2] : 1 / 30);
+    if (displayOrder.length) {
+      const last = displayOrder[displayOrder.length - 1];
+      durations[last] = (table.defaultFrameDuration * timescale)
+        || (displayOrder.length > 1 ? durations[displayOrder[displayOrder.length - 2]] : timescale / 30);
     }
 
-    this.numFrames = n;
-    this.duration = n
-      ? this.presentationTimes[n - 1] + this.frameDurations[n - 1] : 0;
+    // The same sample-record shape the ISOBMFF and AVI paths hand to
+    // _buildTables, which does the rest: display order, the decode/display
+    // mappings, and the normalized timelines.
+    this._buildTables(frames.map((frame, k) => ({
+      offset: frame.offset,
+      size: frame.size,
+      is_sync: frame.isSync,
+      cts: frame.ticks,
+      duration: durations[k],
+      timescale,
+    })), null);
   }
 
   // AVI: unlike the WebM and Ogg paths above, this builds a FULL decode-order
@@ -2956,10 +3370,10 @@ class VideoEngine extends EventTarget {
       const index = options.index
         || await ContainerIndex.fromSource(source);
       if (!index.supportsWebCodecs) {
-        // A WebM index: exact timestamps, but no sample table and no decoder
-        // configuration, so there is nothing here to decode from. The clip is
-        // fine — it belongs on NativeVideoEngine, which the same index makes
-        // frame-exact anyway.
+        // An Ogg index, or a Matroska one whose codec we could not configure:
+        // exact timestamps, but nothing here to decode from. The clip is fine —
+        // it belongs on NativeVideoEngine, which the same index makes frame-exact
+        // anyway.
         throw new Error(`this ${index.containerFormat} container carries no `
           + 'sample table for WebCodecs to decode from');
       }
@@ -3556,6 +3970,12 @@ class VideoEngine extends EventTarget {
 //    here if the caller did not supply one) and the presented-frame clock, and
 //    refuses the clip otherwise rather than report guessed frame numbers.
 // ==================================================================
+// How long the <video> element may go with no sign of progress — no bytes
+// arriving, no frame, no error — before load() gives up on it (see
+// _loadElement, which rearms this on every 'progress' event, so a slow download
+// is never cut off by it).
+const LOAD_STALL_MILLISECONDS = 10000;
+
 class NativeVideoEngine extends EventTarget {
   constructor(videoElement) {
     super();
@@ -3657,7 +4077,8 @@ class NativeVideoEngine extends EventTarget {
     return 'native (container index, presented clock)';
   }
   // Same contract as VideoEngine.codecString. Null when the index carries no
-  // decoder configuration (WebM's does not).
+  // decoder configuration (Ogg's does not, nor a Matroska track whose codec we
+  // could not configure).
   get codecString() {
     return (this._index && this._index.decoderConfig)
       ? this._index.decoderConfig.codec : null;
@@ -3833,13 +4254,31 @@ class NativeVideoEngine extends EventTarget {
     }
   }
 
+  // Hand the clip to the element and wait for its first frame ('loadeddata'), an
+  // error, or a stall.
+  //
+  // The stall case is not theoretical and is not covered by 'error': a browser
+  // that can DEMUX a container but cannot DECODE what is inside it parses the
+  // metadata, reports no error at all, and simply never produces a frame. (WebKit
+  // does exactly this with AV1 in WebM: readyState stops at HAVE_METADATA,
+  // networkState goes idle with every byte already in hand, and nothing further
+  // ever happens.) With no deadline that is an unbounded await inside load() —
+  // the host's spinner spins forever, with no error to show and no fallback to
+  // take. So the wait is bounded, and the bound is on a LACK OF PROGRESS rather
+  // than on wall-clock time: a media element fires 'progress' while bytes are
+  // arriving, so a genuinely slow download keeps rearming the deadline and is
+  // never cut off, while an element that has gone quiet without a frame is
+  // refused with an error naming the likely cause.
   _loadElement(source) {
     const url = (typeof source === 'string')
       ? source : (this._objectUrl = URL.createObjectURL(source));
     return new Promise((resolve, reject) => {
+      let timer = null;
       const cleanup = () => {
+        clearTimeout(timer);
         this.video.removeEventListener('loadeddata', onLoaded);
         this.video.removeEventListener('error', onError);
+        this.video.removeEventListener('progress', onProgress);
       };
       const onLoaded = () => {
         cleanup();
@@ -3849,8 +4288,23 @@ class NativeVideoEngine extends EventTarget {
         resolve();
       };
       const onError = () => { cleanup(); reject(new Error('native <video> load failed')); };
+      const onStalled = () => {
+        const readyState = this.video.readyState;
+        cleanup();
+        reject(new Error('NativeVideoEngine: this browser loaded the clip\'s metadata '
+          + `but never presented a frame (readyState ${readyState}), and reported no `
+          + 'error — the signature of a container it can demux carrying a codec it '
+          + 'cannot decode. The clip is refused rather than left loading forever.'));
+      };
+      const armStallTimer = () => {
+        clearTimeout(timer);
+        timer = setTimeout(onStalled, LOAD_STALL_MILLISECONDS);
+      };
+      const onProgress = () => armStallTimer();   // bytes arriving: keep waiting
       this.video.addEventListener('loadeddata', onLoaded);
       this.video.addEventListener('error', onError);
+      this.video.addEventListener('progress', onProgress);
+      armStallTimer();
       this.video.src = url;
       this.video.load();
     });

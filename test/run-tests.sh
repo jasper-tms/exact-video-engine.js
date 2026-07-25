@@ -13,6 +13,10 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-vfr-fragmented.mp4 ] \
         || [ ! -f test/clips/counter-idx1.avi ] \
         || [ ! -f test/clips/counter-opendml.avi ] \
+        || [ ! -f test/clips/counter-vfr.mkv ] \
+        || [ ! -f test/clips/counter-vp8.webm ] \
+        || [ ! -f test/clips/counter-av1.webm ] \
+        || [ ! -f test/clips/counter-hevc.mkv ] \
         || [ ! -f test/clips/corrupt-pure-garbage.bin ]; then
     bash test/make-test-clips.sh
 fi
@@ -21,12 +25,15 @@ fi
 # that want them skip themselves when the files are absent.
 
 # Node-only unit tests: no browser, no server. These run in plain Node directly
-# against the src/ modules, up front and cheaply. The Matroska and Ogg parsers
-# (and the WebM indexing progress reports), the known-bad-codec routing decision,
-# and the trimming-edit-list arithmetic are all pure enough to check without a
-# browser.
+# against the src/ modules, up front and cheaply. The Matroska, Ogg and AVI
+# parsers (their tables, their derived codec strings, and the WebM indexing
+# progress reports), the known-bad-codec routing decision, and the
+# trimming-edit-list arithmetic are all pure enough to check without a browser —
+# and the tables are where a browser walk is blind, since a subtly wrong sample
+# table can still decode into right-looking frames.
 node_status=0
 node test/matroska-progress-test.mjs || node_status=1
+node test/matroska-table-test.mjs || node_status=1
 node test/decode-support-test.mjs || node_status=1
 node test/edit-list-test.mjs || node_status=1
 node test/ogg-table-test.mjs || node_status=1
