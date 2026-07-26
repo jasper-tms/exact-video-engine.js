@@ -102,6 +102,29 @@ for (const file of CLIPS) {
     result.durationAfter >= result.durationAtLoad,
     `${result.durationAtLoad} -> ${result.durationAfter}`);
 
+  // expectedDuration is the container's claim about the WHOLE clip, so unlike
+  // duration it does not move as the pass reads more — that is the point of it,
+  // since a scrubber sized by something that moves stretches under the cursor.
+  check('the declared duration is fixed while the index grows',
+    result.expectedDurationAfter === result.expectedDurationAtLoad,
+    `${result.expectedDurationAtLoad} -> ${result.expectedDurationAfter}`);
+  // Matroska states its length in Info/Duration. ISOBMFF has no equivalent a
+  // fragmented file reliably carries — mvhd/tkhd durations are 0 there, and
+  // mvex/mehd is optional and absent from these fixtures — so 0, meaning "the
+  // container declares none", is the honest answer rather than a gap to paper
+  // over with a guess.
+  if (file.endsWith('.webm') || file.endsWith('.mkv')) {
+    check('the whole clip\'s declared length is known before the pass finishes',
+      result.expectedDurationAtLoad > result.durationAtLoad,
+      `declared ${result.expectedDurationAtLoad}, indexed ${result.durationAtLoad} so far`);
+    check('the declared length matches what the scan measured',
+      Math.abs(result.expectedDurationAtLoad - result.durationAfter) < 0.5,
+      `declared ${result.expectedDurationAtLoad}, scanned ${result.durationAfter}`);
+  } else {
+    check('a container declaring no length reports 0 rather than a guess',
+      result.expectedDurationAtLoad === 0, `${result.expectedDurationAtLoad}`);
+  }
+
   // THE POINT: the frames named while the index was growing are still exactly
   // the same frames now that it is finished.
   for (let i = 0; i < result.earlyRows.length; i++) {

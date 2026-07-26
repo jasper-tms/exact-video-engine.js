@@ -231,6 +231,8 @@ const engine = await createBestEngine(source, {
 
 engine.frameIndexState;   // 'growing' | 'complete' | 'truncated'
 engine.numFrames;         // rises as the pass goes on
+engine.duration;          // likewise: the length indexed SO FAR, not the clip's
+engine.expectedDuration;  // the whole clip's length as the container claims it
 engine.addEventListener('indexextended', () => scrubber.value = engine.numFrames - 1);
 engine.addEventListener('indexcomplete', () => scrubber.classList.remove('partial'));
 engine.addEventListener('indextruncated', () => {
@@ -298,10 +300,12 @@ fragmented clip, or an `avc3`/`hev1` track keeping its parameter sets in the
 frames rather than in the `stsd`, indexes in one pass as before.
 
 To size a scrubber against the whole clip rather than a track that stretches
-under the cursor, use the index's `expectedDuration` — the length the container
-*declares* (Matroska's `Info/Duration`), fixed from the first publish, `0` when
-the file declares none. It is a claim, so it never names a frame; only the
-scanned table does that.
+under the cursor, use `engine.expectedDuration` — the length the container
+*declares* (Matroska's `Info/Duration`), fixed from the index's first publish,
+`0` when the file declares none. It is a claim, so it never names a frame; only
+the scanned table does that. Scale it into frames by the mean rate of the part
+already indexed if the scrubber counts frames, and clamp seeks to `numFrames`:
+the projection is geometry, and the frames it implies are not named yet.
 
 Two things it deliberately does not do. It is **off by default**, because a
 growing `numFrames` is not what existing callers expect. And it applies **only to
@@ -508,7 +512,8 @@ plays through.
 | `update(now)` | Call once per animation frame with the rAF timestamp. Advances the playhead and paints (`VideoEngine`); a no-op on `NativeVideoEngine`. |
 | `loop` | Whether playback wraps at the end. |
 | `playbackRate` | Playback speed multiplier. |
-| `duration` | Clip duration in seconds. |
+| `duration` | Clip duration in seconds. While `frameIndexState` is `growing` this is the length indexed *so far*, rising with `numFrames` — see "Playing while the index is still being built". |
+| `expectedDuration` | The whole clip's length in seconds as the container *declares* it (Matroska's `Info/Duration`), fixed from the index's first publish; `0` when the container declares none. What to size a scrubber against while the index grows. A claim, never a mapping input — it names no frame. |
 | `numFrames` | Frame count. Grows while `frameIndexState` is `growing` — see "Playing while the index is still being built". |
 | `currentFrame` | Integer display frame index on screen. |
 | `currentFrameFloat` | Continuous playhead in frame units (index + fraction of the frame's display interval) — drive synchronized/interpolated overlays from this, never from `currentTime * frameRate`. |

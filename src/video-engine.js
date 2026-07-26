@@ -166,6 +166,17 @@ export class VideoEngine extends EventTarget {
   // index to catch up — a stall on the indexer, not on the decoder.
   get waitingForIndex() { return this._waitingForIndex; }
 
+  // The clip's total length in seconds as the CONTAINER DECLARES IT, where it
+  // declares one (Matroska's Info/Duration), and 0 where it does not. This is
+  // what a host sizes a scrubber against while `frameIndexState` is 'growing',
+  // so the track spans the whole clip instead of stretching under the cursor as
+  // `duration` — the length actually indexed so far — rises to meet it.
+  //
+  // It is a claim, not a measurement, so it never names a frame: only the
+  // scanned table does that. Fixed from the index's first publish, so it does
+  // not wander mid-clip.
+  get expectedDuration() { return this._index ? this._index.expectedDuration : 0; }
+
   frameAtTime(t) { return this._index ? this._index.frameAtTime(t) : 0; }
 
   get currentFrame() { return this.frameAtTime(this.playhead); }

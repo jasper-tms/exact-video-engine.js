@@ -123,6 +123,13 @@ export class NativeVideoEngine extends EventTarget {
     return this.video.duration || 0;
   }
 
+  // The clip's length as the container declares it, 0 where it declares none —
+  // same meaning as VideoEngine.expectedDuration, so a host can read it off
+  // either engine without asking which one it got. This path only ever holds a
+  // finished index, so it equals `duration` for every clip that declares one;
+  // it is here for that symmetry, not because the two can differ.
+  get expectedDuration() { return this._index ? this._index.expectedDuration : 0; }
+
   // Normalized to the content timeline (display frame 0 at t = 0), so that
   // currentTime, duration, frameAtTime and seekToFrame mean exactly what they
   // mean on VideoEngine and a host can swap one engine for the other blindly.

@@ -110,6 +110,9 @@ window.run = async function run(file) {
   const stateAtLoad = engine.frameIndexState;
   const framesAtLoad = engine.numFrames;
   const durationAtLoad = engine.duration;
+  // What a host sizes a scrubber by while the rest of the clip is still being
+  // read: the container's own claim about the whole clip, not the part scanned.
+  const expectedDurationAtLoad = engine.expectedDuration;
 
   // Every frame the engine was willing to name at that moment.
   const early = [];
@@ -144,6 +147,8 @@ window.run = async function run(file) {
     settled,
     framesAfter: engine.numFrames,
     durationAfter: engine.duration,
+    expectedDurationAtLoad,
+    expectedDurationAfter: engine.expectedDuration,
     clampedFrame,
     clampedWithin,
     earlyRows,
