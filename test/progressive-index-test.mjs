@@ -29,6 +29,9 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { ContainerIndex } from '../src/container-index.js';
+import {
+  buildAvcC, buildH264SequenceParameterSet,
+} from './bitstream-fixtures.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const clip = (name) => join(here, 'clips', name);
@@ -130,21 +133,35 @@ function assertPrefix(label, earlier, later) {
   }
 }
 
-// VP8 and VP9 do not reorder, so a frame is certified the moment the next one is
-// read and these clips publish long before the pass ends. The rest reorder, and
-// with nothing in the container bounding how far, the honest watermark is the
-// full 32768-tick block-offset window — 32.8 seconds at the default timestamp
-// scale, which these one-second fixtures never clear. They publish once, at the
-// end, and that is the correct conservative answer rather than a shortcoming of
-// the fixtures. The synthetic multi-cluster clips further down are what exercise
-// the reordering watermark itself.
+// Whether a clip can name frames before its last byte is read comes down to what
+// bounds how far it may reorder, and there are three answers among these
+// fixtures — see nextCertifiedRun for the two proofs it combines.
 const CLIPS = [
+  // VP8 and VP9 do not reorder at all, so storage order IS presentation order
+  // and a frame is certified the moment the next one is read.
   { name: 'counter-cfr.webm', publishesEarly: true },   // VP9, constant rate
   { name: 'counter-vfr.webm', publishesEarly: true },   // VP9, variable rate
   { name: 'counter-vp8.webm', publishesEarly: true },   // VP8
-  { name: 'counter-av1.webm', publishesEarly: false },  // AV1 reorders
-  { name: 'counter-hevc.mkv', publishesEarly: false },  // HEVC in Matroska
-  { name: 'counter-vfr.mkv', publishesEarly: false },   // H.264 in Matroska
+
+  // H.264 reorders, but says how far in its own sequence parameter set, and this
+  // clip's says zero — so it certifies as eagerly as VP9 does. Before that
+  // declaration was read this fixture published nothing until the final byte.
+  { name: 'counter-vfr.mkv', publishesEarly: true },    // H.264, declared depth 0
+
+  // AV1 reorders and declares no bound anywhere we can read, so the only honest
+  // watermark is the container's own: the 32768-tick block-offset window, 32.8
+  // seconds at the default timestamp scale, which a one-second fixture never
+  // clears. Publishing once at the end is the correct conservative answer here,
+  // not a shortcoming of the fixture.
+  { name: 'counter-av1.webm', publishesEarly: false },
+
+  // HEVC declares a depth of two, and that bound does take hold — but this
+  // fixture is a single 30-frame group with a deep enough B-pyramid that only
+  // its opening frame certifies before the file runs out, and that one frame is
+  // held back as the one whose duration is not settled yet. So nothing usable
+  // appears early even though certification is running. A longer clip is what
+  // separates those two, and the synthetic ones below are it.
+  { name: 'counter-hevc.mkv', publishesEarly: false },
 ];
 
 for (const { name, publishesEarly } of CLIPS) {
@@ -224,7 +241,7 @@ for (const { name, publishesEarly } of CLIPS) {
         `${usableEarly[0].numFrames} of ${final.numFrames} at the first publish`);
     }
   } else {
-    check(`${name}: a reordering codec certifies nothing inside the 32768-tick window`,
+    check(`${name}: nothing usable is published before the clip's bound allows it`,
       usableEarly.length === 0,
       `published ${usableEarly.length} growing states with frames`);
   }
@@ -336,8 +353,14 @@ const simpleBlock = (relativeTicks, isKeyframe, payloadLength) => element([0xA3]
 // codecId picks whether the certification rule believes storage order is
 // presentation order: 'V_VP8' does not reorder, 'V_MPEG4/ISO/AVC' does.
 // clusters is [{timestamp, blocks: [{relative, isKeyframe}]}].
-function buildSyntheticMatroska({ codecId, clusters, framePayloadLength = 64 }) {
-  const codecPrivate = new Uint8Array([0x01, 0x42, 0xC0, 0x1E, 0xFF]);   // a plausible avcC head
+//
+// codecPrivate defaults to an avcC head too short to hold a sequence parameter
+// set, which is how a track says nothing about how far it reorders. Pass a real
+// one to exercise the bitstream bound.
+function buildSyntheticMatroska({
+  codecId, clusters, framePayloadLength = 64,
+  codecPrivate = new Uint8Array([0x01, 0x42, 0xC0, 0x1E, 0xFF]),
+}) {
   const trackEntry = element([0xAE], concat(
     element([0xD7], unsigned(1, 1)),                       // TrackNumber
     element([0x83], unsigned(1, 1)),                       // TrackType: video
@@ -399,6 +422,94 @@ for (let second = 0; second < 60; second++) {
   }
   for (let i = 0; i < published.length; i++) {
     assertPrefix(`reordering codec publish #${i}`, published[i], final);
+  }
+}
+
+// ------------------------------------------------------------------
+// The same reordering codec, but with a sequence parameter set that says how far
+// it actually reorders. The container's own bound is 32.8 seconds of content
+// before a single frame can be named; the bitstream's is a couple of FRAMES. The
+// same clip, indexed the same way, should now publish within a frame or two of
+// what it has read rather than half a minute behind it.
+// ------------------------------------------------------------------
+{
+  const bytes = buildSyntheticMatroska({
+    codecId: 'V_MPEG4/ISO/AVC',
+    clusters: longClusters,
+    codecPrivate: buildAvcC(buildH264SequenceParameterSet({ declaredReorderFrames: 2 })),
+  });
+  const published = [];
+  const index = await ContainerIndex.load(new MemoryRangeReader(bytes), {
+    chunkBytes: 4096,
+    publishPartialIndex: true,
+    onIndexCreated: (created) =>
+      created.addEventListener('extended', () => published.push(snapshot(created))),
+  });
+  const final = snapshot(index);
+  check('declared reorder depth: indexed every frame', index.numFrames === 60 * 30,
+    `${index.numFrames}`);
+  check('declared reorder depth: completed', index.completionState === 'complete');
+
+  const usableEarly = published
+    .filter((p) => p.completionState === 'growing' && p.numFrames > 0);
+  check('declared reorder depth: published a prefix', usableEarly.length > 0,
+    `${published.length} publishes, none usable early`);
+  if (usableEarly.length) {
+    // How far behind the end of the file the last growing publish stopped. With
+    // the declaration this is a few frames plus whatever the publish granularity
+    // (one per chunk refill) rounds it up to; without one it can never be less
+    // than the 32.768-second block-offset window. Asserted against that window
+    // rather than against a frame count, so a change in chunk size is not a
+    // failure — the claim being made is "frames, not half a minute".
+    const lastGrowing = usableEarly[usableEarly.length - 1];
+    const heldBack = final.duration - lastGrowing.duration;
+    check('declared reorder depth: holds back frames, not the whole window',
+      heldBack < 32.768 / 4, `${heldBack.toFixed(3)}s held back`);
+    // And frames really are named from the opening of the clip, which the
+    // conservative bound cannot do until 32.768 seconds have gone past.
+    check('declared reorder depth: names frames from the opening seconds',
+      usableEarly[0].duration < 32.768,
+      `first publish already ${usableEarly[0].duration.toFixed(3)}s in`);
+  }
+  for (let i = 0; i < published.length; i++) {
+    assertPrefix(`declared reorder depth publish #${i}`, published[i], final);
+  }
+}
+
+// A declared depth is a promise about the whole stream, so a file that breaks it
+// must not be papered over. The certified-prefix invariant catches the case
+// outright: a frame arriving before one already published is not recoverable,
+// because a host may already have written an annotation against that number.
+{
+  // Ordinary clusters, and then one block that presents 30 seconds before the
+  // cluster it sits in — a stream reordering by nine hundred frames while
+  // declaring two. (A block's offset is a signed 16-bit field, so 30 seconds is
+  // about as far back as a Matroska file can physically reach; the declared
+  // bound is violated many times over regardless.)
+  const clusters = [];
+  for (let second = 0; second < 60; second++) {
+    const blocks = [];
+    for (let frame = 0; frame < 30; frame++) {
+      blocks.push({ relative: Math.round(frame * 1000 / 30), isKeyframe: frame === 0 });
+    }
+    if (second === 59) blocks.push({ relative: -30000, isKeyframe: false });
+    clusters.push({ timestamp: second * 1000, blocks });
+  }
+  const bytes = buildSyntheticMatroska({
+    codecId: 'V_MPEG4/ISO/AVC',
+    clusters,
+    codecPrivate: buildAvcC(buildH264SequenceParameterSet({ declaredReorderFrames: 2 })),
+  });
+  const refusal = await ContainerIndex.load(new MemoryRangeReader(bytes), {
+    chunkBytes: 4096,
+    publishPartialIndex: true,
+    onIndexCreated: () => {},
+  }).then(() => null, (error) => error);
+  check('a stream that breaks its declared depth is refused, not mis-numbered',
+    refusal !== null, 'the index built anyway');
+  if (refusal) {
+    check('the refusal says the prefix was not certified',
+      /not certified|unreliable/.test(refusal.message), refusal.message);
   }
 }
 

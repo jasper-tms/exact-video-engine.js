@@ -711,6 +711,530 @@ function hydrateContainerIndex(index, payload) {
 
   return true;
 }
+// How far a codec is allowed to reorder frames, read out of the bitstream's own
+// sequence parameter set.
+//
+// WHY THIS EXISTS. A container that stores frames in decode order cannot publish
+// a frame's display number until it knows that no frame still unread can present
+// before it. Matroska proves almost nothing about that on its own: a block's
+// timestamp is its cluster's plus a SIGNED 16-BIT offset, so the only bound the
+// container itself gives is that window — 32768 ticks, 32.8 seconds at the
+// default 1 ms timestamp scale. Waiting out 32.8 seconds of content before
+// naming a single frame is correct and nearly useless.
+//
+// The bitstream is far less coy. H.264's `max_num_reorder_frames` and HEVC's
+// `sps_max_num_reorder_pics` state exactly this quantity, in frames:
+//
+//   the greatest number of frames that may precede a frame in decode order and
+//   follow it in presentation order
+//
+// Typical real-world values are 0 (no B-frames at all), 1, or 2 — so a bound of
+// a handful of frames replaces a bound of half a minute.
+//
+// WHY IT IS A FACT AND NOT A GUESS. This is not an observation about how muxers
+// usually behave, which is the kind of thing this library refuses to lean on. It
+// is a field the encoder wrote into the stream describing the stream, in the
+// same setup record whose profile and level we already trust to build the codec
+// string a decoder is configured from. A stream that violates it is malformed,
+// and the certified-prefix invariant in container-index.js catches that case
+// outright rather than silently mis-numbering frames.
+//
+// Where H.264 omits the field — it lives in the optional VUI, and plenty of
+// encoders write no VUI at all — the specification says to infer it, and the
+// inference is itself a hard limit rather than a habit: a conforming stream can
+// never reorder by more than its level's decoded-picture-buffer capacity. So
+// there is an answer for every readable H.264 stream, and `null` is reserved for
+// a record we genuinely cannot parse.
+
+// Ceiling on decoded-picture-buffer size, in macroblocks, per H.264 level
+// (ITU-T H.264 Table A-1). A level bounds the DPB in macroblocks rather than in
+// frames, so the frame count depends on the picture size as well.
+const H264_MAX_DECODED_PICTURE_BUFFER_MACROBLOCKS = new Map([
+  [10, 396], [11, 900], [12, 2376], [13, 2376],
+  [20, 2376], [21, 4752], [22, 8100],
+  [30, 8100], [31, 18000], [32, 20480],
+  [40, 32768], [41, 32768], [42, 34816],
+  [50, 110400], [51, 184320], [52, 184320],
+  [60, 696320], [61, 696320], [62, 696320],
+]);
+
+// The profiles for which constraint_set3_flag means "this stream does not
+// reorder at all" (H.264 §E.2.1, the max_num_reorder_frames inference).
+const H264_CONSTRAINED_PROFILES = new Set([44, 86, 100, 110, 122, 244]);
+
+// The profiles whose sequence parameter set carries the chroma format, bit
+// depths and scaling matrices that Baseline and Main do not (H.264 §7.3.2.1.1).
+const H264_PROFILES_WITH_CHROMA_FORMAT = new Set([
+  100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
+]);
+
+// The NAL unit type of an HEVC sequence parameter set (ITU-T H.265 Table 7-1).
+const HEVC_SEQUENCE_PARAMETER_SET_NAL_TYPE = 33;
+
+// The greatest number of frames that may precede a frame in decode order and
+// follow it in presentation order, read from a codec setup record, or null when
+// the record cannot be read.
+//
+// setupRecordKind is 'avcC' or 'hvcC'; setupRecordBytes is that record's body —
+// the bytes Matroska stores in CodecPrivate and an MP4 stores in the box of the
+// same name. Any other codec returns null: there is no such declaration in a VP8
+// or VP9 stream (neither reorders, which callers establish another way) and none
+// in an AV1 sequence header either.
+function declaredFrameReorderDepth(setupRecordKind, setupRecordBytes) {
+  if (!setupRecordBytes || !setupRecordBytes.length) return null;
+  try {
+    if (setupRecordKind === 'avcC') return h264ReorderDepth(setupRecordBytes);
+    if (setupRecordKind === 'hvcC') return hevcReorderDepth(setupRecordBytes);
+  } catch (parseError) {
+    // A record we cannot walk tells us nothing, and guessing at a reorder bound
+    // is precisely the thing that would corrupt frame numbers. The caller falls
+    // back to whatever its container proves on its own.
+    return null;
+  }
+  return null;
+}
+
+// ==================================================================
+// H.264
+// ==================================================================
+
+// avcC (ISO 14496-15 §5.3.3.1): a fixed 6-byte head, then a count of sequence
+// parameter sets and each one's length and bytes.
+function h264ReorderDepth(avcC) {
+  if (avcC.length < 8) return null;
+  const sequenceParameterSetCount = avcC[5] & 0x1F;
+  if (!sequenceParameterSetCount) return null;
+  const length = (avcC[6] << 8) | avcC[7];
+  if (avcC.length < 8 + length || length < 2) return null;
+  // Skip the one-byte NAL header; what follows is the sequence parameter set.
+  const rawByteSequence =
+    removeEmulationPrevention(avcC.subarray(9, 8 + length));
+  return h264ReorderDepthFromSequenceParameterSet(rawByteSequence);
+}
+
+// Walk an H.264 sequence parameter set (ITU-T H.264 §7.3.2.1.1) as far as the
+// VUI's max_num_reorder_frames, or to the end if the stream carries no VUI —
+// in which case the specification's own inference applies (§E.2.1).
+//
+// Every field before the one we want has to be read rather than skipped: they
+// are variable-length, so there is no seeking past them.
+function h264ReorderDepthFromSequenceParameterSet(rawByteSequence) {
+  const bits = new BitstreamReader(rawByteSequence);
+  const profileIdc = bits.readBits(8);
+  const constraintFlags = bits.readBits(8);
+  const constraintSet3Flag = (constraintFlags >> 4) & 1;
+  const levelIdc = bits.readBits(8);
+  bits.readUnsignedExpGolomb();                       // seq_parameter_set_id
+
+  let chromaFormatIdc = 1;
+  if (H264_PROFILES_WITH_CHROMA_FORMAT.has(profileIdc)) {
+    chromaFormatIdc = bits.readUnsignedExpGolomb();
+    if (chromaFormatIdc === 3) bits.readBits(1);      // separate_colour_plane_flag
+    bits.readUnsignedExpGolomb();                     // bit_depth_luma_minus8
+    bits.readUnsignedExpGolomb();                     // bit_depth_chroma_minus8
+    bits.readBits(1);                        // qpprime_y_zero_transform_bypass
+    if (bits.readBits(1)) {                  // seq_scaling_matrix_present_flag
+      const listCount = (chromaFormatIdc !== 3) ? 8 : 12;
+      for (let i = 0; i < listCount; i++) {
+        if (bits.readBits(1)) skipScalingList(bits, i < 6 ? 16 : 64);
+      }
+    }
+  }
+
+  bits.readUnsignedExpGolomb();                       // log2_max_frame_num_minus4
+  const pictureOrderCountType = bits.readUnsignedExpGolomb();
+  if (pictureOrderCountType === 0) {
+    bits.readUnsignedExpGolomb();               // log2_max_pic_order_cnt_lsb_minus4
+  } else if (pictureOrderCountType === 1) {
+    bits.readBits(1);                           // delta_pic_order_always_zero_flag
+    bits.readSignedExpGolomb();                 // offset_for_non_ref_pic
+    bits.readSignedExpGolomb();                 // offset_for_top_to_bottom_field
+    const cycleLength = bits.readUnsignedExpGolomb();
+    for (let i = 0; i < cycleLength; i++) bits.readSignedExpGolomb();
+  }
+
+  bits.readUnsignedExpGolomb();                       // max_num_ref_frames
+  bits.readBits(1);                        // gaps_in_frame_num_value_allowed_flag
+  const pictureWidthInMacroblocks = bits.readUnsignedExpGolomb() + 1;
+  const pictureHeightInMapUnits = bits.readUnsignedExpGolomb() + 1;
+  const frameMacroblocksOnlyFlag = bits.readBits(1);
+  if (!frameMacroblocksOnlyFlag) bits.readBits(1);   // mb_adaptive_frame_field_flag
+  bits.readBits(1);                                  // direct_8x8_inference_flag
+  if (bits.readBits(1)) {                            // frame_cropping_flag
+    for (let i = 0; i < 4; i++) bits.readUnsignedExpGolomb();
+  }
+
+  // A frame is two field-heights tall unless the stream is frames-only.
+  const frameHeightInMacroblocks =
+    (2 - frameMacroblocksOnlyFlag) * pictureHeightInMapUnits;
+
+  // Everything this field counts is measured in FRAMES. A field-coded stream
+  // can put two fields where a caller counts one picture, so the bound would no
+  // longer line up with what the caller is counting. Rather than reason about
+  // which of those two a container's frames are, decline: an unknown bound
+  // costs a caller its tighter watermark, and a wrong one costs it correctness.
+  if (!frameMacroblocksOnlyFlag) return null;
+
+  if (bits.readBits(1)) {                     // vui_parameters_present_flag
+    const declared = h264ReorderDepthFromVideoUsability(bits);
+    if (declared !== null) return declared;
+  }
+
+  // No VUI, or a VUI that stops before the bitstream restrictions: fall back to
+  // the inference the specification itself defines.
+  if (H264_CONSTRAINED_PROFILES.has(profileIdc) && constraintSet3Flag) return 0;
+  return h264MaximumDecodedPictureBufferFrames(
+    profileIdc, constraintSet3Flag, levelIdc,
+    pictureWidthInMacroblocks, frameHeightInMacroblocks);
+}
+
+// The VUI (H.264 Annex E), read only as far as bitstream_restriction_flag.
+// Returns the declared value, or null when the stream declares no restrictions.
+function h264ReorderDepthFromVideoUsability(bits) {
+  if (bits.readBits(1)) {                     // aspect_ratio_info_present_flag
+    const aspectRatioIdc = bits.readBits(8);
+    if (aspectRatioIdc === 255) bits.readBits(32);      // sar_width, sar_height
+  }
+  if (bits.readBits(1)) bits.readBits(1);     // overscan_info / overscan_appropriate
+  if (bits.readBits(1)) {                     // video_signal_type_present_flag
+    bits.readBits(4);                         // video_format, video_full_range_flag
+    if (bits.readBits(1)) bits.readBits(24);  // the three colour description bytes
+  }
+  if (bits.readBits(1)) {                     // chroma_loc_info_present_flag
+    bits.readUnsignedExpGolomb();
+    bits.readUnsignedExpGolomb();
+  }
+  if (bits.readBits(1)) {                     // timing_info_present_flag
+    bits.readBits(32);                        // num_units_in_tick
+    bits.readBits(32);                        // time_scale
+    bits.readBits(1);                         // fixed_frame_rate_flag
+  }
+  const nalHypotheticalReferenceDecoder = bits.readBits(1);
+  if (nalHypotheticalReferenceDecoder) skipHypotheticalReferenceDecoder(bits);
+  const videoCodingHypotheticalReferenceDecoder = bits.readBits(1);
+  if (videoCodingHypotheticalReferenceDecoder) skipHypotheticalReferenceDecoder(bits);
+  if (nalHypotheticalReferenceDecoder || videoCodingHypotheticalReferenceDecoder) {
+    bits.readBits(1);                         // low_delay_hrd_flag
+  }
+  bits.readBits(1);                           // pic_struct_present_flag
+  if (!bits.readBits(1)) return null;         // bitstream_restriction_flag
+
+  bits.readBits(1);              // motion_vectors_over_pic_boundaries_flag
+  bits.readUnsignedExpGolomb();  // max_bytes_per_pic_denom
+  bits.readUnsignedExpGolomb();  // max_bits_per_mb_denom
+  bits.readUnsignedExpGolomb();  // log2_max_mv_length_horizontal
+  bits.readUnsignedExpGolomb();  // log2_max_mv_length_vertical
+  return bits.readUnsignedExpGolomb();               // max_num_reorder_frames
+}
+
+function skipHypotheticalReferenceDecoder(bits) {
+  const codedPictureBufferCount = bits.readUnsignedExpGolomb() + 1;
+  bits.readBits(8);                           // bit_rate_scale, cpb_size_scale
+  for (let i = 0; i < codedPictureBufferCount; i++) {
+    bits.readUnsignedExpGolomb();             // bit_rate_value_minus1
+    bits.readUnsignedExpGolomb();             // cpb_size_value_minus1
+    bits.readBits(1);                         // cbr_flag
+  }
+  bits.readBits(20);      // the four delay-length fields, five bits each
+}
+
+function skipScalingList(bits, entryCount) {
+  let lastScale = 8;
+  let nextScale = 8;
+  for (let i = 0; i < entryCount; i++) {
+    if (nextScale !== 0) {
+      const deltaScale = bits.readSignedExpGolomb();
+      nextScale = (lastScale + deltaScale + 256) % 256;
+    }
+    if (nextScale !== 0) lastScale = nextScale;
+  }
+}
+
+// How many frames this stream's level lets the decoded picture buffer hold
+// (H.264 §A.3.1). A stream can never reorder by more than this, so it is a
+// legitimate — if loose — bound where the encoder declared none.
+function h264MaximumDecodedPictureBufferFrames(
+  profileIdc, constraintSet3Flag, levelIdc,
+  pictureWidthInMacroblocks, frameHeightInMacroblocks
+) {
+  // Level 1b is written as level_idc 11 with constraint_set3_flag set, on the
+  // profiles where that flag is not the "no reordering" signal handled above.
+  const isLevel1b = levelIdc === 11 && constraintSet3Flag
+    && (profileIdc === 66 || profileIdc === 77 || profileIdc === 88);
+  const macroblocks = isLevel1b
+    ? 396 : H264_MAX_DECODED_PICTURE_BUFFER_MACROBLOCKS.get(levelIdc);
+  if (!macroblocks) return null;
+  const macroblocksPerFrame = pictureWidthInMacroblocks * frameHeightInMacroblocks;
+  if (!macroblocksPerFrame) return null;
+  return Math.min(Math.floor(macroblocks / macroblocksPerFrame), 16);
+}
+
+// ==================================================================
+// HEVC
+// ==================================================================
+
+// hvcC (ISO 14496-15 §8.3.3.1): a 22-byte head, then arrays of parameter-set
+// NAL units grouped by type. The sequence parameter set is type 33.
+function hevcReorderDepth(hvcC) {
+  if (hvcC.length < 23) return null;
+  let at = 22;
+  const arrayCount = hvcC[at++];
+  for (let array = 0; array < arrayCount; array++) {
+    if (at + 3 > hvcC.length) return null;
+    const nalUnitType = hvcC[at] & 0x3F;
+    const nalUnitCount = (hvcC[at + 1] << 8) | hvcC[at + 2];
+    at += 3;
+    for (let unit = 0; unit < nalUnitCount; unit++) {
+      if (at + 2 > hvcC.length) return null;
+      const length = (hvcC[at] << 8) | hvcC[at + 1];
+      at += 2;
+      if (at + length > hvcC.length) return null;
+      if (nalUnitType === HEVC_SEQUENCE_PARAMETER_SET_NAL_TYPE && length > 2) {
+        // Skip the two-byte NAL header.
+        return hevcReorderDepthFromSequenceParameterSet(
+          removeEmulationPrevention(hvcC.subarray(at + 2, at + length)));
+      }
+      at += length;
+    }
+  }
+  return null;
+}
+
+// Walk an HEVC sequence parameter set (ITU-T H.265 §7.3.2.2.1) to
+// sps_max_num_reorder_pics. Unlike H.264 this field is mandatory and sits early,
+// so the only real work is stepping over profile_tier_level.
+function hevcReorderDepthFromSequenceParameterSet(rawByteSequence) {
+  const bits = new BitstreamReader(rawByteSequence);
+  bits.readBits(4);                                   // sps_video_parameter_set_id
+  const maximumSubLayersMinusOne = bits.readBits(3);
+  bits.readBits(1);                                // sps_temporal_id_nesting_flag
+  skipProfileTierLevel(bits, maximumSubLayersMinusOne);
+  bits.readUnsignedExpGolomb();                       // sps_seq_parameter_set_id
+  const chromaFormatIdc = bits.readUnsignedExpGolomb();
+  if (chromaFormatIdc === 3) bits.readBits(1);     // separate_colour_plane_flag
+  bits.readUnsignedExpGolomb();                       // pic_width_in_luma_samples
+  bits.readUnsignedExpGolomb();                      // pic_height_in_luma_samples
+  if (bits.readBits(1)) {                             // conformance_window_flag
+    for (let i = 0; i < 4; i++) bits.readUnsignedExpGolomb();
+  }
+  bits.readUnsignedExpGolomb();                       // bit_depth_luma_minus8
+  bits.readUnsignedExpGolomb();                       // bit_depth_chroma_minus8
+  bits.readUnsignedExpGolomb();               // log2_max_pic_order_cnt_lsb_minus4
+  const perSubLayer = bits.readBits(1);
+  // The bound that matters is the one for the highest temporal sub-layer, which
+  // is the last entry written — every frame the file presents is in it.
+  let reorderDepth = null;
+  for (let i = perSubLayer ? 0 : maximumSubLayersMinusOne;
+       i <= maximumSubLayersMinusOne; i++) {
+    bits.readUnsignedExpGolomb();            // sps_max_dec_pic_buffering_minus1
+    reorderDepth = bits.readUnsignedExpGolomb();      // sps_max_num_reorder_pics
+    bits.readUnsignedExpGolomb();            // sps_max_latency_increase_plus1
+  }
+  return reorderDepth;
+}
+
+// profile_tier_level (H.265 §7.3.3), with profilePresentFlag always 1 as it is
+// when called from a sequence parameter set. Nothing in it is needed here; the
+// point is to land on the bit after it.
+function skipProfileTierLevel(bits, maximumSubLayersMinusOne) {
+  bits.skipBits(88);                     // the general profile and constraint block
+  bits.readBits(8);                      // general_level_idc
+  const profilePresent = [];
+  const levelPresent = [];
+  for (let i = 0; i < maximumSubLayersMinusOne; i++) {
+    profilePresent.push(bits.readBits(1));
+    levelPresent.push(bits.readBits(1));
+  }
+  if (maximumSubLayersMinusOne > 0) {
+    bits.skipBits(2 * (8 - maximumSubLayersMinusOne));   // reserved_zero_2bits
+  }
+  for (let i = 0; i < maximumSubLayersMinusOne; i++) {
+    if (profilePresent[i]) bits.skipBits(88);
+    if (levelPresent[i]) bits.readBits(8);
+  }
+}
+
+// ==================================================================
+// Bitstream plumbing
+// ==================================================================
+
+// A NAL unit's payload has 0x03 stuffed into it wherever the encoded bytes would
+// otherwise have spelled a start code (00 00 00/01/02/03). Undo that to get the
+// raw byte sequence the syntax above is written against.
+function removeEmulationPrevention(bytes) {
+  // Nothing to undo in the common case; do not allocate for it.
+  let stuffed = 0;
+  for (let i = 2; i < bytes.length; i++) {
+    if (bytes[i] === 0x03 && bytes[i - 1] === 0 && bytes[i - 2] === 0) stuffed++;
+  }
+  if (!stuffed) return bytes;
+  const out = new Uint8Array(bytes.length - stuffed);
+  let written = 0;
+  let zeroRun = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    if (zeroRun === 2 && bytes[i] === 0x03) { zeroRun = 0; continue; }
+    zeroRun = (bytes[i] === 0) ? zeroRun + 1 : 0;
+    out[written++] = bytes[i];
+  }
+  return out.subarray(0, written);
+}
+
+// Most-significant-bit-first reader with the two exponential-Golomb forms the
+// H.264 and H.265 syntax are written in. Running off the end throws, which the
+// entry point turns into "this record cannot be read" — never into a guess.
+class BitstreamReader {
+  constructor(bytes) {
+    this.bytes = bytes;
+    this.position = 0;
+    this.bitCount = bytes.length * 8;
+  }
+
+  readBits(count) {
+    let value = 0;
+    for (let i = 0; i < count; i++) {
+      if (this.position >= this.bitCount) throw new RangeError('bitstream ended');
+      const bit = (this.bytes[this.position >> 3] >> (7 - (this.position & 7))) & 1;
+      // Multiplication rather than a shift: 32-bit fields would otherwise turn
+      // negative, and every value here is small enough to stay exact.
+      value = value * 2 + bit;
+      this.position++;
+    }
+    return value;
+  }
+
+  skipBits(count) {
+    if (this.position + count > this.bitCount) throw new RangeError('bitstream ended');
+    this.position += count;
+  }
+
+  // ue(v): a run of N zeros, a 1, then N more bits, worth 2^N - 1 plus those.
+  readUnsignedExpGolomb() {
+    let leadingZeros = 0;
+    while (this.readBits(1) === 0) {
+      leadingZeros++;
+      // A valid field is at most 32 bits wide; a longer run means we have lost
+      // our place in the syntax and everything after it would be invented.
+      if (leadingZeros > 32) throw new RangeError('malformed exp-Golomb code');
+    }
+    if (leadingZeros === 0) return 0;
+    return (2 ** leadingZeros - 1) + this.readBits(leadingZeros);
+  }
+
+  // se(v): the unsigned form folded into an alternating sequence 0, 1, -1, 2, ...
+  readSignedExpGolomb() {
+    const unsigned = this.readUnsignedExpGolomb();
+    const magnitude = Math.ceil(unsigned / 2);
+    return (unsigned % 2 === 0) ? -magnitude : magnitude;
+  }
+}
+// Deciding which frames of a half-read container may be given display numbers.
+//
+// A container that stores frames in decode order can hand a host the opening of
+// a clip long before its last byte arrives — but only under one promise, which
+// is the whole reason this file is separate and small enough to check by eye:
+//
+//   Every frame number reported is exact and PERMANENT. The set of frames the
+//   index is willing to report grows; what any one of them means never changes.
+//
+// A host may already have written an annotation against display frame 412. If
+// 412 came to mean a different picture once more of the file had been read, this
+// library would have committed exactly the silent off-by-one it exists to
+// prevent. So a frame is published only once nothing still to be read — and
+// nothing already read but not yet placed — can present before it.
+//
+// Both full-file passes that publish early (Matroska's cluster scan, and the
+// fragmented-MP4 pass through mp4box) use the machinery here, so the two build
+// the same table from the same reasoning and differ only in how they prove their
+// watermark.
+
+// The longest prefix of decode-order frames whose place on the display timeline
+// is settled, or null when nothing new can be settled yet.
+//
+// timeAt(index)        presentation time of a frame, in decode order, in
+//                      whatever unit the caller's watermarks are in
+// frameCount           how many frames have been read so far
+// from                 how many have already been published
+// containerWatermark   the earliest presentation time anything STILL TO BE READ
+//                      could carry — the caller's proof, and the only thing here
+//                      that differs between containers
+// certifiedWatermark   the watermark promised at the previous publish, so a
+//                      caller cannot certify the same ground twice
+//
+// Two things could still displace a frame we hold: one we have not read, bounded
+// by containerWatermark, and one we HAVE read but not yet handed over, which for
+// a reordering codec can carry an earlier presentation time than a frame before
+// it in decode order. The promise made at each cut point is the smaller of
+// those, and the run grows while its own running maximum stays strictly below
+// that promise.
+function longestCertifiedRun(
+  timeAt, frameCount, from, containerWatermark, certifiedWatermark
+) {
+  if (from >= frameCount) return null;
+  if (!(containerWatermark > certifiedWatermark)) return null;
+
+  // The earliest presentation time still in hand, from each possible cut point
+  // backwards: suffixMinimum[i - from] is the smallest time over frames [i..).
+  const suffixMinimum = new Float64Array(frameCount - from + 1);
+  suffixMinimum[frameCount - from] = Infinity;
+  for (let i = frameCount - 1; i >= from; i--) {
+    suffixMinimum[i - from] = Math.min(timeAt(i), suffixMinimum[i - from + 1]);
+  }
+
+  let end = from;
+  let runMaximum = -Infinity;
+  let watermark = certifiedWatermark;
+  while (end < frameCount) {
+    const candidateMaximum = Math.max(runMaximum, timeAt(end));
+    const promise = Math.min(containerWatermark, suffixMinimum[end + 1 - from]);
+    if (!(candidateMaximum < promise)) break;
+    runMaximum = candidateMaximum;
+    watermark = promise;
+    end++;
+  }
+  if (end === from) return null;
+  return { end, watermark };
+}
+
+// The watermark a declared reorder depth proves, maintained as frames arrive.
+//
+// A stream that declares it reorders by at most N frames (see
+// src/frame-reorder-bound.js) is saying that no frame may be preceded in decode
+// order by more than N frames that follow it in presentation order. Read that
+// backwards: once a frame has N + 1 frames at or after its own presentation time
+// already in hand, a frame still to be read landing before it would have to
+// displace all N + 1 of them, one more than the stream is allowed. So the
+// (N + 1)-th largest presentation time read so far is a watermark — and, being
+// counted in frames rather than in time, it is usually a far tighter one than
+// anything a container proves on its own.
+//
+// The list never grows past N + 1 entries (16 or so at the very worst), so the
+// insertion sort below is cheaper than any structure with a better asymptotic
+// story would be.
+class DeclaredReorderWatermark {
+  // depth: the declared reorder depth, or null for a stream that declares none —
+  // in which case this is inert and its watermark is always -Infinity.
+  constructor(depth) {
+    this.capacity = (depth === null || depth === undefined) ? 0 : depth + 1;
+    this.largestTimes = [];
+  }
+
+  observe(time) {
+    if (!this.capacity) return;
+    const largest = this.largestTimes;
+    if (largest.length === this.capacity && time <= largest[0]) return;
+    let position = largest.length;
+    while (position > 0 && largest[position - 1] > time) position--;
+    largest.splice(position, 0, time);
+    if (largest.length > this.capacity) largest.shift();
+  }
+
+  // -Infinity until N + 1 frames have been seen: with fewer in hand there is
+  // nothing the declaration rules out.
+  get watermark() {
+    return (this.capacity && this.largestTimes.length === this.capacity)
+      ? this.largestTimes[0] : -Infinity;
+  }
+}
 // ==================================================================
 // Matroska/WebM frame table — the second way to get real timestamps, and (since
 // v2.2) a full decode table as well.
@@ -814,7 +1338,7 @@ const MATROSKA_MAXIMUM_BLOCK_TIMESTAMP_OFFSET = 32768;
 // codecs, not a habit of muxers, which is why it is safe to certify a frame the
 // moment the next one is read instead of waiting out the 32768-tick window
 // above. Everything else (H.264, HEVC, AV1 in Matroska) can reorder.
-function codecHasNoPresentationReordering(codecId) {
+function matroskaCodecHasNoPresentationReordering(codecId) {
   return codecId === 'V_VP8' || codecId === 'V_VP9';
 }
 
@@ -1051,6 +1575,11 @@ async function readMatroskaFrameTable(reader, options = {}) {
     // cluster-based bound rather than trusting the codec's promise.
     blocksAreInPresentationOrder: true,
     lastBlockTicks: -Infinity,
+    // The watermark this bitstream's own declared reorder depth proves, kept up
+    // to date as blocks are read. Replaced when Tracks is read (before any block
+    // can arrive) with one that knows the track's depth; inert until then, and
+    // inert for good on a codec that declares nothing.
+    declaredReorderWatermark: new DeclaredReorderWatermark(null),
   };
 
   // Build and hand a progress report to onProgress, never letting the indicator
@@ -1252,55 +1781,41 @@ async function readFirstKeyframeBytes(reader, keyframe) {
 }
 
 // The next contiguous run of decode-order frames whose place on the display
-// timeline is settled, or null when nothing new can be settled yet.
+// timeline is settled, or null when nothing new can be settled yet. The run
+// itself is found by longestCertifiedRun; what this adds is the Matroska-shaped
+// proof of how early an unread block could present.
 //
-// Two things could still displace a frame we have read: a frame we have NOT read
-// (bounded by the container — see below), and a frame we HAVE read but not yet
-// handed over, which for a reordering codec can carry an earlier presentation
-// time than one before it in decode order. So the watermark this promises is the
-// smaller of those two bounds, and the run is the longest prefix whose every
-// frame sits strictly below it.
+// There are up to two such proofs, and since both are proofs, the better of them
+// is taken.
 //
-// The container's own bound:
+// What the CONTAINER proves:
 //   * a codec that does not reorder settles a frame as soon as the next one is
 //     read, because storage order IS presentation order;
 //   * otherwise the earliest time an unread block can carry is the current
 //     cluster's timestamp minus the widest offset a block can hold (or minus the
 //     caller's asserted reorder bound, where it gave one).
+//
+// What the BITSTREAM proves, where the stream declares a reorder depth: see
+// DeclaredReorderWatermark. It is counted in frames rather than in the
+// 32768-tick window, so for H.264 and HEVC it is the difference between a
+// handful of frames of lag and half a minute of it.
 function nextCertifiedRun(state, reorderGuardTicks) {
-  const frames = state.frames;
-  const from = state.certifiedFrameCount;
-  const length = frames.length;
-  if (from >= length) return null;
-
-  const containerWatermark =
-    (codecHasNoPresentationReordering(state.codecId) && state.blocksAreInPresentationOrder)
+  const containerWatermark = Math.max(
+    (matroskaCodecHasNoPresentationReordering(state.codecId) && state.blocksAreInPresentationOrder)
       ? state.lastBlockTicks
-      : state.clusterTimestamp - reorderGuardTicks;
-  if (!(containerWatermark > state.certifiedWatermarkTicks)) return null;
+      : state.clusterTimestamp - reorderGuardTicks,
+    state.declaredReorderWatermark.watermark);
 
-  // The earliest presentation time still in hand, from each possible cut point
-  // backwards: suffixMinimum[i - from] is the smallest tick over frames[i..).
-  const suffixMinimum = new Float64Array(length - from + 1);
-  suffixMinimum[length - from] = Infinity;
-  for (let i = length - 1; i >= from; i--) {
-    suffixMinimum[i - from] = Math.min(frames[i].ticks, suffixMinimum[i - from + 1]);
-  }
-
-  // Grow the run while its running maximum stays below everything left behind.
-  let end = from;
-  let runMaximum = -Infinity;
-  let watermarkTicks = state.certifiedWatermarkTicks;
-  while (end < length) {
-    const candidateMaximum = Math.max(runMaximum, frames[end].ticks);
-    const promise = Math.min(containerWatermark, suffixMinimum[end + 1 - from]);
-    if (!(candidateMaximum < promise)) break;
-    runMaximum = candidateMaximum;
-    watermarkTicks = promise;
-    end++;
-  }
-  if (end === from) return null;
-  return { frames: frames.slice(from, end), end, watermarkTicks };
+  const run = longestCertifiedRun(
+    (index) => state.frames[index].ticks,
+    state.frames.length, state.certifiedFrameCount,
+    containerWatermark, state.certifiedWatermarkTicks);
+  if (!run) return null;
+  return {
+    frames: state.frames.slice(state.certifiedFrameCount, run.end),
+    end: run.end,
+    watermarkTicks: run.watermark,
+  };
 }
 
 // Frames per second, for the one place a codec string needs it (a VP9 level is
@@ -1411,6 +1926,25 @@ async function readMatroskaTrackEntry(cursor, end, state) {
   state.videoHeight = height;
   state.codecId = codecId;
   state.codecPrivate = codecPrivate;
+  // Read once, here, because it has to be known before the first block is
+  // recorded: from that point on every block updates the running list of latest
+  // presentation times the bound is applied to (see DeclaredReorderWatermark).
+  state.declaredReorderWatermark =
+    new DeclaredReorderWatermark(matroskaReorderDepth(codecId, codecPrivate));
+}
+
+// The bitstream's own statement of how far it reorders, in frames, for the two
+// Matroska codecs that carry one. Null for everything else — VP8 and VP9 do not
+// reorder at all and are certified by a stronger rule, and neither an AV1
+// sequence header nor a VFW-wrapped oddity declares anything of the kind.
+function matroskaReorderDepth(codecId, codecPrivate) {
+  if (codecId === 'V_MPEG4/ISO/AVC') {
+    return declaredFrameReorderDepth('avcC', codecPrivate);
+  }
+  if (codecId === 'V_MPEGH/ISO/HEVC') {
+    return declaredFrameReorderDepth('hvcC', codecPrivate);
+  }
+  return null;
 }
 
 async function readMatroskaCluster(cursor, end, state) {
@@ -1744,6 +2278,7 @@ async function readMatroskaBlock(cursor, blockEnd, state, keyframeFlagOverride) 
   // one is read (see nextCertifiedRun). One inversion and we stop believing it.
   if (ticks < state.lastBlockTicks) state.blocksAreInPresentationOrder = false;
   state.lastBlockTicks = ticks;
+  state.declaredReorderWatermark.observe(ticks);
   state.frames.push({
     offset,
     size: blockEnd - offset,
@@ -2864,6 +3399,15 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 // fails here, and the <video> element cannot play those either. That is the
 // intended refusal, not a bug.
 // ==================================================================
+// A frame turned up whose display position sorts before one already published,
+// which means the watermark that published it was not a watermark at all. Its
+// own class because it is the one failure that cannot be softened into a
+// truncated index: the frames already handed out are the wrong frames, not
+// merely fewer of them. See ContainerIndex.load and _appendDisplayFrames.
+class CertifiedPrefixViolationError extends Error {
+  constructor(message) { super(message); this.name = 'CertifiedPrefixViolationError'; }
+}
+
 class ContainerIndex extends EventTarget {
   constructor(reader) {
     super();
@@ -2978,6 +3522,14 @@ class ContainerIndex extends EventTarget {
       else if (await ContainerIndex._isAvi(reader)) await index._demuxAvi(reader, options);
       else await index._demuxIsobmff(reader, options);
     } catch (err) {
+      // One failure is not survivable, and it is the one that says so: a frame
+      // turning up before one already published means the watermark that let
+      // that frame out was wrong, so the numbers already handed over are wrong
+      // too. Keeping them as a truncated index would hand the host exactly the
+      // frame numbers this error exists to say cannot be trusted, so it goes
+      // straight out and the clip is refused.
+      if (err instanceof CertifiedPrefixViolationError) throw err;
+      // Everything else is a pass that stopped early rather than one that lied.
       // A pass that had already published a certified prefix keeps it. Those
       // frames were certified BEFORE they went out — the guarantee is that every
       // frame number reported is exact and permanent, not that every clip can be
@@ -3648,7 +4200,7 @@ class ContainerIndex extends EventTarget {
     } else {
       const lastPublished = this.samples[this._displayToDecodeBuffer[this._displayCount - 1]];
       if (first.cts < lastPublished.cts) {
-        throw new Error(
+        throw new CertifiedPrefixViolationError(
           `container index: a frame at composition time ${first.cts} was scanned `
           + `after display frame ${this._displayCount - 1} at ${lastPublished.cts} `
           + 'had already been published, so the certified prefix was not certified '

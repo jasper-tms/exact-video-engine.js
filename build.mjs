@@ -20,7 +20,7 @@
 // file, and the release workflow runs it before tagging, the same way the
 // version pins are guarded (see .githooks/sync_version.sh).
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -34,6 +34,8 @@ const MODULE_ORDER = [
   'src/range-readers.js',
   'src/read-priority-gate.js',
   'src/index-cache.js',
+  'src/frame-reorder-bound.js',
+  'src/certified-prefix.js',
   'src/matroska.js',
   'src/ogg.js',
   'src/avi.js',
@@ -83,13 +85,72 @@ function stripModuleSyntax(source, modulePath) {
   return kept.join('\n');
 }
 
+// Refuse to build while a module in src/ is missing from MODULE_ORDER above.
+//
+// The list is written by hand because concatenation order is dependency order,
+// which no directory listing knows. The failure that costs is the silent one: a
+// new module the list does not mention is simply left out, the modular source
+// and its Node tests go on passing, and the built script — the only thing a
+// consumer loads — throws "X is not defined" the first time that code runs. So
+// the omission is made loud here instead, where it is one line to fix.
+async function assertEveryModuleIsListed() {
+  const listed = new Set(MODULE_ORDER);
+  const present = (await readdir(join(repositoryRoot, 'src')))
+    .filter((name) => name.endsWith('.js'))
+    .map((name) => `src/${name}`);
+  const missing = present.filter((path) => !listed.has(path)).sort();
+  if (missing.length) {
+    throw new Error(`${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} in `
+      + 'src/ but missing from MODULE_ORDER in build.mjs, so the built script would '
+      + 'not contain it. Add it to the list, after whatever it depends on.');
+  }
+}
+
+// Refuse to build while two modules declare the same top-level name.
+//
+// In src/ that is legal and invisible: each module has its own scope, so two
+// files may each have a `codecHasNoPresentationReordering` meaning different
+// things, and every import resolves to the right one. Concatenated into one
+// classic script they land in the SAME scope, the later declaration silently
+// wins, and one module starts calling the other's function. Node tests keep
+// passing — they run the modules — while the built file, which is the only thing
+// a consumer loads, quietly does the wrong thing.
+//
+// So the collision is caught here. This looks only at top-level declarations,
+// which is all the concatenation can collide: anything nested is in a function
+// or class body and stays there.
+function collidingTopLevelNames(modules) {
+  const declaredIn = new Map();
+  const collisions = [];
+  for (const { modulePath, source } of modules) {
+    for (const line of source.split('\n')) {
+      const match = /^(?:async )?(?:class|function|const|let|var) ([A-Za-z_$][\w$]*)/.exec(line);
+      if (!match) continue;   // indented, so not top level
+      const name = match[1];
+      if (declaredIn.has(name) && declaredIn.get(name) !== modulePath) {
+        collisions.push(`${name} (in ${declaredIn.get(name)} and ${modulePath})`);
+      } else {
+        declaredIn.set(name, modulePath);
+      }
+    }
+  }
+  return collisions;
+}
+
 async function buildOutput() {
-  const pieces = [GENERATED_BANNER];
+  await assertEveryModuleIsListed();
+  const modules = [];
   for (const modulePath of MODULE_ORDER) {
     const source = await readFile(join(repositoryRoot, modulePath), 'utf8');
-    pieces.push(stripModuleSyntax(source, modulePath));
+    modules.push({ modulePath, source: stripModuleSyntax(source, modulePath) });
   }
-  return pieces.join('');
+  const collisions = collidingTopLevelNames(modules);
+  if (collisions.length) {
+    throw new Error('two modules declare the same top-level name, which the '
+      + 'concatenated script cannot keep apart — the later one would silently win '
+      + `for both: ${collisions.join('; ')}. Rename one of each pair.`);
+  }
+  return [GENERATED_BANNER, ...modules.map((m) => m.source)].join('');
 }
 
 const built = await buildOutput();

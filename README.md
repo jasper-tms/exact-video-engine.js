@@ -256,12 +256,29 @@ on what the container proves rather than on what muxers usually do:
 - **VP8 and VP9** do not reorder frames for presentation, so storage order *is*
   presentation order and a frame is certified the moment the next one is read.
   Effectively no lag; this is most real `.webm`.
-- **H.264, HEVC and AV1 in Matroska** can reorder, and nothing in the container
-  bounds by how much. A block's timestamp is its cluster's plus a *signed 16-bit*
-  offset, so the honest bound is that window: 32768 ticks, or 32.8 seconds at the
-  default 1 ms timestamp scale. A clip shorter than that — or one written as a
-  single cluster — certifies nothing early and simply indexes in one pass, which
-  is the correct conservative answer rather than a failure.
+- **H.264 and HEVC** say how far they reorder, in their own sequence parameter
+  set, and that beats anything the container knows. H.264 writes
+  `max_num_reorder_frames` in the VUI and HEVC writes `sps_max_num_reorder_pics`
+  outright; both mean *the greatest number of frames that may precede a frame in
+  decode order and follow it in presentation order*, and both are typically 0, 1
+  or 2. Read that backwards and it is a watermark: once a frame has N + 1 frames
+  at or after its own presentation time already in hand, an unread frame landing
+  before it would have to displace all N + 1, which the stream is not allowed to
+  do. So the lag is a *handful of frames* rather than a span of time. Where H.264
+  writes no VUI at all, the specification's own inference applies — a conforming
+  stream can never reorder past its level's decoded-picture-buffer capacity — so
+  there is a bound either way.
+- **AV1 in Matroska**, and anything whose setup record we cannot read, falls back
+  to what the container proves: a block's timestamp is its cluster's plus a
+  *signed 16-bit* offset, so the honest bound is that window — 32768 ticks, or
+  32.8 seconds at the default 1 ms timestamp scale. A clip shorter than that — or
+  one written as a single cluster — certifies nothing early and simply indexes in
+  one pass, which is the correct conservative answer rather than a failure.
+
+Both are proofs, so whichever is tighter is the one used. And a stream that
+breaks its own declaration is not papered over: a frame arriving before one
+already published means the numbers already handed out are wrong, so the clip is
+refused outright rather than kept as a shorter index (`CertifiedPrefixViolationError`).
 
 If the pass later dies (a budget, a dropped connection, a corrupt tail), the
 frames already published *stay*: they were certified before they went out. The

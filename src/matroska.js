@@ -1,4 +1,6 @@
 import { awaitPriorityReadsQuiet } from './read-priority-gate.js';
+import { declaredFrameReorderDepth } from './frame-reorder-bound.js';
+import { longestCertifiedRun, DeclaredReorderWatermark } from './certified-prefix.js';
 
 // ==================================================================
 // Matroska/WebM frame table — the second way to get real timestamps, and (since
@@ -103,7 +105,7 @@ const MATROSKA_MAXIMUM_BLOCK_TIMESTAMP_OFFSET = 32768;
 // codecs, not a habit of muxers, which is why it is safe to certify a frame the
 // moment the next one is read instead of waiting out the 32768-tick window
 // above. Everything else (H.264, HEVC, AV1 in Matroska) can reorder.
-function codecHasNoPresentationReordering(codecId) {
+function matroskaCodecHasNoPresentationReordering(codecId) {
   return codecId === 'V_VP8' || codecId === 'V_VP9';
 }
 
@@ -340,6 +342,11 @@ export async function readMatroskaFrameTable(reader, options = {}) {
     // cluster-based bound rather than trusting the codec's promise.
     blocksAreInPresentationOrder: true,
     lastBlockTicks: -Infinity,
+    // The watermark this bitstream's own declared reorder depth proves, kept up
+    // to date as blocks are read. Replaced when Tracks is read (before any block
+    // can arrive) with one that knows the track's depth; inert until then, and
+    // inert for good on a codec that declares nothing.
+    declaredReorderWatermark: new DeclaredReorderWatermark(null),
   };
 
   // Build and hand a progress report to onProgress, never letting the indicator
@@ -541,55 +548,41 @@ async function readFirstKeyframeBytes(reader, keyframe) {
 }
 
 // The next contiguous run of decode-order frames whose place on the display
-// timeline is settled, or null when nothing new can be settled yet.
+// timeline is settled, or null when nothing new can be settled yet. The run
+// itself is found by longestCertifiedRun; what this adds is the Matroska-shaped
+// proof of how early an unread block could present.
 //
-// Two things could still displace a frame we have read: a frame we have NOT read
-// (bounded by the container — see below), and a frame we HAVE read but not yet
-// handed over, which for a reordering codec can carry an earlier presentation
-// time than one before it in decode order. So the watermark this promises is the
-// smaller of those two bounds, and the run is the longest prefix whose every
-// frame sits strictly below it.
+// There are up to two such proofs, and since both are proofs, the better of them
+// is taken.
 //
-// The container's own bound:
+// What the CONTAINER proves:
 //   * a codec that does not reorder settles a frame as soon as the next one is
 //     read, because storage order IS presentation order;
 //   * otherwise the earliest time an unread block can carry is the current
 //     cluster's timestamp minus the widest offset a block can hold (or minus the
 //     caller's asserted reorder bound, where it gave one).
+//
+// What the BITSTREAM proves, where the stream declares a reorder depth: see
+// DeclaredReorderWatermark. It is counted in frames rather than in the
+// 32768-tick window, so for H.264 and HEVC it is the difference between a
+// handful of frames of lag and half a minute of it.
 function nextCertifiedRun(state, reorderGuardTicks) {
-  const frames = state.frames;
-  const from = state.certifiedFrameCount;
-  const length = frames.length;
-  if (from >= length) return null;
-
-  const containerWatermark =
-    (codecHasNoPresentationReordering(state.codecId) && state.blocksAreInPresentationOrder)
+  const containerWatermark = Math.max(
+    (matroskaCodecHasNoPresentationReordering(state.codecId) && state.blocksAreInPresentationOrder)
       ? state.lastBlockTicks
-      : state.clusterTimestamp - reorderGuardTicks;
-  if (!(containerWatermark > state.certifiedWatermarkTicks)) return null;
+      : state.clusterTimestamp - reorderGuardTicks,
+    state.declaredReorderWatermark.watermark);
 
-  // The earliest presentation time still in hand, from each possible cut point
-  // backwards: suffixMinimum[i - from] is the smallest tick over frames[i..).
-  const suffixMinimum = new Float64Array(length - from + 1);
-  suffixMinimum[length - from] = Infinity;
-  for (let i = length - 1; i >= from; i--) {
-    suffixMinimum[i - from] = Math.min(frames[i].ticks, suffixMinimum[i - from + 1]);
-  }
-
-  // Grow the run while its running maximum stays below everything left behind.
-  let end = from;
-  let runMaximum = -Infinity;
-  let watermarkTicks = state.certifiedWatermarkTicks;
-  while (end < length) {
-    const candidateMaximum = Math.max(runMaximum, frames[end].ticks);
-    const promise = Math.min(containerWatermark, suffixMinimum[end + 1 - from]);
-    if (!(candidateMaximum < promise)) break;
-    runMaximum = candidateMaximum;
-    watermarkTicks = promise;
-    end++;
-  }
-  if (end === from) return null;
-  return { frames: frames.slice(from, end), end, watermarkTicks };
+  const run = longestCertifiedRun(
+    (index) => state.frames[index].ticks,
+    state.frames.length, state.certifiedFrameCount,
+    containerWatermark, state.certifiedWatermarkTicks);
+  if (!run) return null;
+  return {
+    frames: state.frames.slice(state.certifiedFrameCount, run.end),
+    end: run.end,
+    watermarkTicks: run.watermark,
+  };
 }
 
 // Frames per second, for the one place a codec string needs it (a VP9 level is
@@ -700,6 +693,25 @@ async function readMatroskaTrackEntry(cursor, end, state) {
   state.videoHeight = height;
   state.codecId = codecId;
   state.codecPrivate = codecPrivate;
+  // Read once, here, because it has to be known before the first block is
+  // recorded: from that point on every block updates the running list of latest
+  // presentation times the bound is applied to (see DeclaredReorderWatermark).
+  state.declaredReorderWatermark =
+    new DeclaredReorderWatermark(matroskaReorderDepth(codecId, codecPrivate));
+}
+
+// The bitstream's own statement of how far it reorders, in frames, for the two
+// Matroska codecs that carry one. Null for everything else — VP8 and VP9 do not
+// reorder at all and are certified by a stronger rule, and neither an AV1
+// sequence header nor a VFW-wrapped oddity declares anything of the kind.
+function matroskaReorderDepth(codecId, codecPrivate) {
+  if (codecId === 'V_MPEG4/ISO/AVC') {
+    return declaredFrameReorderDepth('avcC', codecPrivate);
+  }
+  if (codecId === 'V_MPEGH/ISO/HEVC') {
+    return declaredFrameReorderDepth('hvcC', codecPrivate);
+  }
+  return null;
 }
 
 async function readMatroskaCluster(cursor, end, state) {
@@ -1033,6 +1045,7 @@ async function readMatroskaBlock(cursor, blockEnd, state, keyframeFlagOverride) 
   // one is read (see nextCertifiedRun). One inversion and we stop believing it.
   if (ticks < state.lastBlockTicks) state.blocksAreInPresentationOrder = false;
   state.lastBlockTicks = ticks;
+  state.declaredReorderWatermark.observe(ticks);
   state.frames.push({
     offset,
     size: blockEnd - offset,

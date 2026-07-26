@@ -63,6 +63,15 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 // fails here, and the <video> element cannot play those either. That is the
 // intended refusal, not a bug.
 // ==================================================================
+// A frame turned up whose display position sorts before one already published,
+// which means the watermark that published it was not a watermark at all. Its
+// own class because it is the one failure that cannot be softened into a
+// truncated index: the frames already handed out are the wrong frames, not
+// merely fewer of them. See ContainerIndex.load and _appendDisplayFrames.
+export class CertifiedPrefixViolationError extends Error {
+  constructor(message) { super(message); this.name = 'CertifiedPrefixViolationError'; }
+}
+
 export class ContainerIndex extends EventTarget {
   constructor(reader) {
     super();
@@ -177,6 +186,14 @@ export class ContainerIndex extends EventTarget {
       else if (await ContainerIndex._isAvi(reader)) await index._demuxAvi(reader, options);
       else await index._demuxIsobmff(reader, options);
     } catch (err) {
+      // One failure is not survivable, and it is the one that says so: a frame
+      // turning up before one already published means the watermark that let
+      // that frame out was wrong, so the numbers already handed over are wrong
+      // too. Keeping them as a truncated index would hand the host exactly the
+      // frame numbers this error exists to say cannot be trusted, so it goes
+      // straight out and the clip is refused.
+      if (err instanceof CertifiedPrefixViolationError) throw err;
+      // Everything else is a pass that stopped early rather than one that lied.
       // A pass that had already published a certified prefix keeps it. Those
       // frames were certified BEFORE they went out — the guarantee is that every
       // frame number reported is exact and permanent, not that every clip can be
@@ -847,7 +864,7 @@ export class ContainerIndex extends EventTarget {
     } else {
       const lastPublished = this.samples[this._displayToDecodeBuffer[this._displayCount - 1]];
       if (first.cts < lastPublished.cts) {
-        throw new Error(
+        throw new CertifiedPrefixViolationError(
           `container index: a frame at composition time ${first.cts} was scanned `
           + `after display frame ${this._displayCount - 1} at ${lastPublished.cts} `
           + 'had already been published, so the certified prefix was not certified '
