@@ -81,9 +81,39 @@
   }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: 0.4; cursor: default; }
-  /* The two step buttons carry a single glyph; give them a common width so the
-     control bar does not shift, and keep the triangles optically centered. */
-  #previous, #next { min-width: 48px; text-align: center; line-height: 1; }
+  /* Fixed square box, regardless of which icon a button holds, so the play
+     button never resizes when it swaps between its play and pause icons (it
+     used to, back when it was a "Play"/"Pause" text label). Each icon is
+     inline SVG rather than a Unicode glyph: a font glyph is centered by its
+     line box, not its ink, which left the previous ◀/▶ triangles and the
+     play/pause label visibly off-center. These are authored with their
+     bounding box centered in their 24x24 viewBox instead — equal empty
+     margin on the left and right. The chevrons open to a 110-degree interior
+     angle (rather than a right angle) as a deliberate style choice. */
+  .icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+  }
+  .icon-button .icon {
+    width: 20px;
+    height: 20px;
+    display: block;
+  }
+  /* Both icons are always in the DOM (see the #play markup above); only one
+     is shown at a time, so swapping between them never changes the box. */
+  .icon-button .icon-pause {
+    display: none;
+  }
+  #play.is-playing .icon-play {
+    display: none;
+  }
+  #play.is-playing .icon-pause {
+    display: block;
+  }
 
   #player { display: none; }
   #player.loaded { display: block; }
@@ -207,9 +237,16 @@
     </div>
 
     <div class="controls">
-      <button id="play">Play</button>
-      <button id="previous" title="Previous frame">&#9664;</button>
-      <button id="next" title="Next frame">&#9654;</button>
+      <button id="play" class="icon-button" title="Play/pause">
+        <svg class="icon icon-play" viewBox="0 0 24 24" fill="currentColor"><path d="M3.6 3.25L3.6 20.75L20.4 12Z"/></svg>
+        <svg class="icon icon-pause" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg>
+      </button>
+      <button id="previous" class="icon-button" title="Previous frame">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.1 6L9.9 12L14.1 18"/></svg>
+      </button>
+      <button id="next" class="icon-button" title="Next frame">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 6L14.1 12L9.9 18"/></svg>
+      </button>
       <span class="readout">
         frame <strong id="frame-readout">0</strong> / <span id="total-readout">0</span>
       </span>
@@ -338,7 +375,7 @@ async function load(file) {
     `${engine.videoWidth}×${engine.videoHeight}`;
 
   setStatus('');
-  playButton.textContent = 'Play';
+  playButton.classList.remove('is-playing');
 }
 
 // Whether the container could be indexed. That is the fork in the road: the
@@ -413,7 +450,7 @@ function tick(now) {
     frameReadout.textContent = frame;
     timeReadout.textContent = formatTime(engine.currentTime);
     if (!scrubbing) scrubber.value = frame;
-    playButton.textContent = engine.paused ? 'Play' : 'Pause';
+    playButton.classList.toggle('is-playing', !engine.paused);
   }
   requestAnimationFrame(tick);
 }
