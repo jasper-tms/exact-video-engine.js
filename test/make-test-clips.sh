@@ -31,11 +31,10 @@ cd "$(dirname "$0")"
 mkdir -p clips
 
 # The counter frames are drawn once, here, and every clip below is encoded from
-# the same bytes -- so two fixtures differing in container or codec really do
-# differ in nothing else. They are drawn in Python rather than by ffmpeg's
-# drawtext filter because drawtext needs an ffmpeg built with libfreetype, and
-# plenty are not (including the one this was written against); a bar alone could
-# be drawn with geq, but digits cannot.
+# the same bytes, so two fixtures differing in container or codec differ in
+# nothing else. Python rather than ffmpeg's drawtext filter: drawtext needs an
+# ffmpeg built with libfreetype and plenty are not. A bar alone could be drawn
+# with geq; digits cannot.
 python3 make-counter-frames.py 150 90 30 clips/counter-frames-150x90.gray
 python3 make-counter-frames.py 170 94 25 clips/counter-frames-170x94.gray
 
@@ -72,10 +71,9 @@ done
 #     -qp 0; -bf 0 keeps that property explicit now that the encode is lossy.
 #   * -sc_threshold 0 (no scene-change keyframes) so the group of pictures is
 #     exactly what -g 10 says: keyframes at frames 0, 10 and 20 and nowhere else,
-#     which is what the table tests assert and what counter-elst.mp4's cut
-#     depends on. Without it x264 inserts a fourth keyframe where the frame
-#     number's digits change shape enough to read as a cut -- a real hazard now
-#     that these frames carry printed numbers rather than a bar alone.
+#     which the table tests assert and counter-elst.mp4's cut depends on. Without
+#     it x264 reads the frame number's digits changing shape as a scene cut and
+#     inserts a fourth keyframe.
 # -qp 1 is still visually lossless at the scale that matters here: the bar edges
 # stay a hard black/white step, so visibleFrame()'s "columns brighter than half"
 # detection reads the same bar position on all three browsers' YUV-to-RGB paths.
@@ -327,11 +325,10 @@ ffmpeg -y -loglevel error -f lavfi \
     -c:v rawvideo -f avi clips/counter-rawvideo.avi
 
 # 5. MJPEG AVI — the shape a webcam, a machine-vision camera or an older
-# camcorder writes, and for a long time the other honest-no case here. It is not
-# one any more: no browser has an MJPEG VideoDecoder, but every browser has a
-# JPEG decoder, and each of these frames is one whole JPEG image
-# (src/image-frame-decoder.js). So this is a full 150x90 counter clip like the
-# H.264 AVIs above rather than a token 48x32 — its pixels are walked now.
+# camcorder writes. No browser has an MJPEG VideoDecoder, but every browser has a
+# JPEG decoder and each of these frames is one whole JPEG image
+# (src/image-frame-decoder.js), so this plays and its pixels are walked. Hence a
+# full 150x90 counter clip, like the H.264 AVIs above.
 #
 # -q:v 1 (best quality) so the bar's edges stay a hard black/white step through
 # the JPEG's DCT, which is what visibleFrame()'s "columns brighter than half"

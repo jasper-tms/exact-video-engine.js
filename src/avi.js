@@ -569,12 +569,11 @@ function isMotionJpegFourCc(fourCc) {
 // SPS and PPS, and the caller converts each frame's Annex B to AVCC before feeding
 // it (convertAnnexBToAvcc). The avc1.PPCCLL codec string comes from the SPS.
 //
-// Motion JPEG is the second supported codec, and it needs nothing read out of a
-// frame at all: every sample is a complete JPEG image carrying its own
-// dimensions and colour information, so the configuration is the codec marker
-// and the picture size from the stream header. No browser has an MJPEG
-// VideoDecoder, which is why this used to be refused — but every browser has a
-// JPEG decoder, and src/image-frame-decoder.js is the adapter that reaches it.
+// Motion JPEG needs nothing read out of a frame at all: every sample is a
+// complete JPEG image carrying its own dimensions and colour information, so the
+// configuration is the codec marker plus the picture size from the stream
+// header. No browser has an MJPEG VideoDecoder; src/image-frame-decoder.js
+// reaches the browser's JPEG decoder instead.
 //
 // Uncompressed video (biCompression 0 / 'DIB ' / 'RAW ') and everything else
 // still return null: a raw-frame path needs the whole BI_RGB pixel-format

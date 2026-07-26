@@ -3,26 +3,25 @@
 // Motion JPEG is a sequence of complete JPEG images, one per frame, and it is
 // what a great deal of real footage actually is: webcams, machine-vision and
 // microscope cameras, older camcorders, and much of what sits in a `.avi` on a
-// lab drive. No browser ships an MJPEG `VideoDecoder` — so until now this engine
-// refused every one of those clips, having correctly decided it could not
-// configure a decoder for them.
+// lab drive.
 //
-// But every browser has had a JPEG decoder since before any of this existed. The
-// container index already gives each frame an exact byte range and an exact
-// presentation time; all that is missing is something to turn one frame's bytes
-// into a `VideoFrame`, which `createImageBitmap` does everywhere.
+// No browser ships an MJPEG `VideoDecoder`, and none is needed. Every browser
+// has a JPEG decoder, the container index already gives each frame an exact byte
+// range and an exact presentation time, and `createImageBitmap` turns one
+// frame's bytes into something a `VideoFrame` can be built from.
 //
 // So this class is a `VideoDecoder` in shape — same constructor, same
 // `configure` / `decode` / `flush` / `reset` / `close`, same `decodeQueueSize`
 // and `output` callback — and the engine's decode driver uses it without knowing
-// the difference. That is deliberate: the driver's hard parts (keyframe runs,
+// the difference. Keep it that way: the driver's hard parts (keyframe runs,
 // read-ahead windows, the byte-budgeted frame cache) are about WHICH frames to
-// decode, not about how, and none of it needed to change.
+// decode, so a codec that changes only HOW belongs behind this interface rather
+// than in a branch through the driver.
 //
-// Two things fall out of every frame being independent, and both are pure gain:
-// there is no keyframe to walk forward from, so `bitmapForFrame()` on frame
-// 40000 costs exactly one frame's work rather than a GOP's; and there is no
-// reordering, so a progressively built index certifies immediately.
+// Two things follow from every frame being independent. `bitmapForFrame()` on
+// frame 40000 costs one frame's work rather than a group of pictures', because
+// there is no keyframe to walk forward from; and nothing reorders, so a
+// progressively built index certifies a frame as soon as it is read.
 //
 // `createImageBitmap` rather than `ImageDecoder`: ImageDecoder would save a copy
 // and is the better fit on paper, but it is not in Safari, and a second code

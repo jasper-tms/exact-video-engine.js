@@ -369,23 +369,21 @@ AVI support. Motion JPEG takes the image-frame path below. Uncompressed
 
 A Motion JPEG clip is a run of complete JPEG images, one per frame — what
 webcams, machine-vision and microscope cameras, and older camcorders write, and
-much of what sits in a `.avi` on a lab drive. No browser ships an MJPEG
-`VideoDecoder`, so every one of those clips used to be refused: correctly, since
-there was no decoder to configure.
+much of what sits in a `.avi` on a lab drive.
 
-But every browser has had a JPEG decoder since long before any of this. The
-container index already gives each frame an exact byte range and an exact
-presentation time; the only missing piece was something to turn one frame's
-bytes into a `VideoFrame`, which `createImageBitmap` does everywhere. So
+No browser ships an MJPEG `VideoDecoder`, and none is needed. Every browser has
+a JPEG decoder, the container index already gives each frame an exact byte range
+and an exact presentation time, and `createImageBitmap` turns one frame's bytes
+into something a `VideoFrame` can be built from. So
 `src/image-frame-decoder.js` is a `VideoDecoder` in shape — same constructor,
 same `configure`/`decode`/`flush`/`reset`/`close`, same `decodeQueueSize` and
 `output` callback — and the engine's decode driver uses it without knowing the
 difference. Which frames to decode, and when, is the same problem either way.
 
-Two things fall out of every frame being independent, and both are pure gain.
-`bitmapForFrame()` on frame 40000 costs one frame's work rather than a whole
-group of pictures, because there is no keyframe to walk forward from. And
-nothing reorders, so `playWhileIndexing` certifies immediately.
+Two things follow from every frame being independent. `bitmapForFrame()` on
+frame 40000 costs one frame's work rather than a whole group of pictures,
+because there is no keyframe to walk forward from. And nothing reorders, so
+`playWhileIndexing` certifies a frame as soon as it is read.
 
 It works in both containers that carry MJPEG: the `MJPG` FourCC in AVI, and the
 `jpeg` sample entry in QuickTime/MP4. (mp4box does not recognize `jpeg` as a

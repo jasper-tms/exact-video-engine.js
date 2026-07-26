@@ -225,8 +225,7 @@ for (const [label, path] of [['idx1', IDX1], ['opendml', OPENDML]]) {
 // decoders do not take BI_RGB, and AVI has no native fallback — so it must be
 // refused: the parse declines to produce a decoderConfig, and ContainerIndex.load
 // surfaces a clear error rather than a crash or a hang. A watchdog proves
-// "bounded time". (MJPEG used to be in this list and is not any more: see the
-// image-frame section below.)
+// "bounded time". (MJPEG is not in this list: it plays, see below.)
 async function withinTime(promise, milliseconds) {
   let timer;
   const timeout = new Promise((_, reject) => {

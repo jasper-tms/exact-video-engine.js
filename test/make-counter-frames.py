@@ -17,10 +17,9 @@ Each frame says which frame it is, twice, in two different languages:
 The two halves never overlap, so the bar reading cannot be confused by a digit
 and the digits cannot be clipped by a bar.
 
-The digits are drawn from the 5x7 bitmap font below rather than by ffmpeg's
-drawtext filter, because drawtext needs an ffmpeg built with libfreetype and
-plenty are not (including the one on the machine this was written for). A
-handful of bytes of font data has no such problem.
+The digits come from the 5x7 bitmap font below rather than ffmpeg's drawtext
+filter: drawtext needs an ffmpeg built with libfreetype, and plenty are not. A
+handful of bytes of font data works anywhere.
 
 Output is headerless 8-bit grayscale, one frame after another, which ffmpeg
 reads with:
@@ -60,9 +59,8 @@ PAPER = 0
 def digit_scale(text, width, top_height):
     """The largest whole-pixel scale at which `text` fits the top half.
 
-    Whole pixels only: a fractional scale would put grey edges on the digits,
-    and while nothing measures them, a fixture whose only two values are 0 and
-    255 is one fewer thing to wonder about when a test fails.
+    Whole pixels only, so every pixel in the frame is either 0 or 255; a
+    fractional scale would put grey edges on the digits.
     """
     columns = len(text) * GLYPH_WIDTH + (len(text) - 1) * GLYPH_GAP
     # Leave a two-pixel margin so nothing touches the frame edge or the seam

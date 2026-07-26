@@ -89,11 +89,10 @@ function stripModuleSyntax(source, modulePath) {
 // Refuse to build while a module in src/ is missing from MODULE_ORDER above.
 //
 // The list is written by hand because concatenation order is dependency order,
-// which no directory listing knows. The failure that costs is the silent one: a
-// new module the list does not mention is simply left out, the modular source
-// and its Node tests go on passing, and the built script — the only thing a
-// consumer loads — throws "X is not defined" the first time that code runs. So
-// the omission is made loud here instead, where it is one line to fix.
+// which no directory listing knows. An unlisted module is simply left out of the
+// built script: src/ and its Node tests still pass, and the only thing a
+// consumer loads throws "X is not defined" the first time that code runs. This
+// turns that into a build failure, where it is one line to fix.
 async function assertEveryModuleIsListed() {
   const listed = new Set(MODULE_ORDER);
   const present = (await readdir(join(repositoryRoot, 'src')))
@@ -110,16 +109,14 @@ async function assertEveryModuleIsListed() {
 // Refuse to build while two modules declare the same top-level name.
 //
 // In src/ that is legal and invisible: each module has its own scope, so two
-// files may each have a `codecHasNoPresentationReordering` meaning different
-// things, and every import resolves to the right one. Concatenated into one
-// classic script they land in the SAME scope, the later declaration silently
-// wins, and one module starts calling the other's function. Node tests keep
-// passing — they run the modules — while the built file, which is the only thing
-// a consumer loads, quietly does the wrong thing.
+// files may each declare a `codecHasNoPresentationReordering` meaning different
+// things and every import resolves to the right one. Concatenated into one
+// classic script they land in the SAME scope, the later declaration wins for
+// both, and one module starts calling the other's function — with src/ and its
+// Node tests still passing, since those run the modules.
 //
-// So the collision is caught here. This looks only at top-level declarations,
-// which is all the concatenation can collide: anything nested is in a function
-// or class body and stays there.
+// Only top-level declarations can collide this way; anything nested is inside a
+// function or class body and stays there.
 function collidingTopLevelNames(modules) {
   const declaredIn = new Map();
   const collisions = [];
