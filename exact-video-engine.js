@@ -3399,6 +3399,7 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 // fails here, and the <video> element cannot play those either. That is the
 // intended refusal, not a bug.
 // ==================================================================
+
 // A frame turned up whose display position sorts before one already published,
 // which means the watermark that published it was not a watermark at all. Its
 // own class because it is the one failure that cannot be softened into a
@@ -3406,6 +3407,26 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 // merely fewer of them. See ContainerIndex.load and _appendDisplayFrames.
 class CertifiedPrefixViolationError extends Error {
   constructor(message) { super(message); this.name = 'CertifiedPrefixViolationError'; }
+}
+
+// Which setup record an ISOBMFF codec string's reorder declaration lives in, and
+// what it says. `avc3` and `hev1` keep their parameter sets in the frames rather
+// than in the `stsd`, so their description is empty or absent and the answer is
+// honestly "unknown" — the same as for a codec that declares nothing at all.
+function isobmffReorderDepth(codec, description) {
+  if (/^avc[13]/.test(codec)) return declaredFrameReorderDepth('avcC', description);
+  if (/^(hvc1|hev1)/.test(codec)) return declaredFrameReorderDepth('hvcC', description);
+  return null;
+}
+
+// Codecs with no presentation reordering, by WebCodecs codec string: their
+// frames are stored in the order they are shown. This is a property of the
+// codecs — VP8 has no B-frames at all, and VP9's altref frames are hidden inside
+// superframes rather than reordered for display — not a habit of muxers, which
+// is why a frame can be settled the moment the next one is read. (AV1 reorders,
+// and its sequence header declares no bound we can read.)
+function isobmffCodecHasNoPresentationReordering(codec) {
+  return /^(vp08|vp8|vp09)/.test(codec);
 }
 
 class ContainerIndex extends EventTarget {
@@ -3694,10 +3715,14 @@ class ContainerIndex extends EventTarget {
     // moov sits at the end of the file — so we never read frame bytes here. This
     // is the whole cost for a classic single-`moov` MP4, and it stays exactly as
     // cheap as before: a few range reads, no budget, no progress ticks, no yields.
-    const READY_CHUNK = 1 << 18;   // 256 KB
+    // 256 KB by default: big enough that a moov at the front of the file arrives
+    // in one read. options.chunkBytes overrides it, which is how a test forces a
+    // small fixture to be discovered a little at a time instead of whole in the
+    // first read — the shape a real file of any size has anyway.
+    const readyChunk = options.chunkBytes || (1 << 18);
     let offset = 0;
     while (info === null && demuxError === null && offset < reader.size) {
-      const end = Math.min(offset + READY_CHUNK, reader.size) - 1;
+      const end = Math.min(offset + readyChunk, reader.size) - 1;
       const buffer = await reader.read(offset, end);
       if (!buffer.byteLength) break;
       buffer.fileStart = offset;
@@ -3719,13 +3744,11 @@ class ContainerIndex extends EventTarget {
     const readySampleCount = file.getTrackSamplesInfo(videoTrack.id).length;
     const isFragmented = !!info.isFragmented || (readySampleCount === 0 && offset < reader.size);
 
-    if (isFragmented) {
-      await this._demuxFragmentedIsobmff(reader, file, videoTrack, options,
-        () => demuxError, offset);
-    }
-    file.flush();
-    if (demuxError) throw demuxError;
-
+    // Everything that decides what a frame NUMBER means — the codec, the display
+    // geometry, the timescale, the edit window — is in the `moov`, which phase 1
+    // has already read. Settling it HERE rather than after the fragment pass is
+    // what lets that pass publish frames while it is still running: an index
+    // cannot hand out a frame before it knows its own geometry.
     this.decoderConfig = {
       codec: videoTrack.codec,
       codedWidth: videoTrack.video.width,
@@ -3744,10 +3767,103 @@ class ContainerIndex extends EventTarget {
     const swapAxes = this.rotation === 90 || this.rotation === 270;
     this.videoWidth = swapAxes ? videoTrack.video.height : videoTrack.video.width;
     this.videoHeight = swapAxes ? videoTrack.video.width : videoTrack.video.height;
-
-    this._buildTables(file.getTrackSamplesInfo(videoTrack.id),
-      this._editListWindow(videoTrack));
     this.containerFormat = 'isobmff';
+    const editWindow = this._editListWindow(videoTrack);
+
+    if (isFragmented) {
+      // A fragmented file is the only ISOBMFF shape whose samples arrive over
+      // the length of the file, so it is the only one that can publish early.
+      const publisher = options.publishPartialIndex
+        ? this._fragmentedPublisher(file, videoTrack, editWindow) : null;
+      await this._demuxFragmentedIsobmff(reader, file, videoTrack, options,
+        () => demuxError, offset, publisher);
+      file.flush();
+      if (demuxError) throw demuxError;
+      if (publisher) { publisher.finish(); return; }
+    } else {
+      file.flush();
+      if (demuxError) throw demuxError;
+    }
+
+    this._buildTables(file.getTrackSamplesInfo(videoTrack.id), editWindow);
+  }
+
+  // Publishing a fragmented MP4's frames while the pass that finds them is still
+  // going, on the same terms the Matroska scan publishes on: a frame is handed
+  // out only once nothing still to be read can present before it (see
+  // longestCertifiedRun for the shape of the argument, and the certified-prefix
+  // invariant in _appendDisplayFrames for what enforces it).
+  //
+  // What differs is the proof. Matroska has the signed-16-bit block offset to
+  // fall back on; an unread `moof` is bounded by nothing at all, so a fragmented
+  // file publishes early only where the stream itself says how far it reorders:
+  //
+  //   * H.264 and HEVC declare it in the sequence parameter set sitting in the
+  //     `stsd` we have already parsed (see src/frame-reorder-bound.js). This is
+  //     nearly every fragmented MP4 in existence — it is what CMAF packagers and
+  //     MediaRecorder write.
+  //   * VP8 and VP9 do not reorder at all, so decode order IS presentation order
+  //     and a frame settles the moment the next one is read.
+  //   * Anything else (AV1, or an `avc3`/`hev1` track carrying its parameter sets
+  //     in-band rather than in the `stsd`) publishes nothing early and indexes in
+  //     one pass, which is the correct conservative answer rather than a failure.
+  //
+  // Unlike Matroska, no frame is ever held back for its duration: an ISOBMFF
+  // sample carries its own, so a certified frame is immediately complete.
+  _fragmentedPublisher(file, videoTrack, editWindow) {
+    const declared = new DeclaredReorderWatermark(
+      isobmffReorderDepth(videoTrack.codec, this.decoderConfig.description));
+    const decodeOrderIsDisplayOrder = isobmffCodecHasNoPresentationReordering(videoTrack.codec);
+
+    let observedCount = 0;      // samples fed to the watermark
+    let publishedCount = 0;     // samples appended to the tables
+    let certifiedWatermark = -Infinity;
+    let samplesAreInPresentationOrder = true;
+    let lastCompositionTime = -Infinity;
+
+    // The timescale and edit window are fixed for the life of the index, and both
+    // are known now, so the table can be opened before a fragment is read.
+    this._beginTables(videoTrack.timescale, editWindow);
+
+    const observe = (samples) => {
+      for (; observedCount < samples.length; observedCount++) {
+        const compositionTime = samples[observedCount].cts;
+        if (compositionTime < lastCompositionTime) samplesAreInPresentationOrder = false;
+        lastCompositionTime = compositionTime;
+        declared.observe(compositionTime);
+      }
+    };
+
+    const append = (samples, end) => {
+      const decodeIndices = this._appendSamples(samples.slice(publishedCount, end));
+      this._appendDisplayFrames(this._presentedInDisplayOrder(decodeIndices));
+      publishedCount = end;
+    };
+
+    return {
+      // Called after each chunk of the file has gone through mp4box.
+      certify: () => {
+        const samples = file.getTrackSamplesInfo(videoTrack.id);
+        observe(samples);
+        const watermark = Math.max(
+          (decodeOrderIsDisplayOrder && samplesAreInPresentationOrder)
+            ? lastCompositionTime : -Infinity,
+          declared.watermark);
+        const run = longestCertifiedRun((index) => samples[index].cts,
+          samples.length, publishedCount, watermark, certifiedWatermark);
+        if (!run) return;
+        append(samples, run.end);
+        certifiedWatermark = run.watermark;
+        this._publish();
+      },
+      // The pass reached the end of the file: whatever the certified runs did not
+      // cover is settled now by there being nothing left to read.
+      finish: () => {
+        const samples = file.getTrackSamplesInfo(videoTrack.id);
+        append(samples, samples.length);
+        this._finishTables();
+      },
+    };
   }
 
   // Phase 2 of the ISOBMFF open, for a fragmented file only: feed the whole file
@@ -3760,7 +3876,11 @@ class ContainerIndex extends EventTarget {
   //
   // getDemuxError() surfaces a late mp4box parse error from _demuxIsobmff's onError
   // closure; startOffset is where phase 1 left the cursor (just past the moov).
-  async _demuxFragmentedIsobmff(reader, file, videoTrack, options, getDemuxError, startOffset) {
+  // publisher, when the caller asked for a growing index, is given each chunk's
+  // worth of newly parsed samples to certify and publish (see _fragmentedPublisher).
+  async _demuxFragmentedIsobmff(
+    reader, file, videoTrack, options, getDemuxError, startOffset, publisher
+  ) {
     const maxBytes = (options.maxBytes === undefined) ? Infinity : options.maxBytes;
     // Refuse an oversized file BEFORE the full-file pass, the same gate the
     // Matroska and Ogg scans apply — reading all of it is exactly the cost.
@@ -3825,6 +3945,9 @@ class ContainerIndex extends EventTarget {
       buffer.fileStart = offset;
       const next = file.appendBuffer(buffer);
       offset = (next > offset) ? next : end + 1;
+      // Whatever that chunk's fragments settled can go out now rather than at
+      // the end of the file.
+      if (publisher) publisher.certify();
     }
     report(reader.size);   // a final 100% tick, so the host can settle the bar
   }
@@ -5838,8 +5961,9 @@ async function createBestEngine(source, options = {}) {
     index: providedIndex,
     // Hand back a playable engine as soon as enough of the clip has been indexed
     // to be worth showing, instead of waiting for the whole container to be read.
-    // Only a full-file pass has anything to wait for (WebM today; a classic MP4
-    // indexes in a few range reads however long the clip is), and only the
+    // Only a full-file pass has anything to wait for (WebM/MKV and fragmented
+    // MP4; a classic MP4 indexes in a few range reads however long the clip is,
+    // and an AVI reads its own index rather than the file), and only the
     // WebCodecs tier can use a partial index — the <video> element plays the
     // whole clip whether or not we have named its frames yet, so an index still
     // growing underneath it would have to answer for frames it has not certified.

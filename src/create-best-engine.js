@@ -57,8 +57,9 @@ export async function createBestEngine(source, options = {}) {
     index: providedIndex,
     // Hand back a playable engine as soon as enough of the clip has been indexed
     // to be worth showing, instead of waiting for the whole container to be read.
-    // Only a full-file pass has anything to wait for (WebM today; a classic MP4
-    // indexes in a few range reads however long the clip is), and only the
+    // Only a full-file pass has anything to wait for (WebM/MKV and fragmented
+    // MP4; a classic MP4 indexes in a few range reads however long the clip is,
+    // and an AVI reads its own index rather than the file), and only the
     // WebCodecs tier can use a partial index — the <video> element plays the
     // whole clip whether or not we have named its frames yet, so an index still
     // growing underneath it would have to answer for frames it has not certified.

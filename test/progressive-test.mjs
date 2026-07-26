@@ -16,11 +16,20 @@
 // handles that) and Playwright to be installed (npm install playwright).
 import { launchBrowser, serverBase, browserName } from './harness.mjs';
 
-// VP9 and VP8 do not reorder, so these certify a prefix as soon as the next
-// frame is read — the case a host actually gets to use. A reordering codec's
-// honest watermark is the full 32768-tick block-offset window, which a
-// one-second fixture never clears; that behaviour is pinned in the Node test.
-const CLIPS = ['counter-cfr.webm', 'counter-vp8.webm'];
+// Every container shape that can hand back a playable prefix, one clip each.
+// VP9 and VP8 certify as soon as the next frame is read because they do not
+// reorder at all; H.264 certifies nearly as eagerly because these clips' own
+// sequence parameter set declares a reorder depth of zero. The fragmented MP4 is
+// here because it is the shape a recorder or a CMAF packager writes — the case
+// where "play it while it indexes" is worth the most — and because it reaches
+// the same certification machinery down a completely different path (mp4box
+// parsing `moof` boxes, rather than the engine's own cluster scan).
+const CLIPS = [
+  'counter-cfr.webm',              // VP9
+  'counter-vp8.webm',              // VP8
+  'counter-vfr.mkv',               // H.264 in Matroska, declared reorder depth 0
+  'counter-vfr-fragmented.mp4',    // fragmented MP4, indexed through mp4box
+];
 
 const browser = await launchBrowser();
 let failures = 0;

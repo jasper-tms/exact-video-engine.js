@@ -286,6 +286,16 @@ index moves to `'truncated'`, `numFrames` stops rising, and the host is told.
 Nothing is cached in that state — a network hiccup should not become a permanently
 short table for that clip.
 
+This works for a **fragmented MP4** as well as for WebM/MKV, and that is the case
+it is worth the most for: fMP4 is what a recorder or a CMAF packager writes, so
+"just uploaded, want it playing now" is its normal condition. There the reorder
+declaration is the only bound available — nothing bounds an unread `moof` the way
+the signed 16-bit block offset bounds an unread Matroska cluster — so an fMP4
+publishes early exactly when its stream says how far it reorders (H.264 and HEVC,
+which is nearly all of them) or cannot reorder at all (VP8, VP9). An AV1
+fragmented clip, or an `avc3`/`hev1` track keeping its parameter sets in the
+frames rather than in the `stsd`, indexes in one pass as before.
+
 To size a scrubber against the whole clip rather than a track that stretches
 under the cursor, use the index's `expectedDuration` — the length the container
 *declares* (Matroska's `Info/Duration`), fixed from the first publish, `0` when
@@ -308,10 +318,10 @@ write) has no central sample table: an `mvex` box in the `moov` announces that
 the samples live in `moof` fragments scattered through the file. The engine
 detects that and feeds the whole file through mp4box so every fragment's
 samples land in the table — still nothing decoded, but a full-file read, so it
-takes the same budget, progress reporting, and cache treatment as the WebM
-scan. A fragmented index is as complete as a classic one (sample table, decoder
-configuration), so fragmented clips play through WebCodecs wherever classic
-ones do.
+takes the same budget, progress reporting, cache treatment, and
+`playWhileIndexing` treatment as the WebM scan. A fragmented index is as complete
+as a classic one (sample table, decoder configuration), so fragmented clips play
+through WebCodecs wherever classic ones do.
 
 ### Ogg
 
