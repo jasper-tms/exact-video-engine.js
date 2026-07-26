@@ -16,7 +16,7 @@
 // has none), and the frame on screen must be the one that was asked for.
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
-// that) and Playwright (npm install playwright).
+// that) and Playwright (npm install).
 import { launchBrowser, serverBase } from './harness.mjs';
 
 // Neither case calls resizeCanvas() after the pane is revealed. That is the

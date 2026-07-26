@@ -422,6 +422,14 @@ Cheap indexes (a classic MP4's few range reads) are never stored.
 
 ## Usage
 
+There are two ways in, and they want two different files. A `<script>` tag wants
+`exact-video-engine.js`, which is a **classic script**: `build.mjs` concatenates
+`src/` and strips the module syntax, so it defines globals and exports nothing. A
+bundler wants the opposite, so `import` resolves to `index.mjs`, which re-exports
+the same names from the modules in `src/`.
+
+### From a `<script>` tag
+
 ```html
 <!-- mp4box.js must be loaded first to index MP4s (it provides the MP4Box and
      DataStream globals). WebM/MKV, Ogg and AVI indexing are built in. -->
@@ -460,8 +468,32 @@ Cheap indexes (a classic MP4's few range reads) are never stored.
 </script>
 ```
 
-To use `VideoEngine` alone, construct it with the canvas and call `load(source)`
-as before; nothing about that path has changed.
+To use `VideoEngine` alone, construct it with the canvas and call `load(source)`.
+
+### From a bundler
+
+```sh
+npm install exact-video-engine.js mp4box
+```
+
+```js
+// mp4box is a PEER dependency, and installing it is necessary but not
+// sufficient: this engine reads it off the global scope, so put it there before
+// indexing any MP4 or MOV. WebM/MKV, AVI and Ogg need none of this.
+import * as MP4Box from 'mp4box';
+globalThis.MP4Box = MP4Box;
+globalThis.DataStream = MP4Box.DataStream;
+
+import { createBestEngine } from 'exact-video-engine.js';
+
+const engine = await createBestEngine(source, { canvas, video });
+```
+
+`index.mjs` re-exports `createBestEngine`, both engines, `ContainerIndex`, the
+range readers, `formatProgress`, the decode-support predicates, and the two error
+classes a host branches on (`IndexBudgetExceededError`,
+`CertifiedPrefixViolationError`). Everything after this point is identical on
+both paths.
 
 ## API
 
@@ -696,7 +728,7 @@ check exists at all.) To recover: run `.githooks/sync_version.sh`, commit, push.
 
 ## Tests
 
-`test/` needs `ffmpeg` on the PATH and Playwright (`npm install playwright`):
+`test/` needs `ffmpeg` on the PATH and Playwright (`npm install`):
 
 ```sh
 bash test/run-tests.sh

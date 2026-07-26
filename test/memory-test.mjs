@@ -15,7 +15,7 @@
 // anyway and passes.
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
-// that) and Playwright (npm install playwright).
+// that) and Playwright (npm install).
 import { launchBrowser, serverBase } from './harness.mjs';
 
 const LARGE_FILE = 'hd.mp4';        // 1920x1080: ~8.3 MB per decoded frame

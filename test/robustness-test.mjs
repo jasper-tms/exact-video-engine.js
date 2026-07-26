@@ -19,7 +19,7 @@
 //      not fail the suite but a hang or a page crash does.
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
-// that) and Playwright (npm install playwright).
+// that) and Playwright (npm install).
 import { launchBrowser, serverBase } from './harness.mjs';
 
 // Anything slower than this is treated as a hang: every path here is a handful

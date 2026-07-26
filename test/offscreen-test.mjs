@@ -11,7 +11,7 @@
 // against the bug.
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
-// that) and Playwright (npm install playwright).
+// that) and Playwright (npm install).
 import { launchBrowser, serverBase } from './harness.mjs';
 
 const CASES = [

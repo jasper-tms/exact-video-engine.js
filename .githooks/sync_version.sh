@@ -66,6 +66,29 @@ for file in "${FILES[@]}"; do
     fi
 done
 
+# package.json states the version too, and npm has no idea VERSION exists, so it
+# is derived here like every other copy -- a package must never claim a version
+# the tag it was cut from does not.
+#
+# Anchored to a two-space indent so it can only ever match the top-level field,
+# never a "version" key nested inside a dependency block.
+PACKAGE_VERSION_FIELD='^  "version": "[0-9]+\.[0-9]+\.[0-9]+",$'
+package_stale=$(grep -Ec "$PACKAGE_VERSION_FIELD" package.json || true)
+if [ "$package_stale" -eq 0 ]; then
+    echo 'error: package.json has no top-level "version" field to keep in step' >&2
+    exit 1
+fi
+if ! grep -qxF "  \"version\": \"${VERSION}\"," package.json; then
+    if [ "$CHECK" = true ]; then
+        echo "package.json: version disagrees with VERSION ($VERSION):" >&2
+        grep -nE "$PACKAGE_VERSION_FIELD" package.json >&2 || true
+        stale_files=$((stale_files + 1))
+    else
+        perl -pi -e "s{^  \"version\": \"[0-9]+\.[0-9]+\.[0-9]+\",\$}{  \"version\": \"${VERSION}\",}" package.json
+        echo "package.json: version -> ${VERSION}"
+    fi
+fi
+
 if [ "$CHECK" = true ] && [ "$stale_files" -gt 0 ]; then
     echo >&2
     echo "Run .githooks/sync_version.sh to bring them in line with VERSION, and commit the result." >&2

@@ -1,9 +1,25 @@
 test/clips/
 node_modules/
-package.json
+
+# package.json is committed. It carries what only the repository can state: the
+# package name, license and repository, which files a consumer gets, that mp4box
+# is a PEER dependency (this engine reads it off the global scope, so installing
+# it is necessary and not sufficient), and that ./index.mjs is the entry point
+# for anyone reaching this library through a bundler rather than a <script> tag.
+#
+# Run `npm install`, never `npm install playwright`: the bare form reads the
+# committed file, the other rewrites its `dependencies`.
+#
+# Do not hand-edit its version field. .githooks/sync_version.sh derives it from
+# VERSION along with the pinned CDN URLs.
+
+# The lockfile stays ignored: this is a library, so a consumer resolves against
+# the range package.json declares, and a committed lock would only pin a test
+# runner for people who are not running the tests.
 package-lock.json
-# ...but src/package.json is a committed type marker, not a local convenience
-# file: it declares the src/ modules ES modules so they `import` into plain Node
-# (the unit tests, and the README's "parsers import into plain Node" promise)
-# regardless of whatever root package.json `npm install playwright` leaves behind.
+
+# src/package.json is a type marker rather than a package: it declares the src/
+# modules ES modules so they `import` into plain Node (the unit tests, and the
+# README's "parsers import into plain Node" promise) independently of anything
+# the root package.json says.
 !src/package.json

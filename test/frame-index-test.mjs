@@ -44,7 +44,7 @@
 // robustness-test.mjs pins.
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
-// that) and Playwright (npm install playwright).
+// that) and Playwright (npm install).
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';

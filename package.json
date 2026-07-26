@@ -1,0 +1,54 @@
+{
+  "name": "exact-video-engine.js",
+  "version": "2.1.0",
+  "description": "Frame-perfect video playback for the browser, on WebCodecs where it is available and a <video> element where it is not, without giving up exact frame indices in the fallback.",
+  "keywords": [
+    "video",
+    "webcodecs",
+    "frame-accurate",
+    "mp4",
+    "webm",
+    "matroska",
+    "avi",
+    "mjpeg",
+    "variable-frame-rate"
+  ],
+  "license": "MIT",
+  "author": "Jasper Phelps",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jasper-tms/exact-video-engine.js.git"
+  },
+  "homepage": "https://github.com/jasper-tms/exact-video-engine.js#readme",
+  "bugs": "https://github.com/jasper-tms/exact-video-engine.js/issues",
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./script": "./exact-video-engine.js",
+    "./package.json": "./package.json"
+  },
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "src/",
+    "exact-video-engine.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "peerDependencies": {
+    "mp4box": ">=0.5.2"
+  },
+  "peerDependenciesMeta": {
+    "mp4box": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "bash test/run-tests.sh"
+  },
+  "devDependencies": {
+    "playwright": "^1.61.1"
+  }
+}

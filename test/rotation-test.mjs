@@ -3,7 +3,7 @@
 // matches the native <video> element's. Rotation is read the same way on every
 // engine, so there are no per-browser expectations here.
 // Expects the repo root to be served at http://localhost:8798 (run-tests.sh
-// handles that) and Playwright to be installed (npm install playwright).
+// handles that) and Playwright to be installed (npm install).
 import { launchBrowser, serverBase } from './harness.mjs';
 
 const browser = await launchBrowser();

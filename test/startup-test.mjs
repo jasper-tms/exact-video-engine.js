@@ -8,7 +8,7 @@
 // clip's bitrate. Correctness tests cannot see this. Byte counts can.
 //
 // Expects the repo root served at http://localhost:8798 (run-tests.sh handles
-// that) and Playwright (npm install playwright).
+// that) and Playwright (npm install).
 import { launchBrowser, serverBase } from './harness.mjs';
 
 const FILE = 'startup.mp4';

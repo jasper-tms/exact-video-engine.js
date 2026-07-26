@@ -13,7 +13,7 @@
 // under three browsers would only re-test WebCodecs itself.
 //
 // Expects the repo root to be served at http://localhost:8798 (run-tests.sh
-// handles that) and Playwright to be installed (npm install playwright).
+// handles that) and Playwright to be installed (npm install).
 import { launchBrowser, serverBase, browserName } from './harness.mjs';
 
 // Every container shape that can hand back a playable prefix, one clip each.
