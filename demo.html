@@ -136,6 +136,14 @@
     height: 100%;
     object-fit: contain;
   }
+  /* A paused seek whose frame has not been decoded and presented yet (and has
+     taken more than a grace period — see WAITING_INDICATOR_DELAY_MILLISECONDS)
+     dims the picture, so the stale pixels visibly read as "not the frame you
+     asked for". The "Waiting for frame…" pill below the video appears in step
+     with this. */
+  #pane.waiting-for-frame canvas, #pane.waiting-for-frame video {
+    filter: brightness(0.4);
+  }
 
   .controls {
     display: flex;
@@ -185,6 +193,10 @@
      something true and worth reading. */
   button.badge:disabled { opacity: 1; cursor: default; }
   button.badge:disabled::after { content: none; }
+
+  /* Lit while the video is dimmed for a still-pending seek; accent-coloured so
+     the eye lands on the explanation, not just the darkened picture. */
+  #waiting-badge { border-color: var(--accent); color: var(--accent); }
 
   /* Names the clip directly above the frame it labels. */
   #clip-header {
@@ -260,6 +272,9 @@
       <span class="badge" id="format-badge"></span>
       <button class="badge" id="engine-badge" type="button"
               title="Click to play this clip through the other engine"></button>
+      <span class="badge" id="waiting-badge" hidden
+            title="A seek was requested but the target frame has not been decoded and presented yet, so the picture still shows the previous frame — dimmed until the requested frame lands."
+            >Waiting for frame&hellip;</span>
     </div>
   </div>
 
@@ -281,6 +296,59 @@ const durationReadout = document.getElementById('duration-readout');
 
 let engine = null;
 let scrubbing = false;
+
+// The waiting-for-frame indicator (dimmed picture + the pill under the video).
+// A paused seek names its target instantly (engine.currentFrame) but the pixels
+// arrive only when the frame is decoded (engine.presentedFrame); while those
+// disagree the picture on screen is not the frame that was asked for. The grace
+// period keeps an already-cached frame that lands within a tick or two from
+// flashing the indicator, and scrubbing suppresses it — rapid-fire seeks
+// mid-drag are expected to lag a little, and flagging every intermediate tick
+// would be noise, not signal.
+const WAITING_INDICATOR_DELAY_MILLISECONDS = 80;
+let requestedFrame = null;   // last paused-seek target; null once playback runs
+let waitingTimer = null;
+let waitingShown = false;
+const pane = document.getElementById('pane');
+const waitingBadge = document.getElementById('waiting-badge');
+
+function isSeekWaiting() {
+  return !!engine && engine.paused && requestedFrame !== null
+    && typeof engine.presentedFrame === 'number'
+    && engine.presentedFrame !== requestedFrame;
+}
+
+function showWaitingIndicator(show) {
+  if (waitingShown === show) return;
+  waitingShown = show;
+  pane.classList.toggle('waiting-for-frame', show);
+  waitingBadge.hidden = !show;
+}
+
+// Called every tick: settles the indicator off immediately, but only turns it
+// on once the seek has been waiting for the whole grace period.
+function updateWaitingIndicator() {
+  if (!isSeekWaiting() || scrubbing) {
+    if (waitingTimer !== null) { clearTimeout(waitingTimer); waitingTimer = null; }
+    showWaitingIndicator(false);
+    return;
+  }
+  if (waitingShown || waitingTimer !== null) return;
+  waitingTimer = setTimeout(() => {
+    waitingTimer = null;
+    if (isSeekWaiting() && !scrubbing) showWaitingIndicator(true);
+  }, WAITING_INDICATOR_DELAY_MILLISECONDS);
+}
+
+// Every discrete seek routes through here so the indicator always knows the
+// current target. Reading the target back from engine.currentFrame (which
+// lands the instant a seek is requested) rather than storing the raw argument
+// keeps an out-of-range request — stepping past either end of the clip — from
+// recording a frame number that presentedFrame could never reach.
+function seekToFrame(frame) {
+  engine.seekToFrame(frame);
+  requestedFrame = engine.currentFrame;
+}
 
 // ?engine=native forces the <video> fallback, ?engine=webcodecs forces WebCodecs.
 // Without it the library picks, which on a modern desktop browser always means
@@ -314,6 +382,9 @@ async function load(file) {
   // Decoders are a limited browser resource, so hand back the previous engine's
   // before building another.
   if (engine) { engine.destroy(); engine = null; }
+  // A seek target from the previous engine means nothing to the new one.
+  requestedFrame = null;
+  updateWaitingIndicator();
 
   // Build the container index here rather than letting createBestEngine do it,
   // so we can report whether this container could be read at all — the thing
@@ -451,6 +522,13 @@ function tick(now) {
     timeReadout.textContent = formatTime(engine.currentTime);
     if (!scrubbing) scrubber.value = frame;
     playButton.classList.toggle('is-playing', !engine.paused);
+    // Playback supersedes any discrete seek: once the engine is playing, the
+    // last requested frame is no longer a target the picture is chasing, and
+    // keeping it would leave the waiting indicator stuck on after the next
+    // pause (the playhead has moved past it, so presentedFrame can never
+    // match it again).
+    if (!engine.paused) requestedFrame = null;
+    updateWaitingIndicator();
   }
   requestAnimationFrame(tick);
 }
@@ -463,19 +541,19 @@ playButton.addEventListener('click', () => {
 document.getElementById('previous').addEventListener('click', () => {
   if (!engine) return;
   engine.pause();
-  engine.seekToFrame(engine.currentFrame - 1);
+  seekToFrame(engine.currentFrame - 1);
 });
 document.getElementById('next').addEventListener('click', () => {
   if (!engine) return;
   engine.pause();
-  engine.seekToFrame(engine.currentFrame + 1);
+  seekToFrame(engine.currentFrame + 1);
 });
 scrubber.addEventListener('pointerdown', () => { scrubbing = true; });
 scrubber.addEventListener('pointerup', () => { scrubbing = false; });
 scrubber.addEventListener('input', () => {
   if (!engine) return;
   engine.pause();
-  engine.seekToFrame(parseInt(scrubber.value, 10));
+  seekToFrame(parseInt(scrubber.value, 10));
 });
 
 // Browse
