@@ -255,6 +255,18 @@ export class NativeVideoEngine extends EventTarget {
     }
     try {
       this._index = options.index || await ContainerIndex.fromSource(source);
+      // A <video> element plays the whole clip whether or not we have finished
+      // reading the container, so an index still growing underneath it would be
+      // asked, within seconds, which frame is on screen for a part of the clip it
+      // has not certified. The WebCodecs engine can hold the playhead at the last
+      // indexed frame because it owns the clock; this one cannot. So refuse a
+      // partial index here rather than answer for frames it has not read.
+      if (this._index.completionState === 'growing') {
+        throw new Error('NativeVideoEngine: this index is still being built, and a '
+          + '<video> element plays past whatever has been indexed so far — it '
+          + 'cannot be held at the last certified frame the way the WebCodecs '
+          + 'engine can. Wait for the index to finish before loading it here.');
+      }
       this.numFrames = this._index.numFrames;
       this.rotation = this._index.rotation;
 

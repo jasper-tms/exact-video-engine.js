@@ -69,6 +69,20 @@
 // This engine is the *exact* one: an engine it hands back always reports true
 // frame indices, never inferred ones.
 //
+// That rule holds at the level of the frame, not the file, and the difference
+// matters once an index can be published while it is still being built (see
+// createBestEngine's playWhileIndexing, and the certified-prefix note in
+// container-index):
+//
+//   Every frame number this library reports is exact and PERMANENT. The set of
+//   frames it is willing to report grows.
+//
+// So display indices are append-only and immutable. A frame is published only
+// once no frame still to be read can present before it, because a host may
+// already have written an annotation against frame 412 — and 412 coming to mean
+// a different picture later would be exactly the silent off-by-one this library
+// exists to prevent, worse than refusing the clip outright.
+//
 // Decode (engine 1) is windowed by GOP (group of pictures: a keyframe plus the
 // frames that depend on it). To show a frame we decode just its GOP, cache the
 // results as ImageBitmaps, and evict distant GOPs, so memory stays flat

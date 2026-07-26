@@ -38,6 +38,7 @@ node test/decode-support-test.mjs || node_status=1
 node test/edit-list-test.mjs || node_status=1
 node test/ogg-table-test.mjs || node_status=1
 node test/avi-table-test.mjs || node_status=1
+node test/progressive-index-test.mjs || node_status=1
 
 # test/serve.py, not `python3 -m http.server`: the latter ignores Range headers
 # and answers 200 with the whole file, which the engine reads over Range. That is
@@ -72,7 +73,7 @@ done
 # a Chromium-specific decoder error surface (decoder-failure), and the task they
 # verify is engine bookkeeping that is not browser-specific — so running them
 # under one engine is enough and porting them would only add contortions.
-echo "=== chromium-only: startup, memory, decoder-failure, known-bad-codec, index-cache ==="
+echo "=== chromium-only: startup, memory, decoder-failure, known-bad-codec, index-cache, progressive ==="
 node test/startup-test.mjs || status=1
 node test/memory-test.mjs || status=1
 node test/decoder-failure-test.mjs || status=1
@@ -83,6 +84,11 @@ node test/known-bad-codec-test.mjs || status=1
 # changed or absent validator is a miss and rebuild. IndexedDB behaves the same
 # across engines, so one engine covers it.
 node test/cache-test.mjs || status=1
+# progressive drives the WebCodecs engine against an index that is still being
+# built and checks that a frame named early is the same picture once the pass has
+# finished. The certification rules themselves are engine-independent and proved
+# in progressive-index-test.mjs, so one engine covers the playback half.
+node test/progressive-test.mjs || status=1
 
 # Chromium-only too, but for a different reason: robustness-test pins that
 # malformed and truncated inputs fail softly (bounded time, no page crash). That

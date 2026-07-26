@@ -72,6 +72,20 @@
 // This engine is the *exact* one: an engine it hands back always reports true
 // frame indices, never inferred ones.
 //
+// That rule holds at the level of the frame, not the file, and the difference
+// matters once an index can be published while it is still being built (see
+// createBestEngine's playWhileIndexing, and the certified-prefix note in
+// container-index):
+//
+//   Every frame number this library reports is exact and PERMANENT. The set of
+//   frames it is willing to report grows.
+//
+// So display indices are append-only and immutable. A frame is published only
+// once no frame still to be read can present before it, because a host may
+// already have written an annotation against frame 412 — and 412 coming to mean
+// a different picture later would be exactly the silent off-by-one this library
+// exists to prevent, worse than refusing the clip outright.
+//
 // Decode (engine 1) is windowed by GOP (group of pictures: a keyframe plus the
 // frames that depend on it). To show a frame we decode just its GOP, cache the
 // results as ImageBitmaps, and evict distant GOPs, so memory stays flat
@@ -285,6 +299,69 @@ function createRangeReader(source) {
     ? new UrlRangeReader(source) : new FileRangeReader(source);
 }
 
+// ==================================================================
+// Read priority — keep a bulk scan out of the way of a read someone is waiting on.
+//
+// Once an index can be published in certified prefixes, two readers are on the
+// same source at the same time: the sequential pass streaming the rest of the
+// container, and the decoder fetching the bytes of a frame near the playhead.
+// They never want the same bytes — the playhead trails the scanner, so whatever
+// the decoder asks for went past the scanner long ago — which is why there is no
+// shared chunk cache here. Caching would miss every time.
+//
+// What they do compete for is bandwidth, and they are not equally urgent: a
+// viewer is waiting on the decoder's read, and nobody is waiting on the scan's.
+// So the scan asks here before taking its next chunk, and waits while any urgent
+// read is outstanding. That is the whole mechanism: no queue, no cancellation,
+// no priorities beyond "someone is waiting" and "nobody is".
+//
+// Deliberately a module-level counter rather than an object threaded through
+// every call: the thing being shared is the network, which is global, and a host
+// playing two clips at once wants the same courtesy between them.
+// ==================================================================
+
+// How many latency-critical reads are in flight right now.
+let priorityReadsInFlight = 0;
+// Resolvers for scans parked in awaitPriorityReadsQuiet, released together when
+// the last urgent read lands.
+let quietWaiters = [];
+// A scan is never parked longer than this, however busy the playhead is. A host
+// that scrubs continuously would otherwise starve the pass forever, and an index
+// that never finishes is worse than one that shares the pipe.
+const MAXIMUM_YIELD_MILLISECONDS = 250;
+
+// Bracket a read the user is waiting on. Always pair these — a `finally` — or a
+// failed read leaves the scan parked until the timeout above rescues it.
+function beginPriorityRead() {
+  priorityReadsInFlight += 1;
+}
+
+function endPriorityRead() {
+  priorityReadsInFlight = Math.max(0, priorityReadsInFlight - 1);
+  if (priorityReadsInFlight === 0 && quietWaiters.length) {
+    const waiting = quietWaiters;
+    quietWaiters = [];
+    for (const resolve of waiting) resolve();
+  }
+}
+
+// Wait for the urgent reads to land, up to MAXIMUM_YIELD_MILLISECONDS. Resolves
+// immediately — without touching the event loop — when there are none, so a scan
+// with no engine alongside it pays nothing for this call.
+function awaitPriorityReadsQuiet() {
+  if (priorityReadsInFlight === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, MAXIMUM_YIELD_MILLISECONDS);
+    quietWaiters.push(finish);
+  });
+}
 // ==================================================================
 // Index cache — repeat loads of the same clip, without re-parsing it.
 //
@@ -690,6 +767,7 @@ const EBML_ID = {
   seekHead: 0x114D9B74,
   info: 0x1549A966,
   timestampScale: 0x2AD7B1,
+  duration: 0x4489,
   tracks: 0x1654AE6B,
   trackEntry: 0xAE,
   trackNumber: 0xD7,
@@ -721,6 +799,24 @@ const EBML_SEGMENT_LEVEL_IDS = new Set([
 ]);
 
 const MATROSKA_TRACK_TYPE_VIDEO = 1;
+
+// A block's timestamp is its cluster's plus a SIGNED 16-BIT offset, so the
+// earliest presentation time a block of the cluster starting at T can carry is
+// T - 32768 ticks. Nothing in the format ties that offset to the cluster's own
+// span, so this — not any observation about how muxers actually lay clusters out
+// — is what bounds how far back a frame we have not read yet could present.
+const MATROSKA_MAXIMUM_BLOCK_TIMESTAMP_OFFSET = 32768;
+
+// Codecs with no presentation reordering: their frames are stored in the order
+// they are shown, so a block's timestamp can never fall below one already read.
+// VP8 has no B-frames at all, and VP9's altref frames are hidden inside
+// superframes rather than reordered for display. That is a property of the
+// codecs, not a habit of muxers, which is why it is safe to certify a frame the
+// moment the next one is read instead of waiting out the 32768-tick window
+// above. Everything else (H.264, HEVC, AV1 in Matroska) can reorder.
+function codecHasNoPresentationReordering(codecId) {
+  return codecId === 'V_VP8' || codecId === 'V_VP9';
+}
 
 // Thrown when the pass runs out of its time (or byte) budget. Named so a caller
 // can tell "this clip is too big to index in the time you gave me" (fall back to
@@ -806,6 +902,18 @@ async function readEbmlVariableInt(cursor) {
   return allOnes ? null : value;
 }
 
+// An IEEE float element (Matroska writes Duration as one, 4 or 8 bytes wide).
+// Anything else is not a float this format defines, so it reads as absent.
+async function readEbmlFloat(cursor, byteCount) {
+  if (byteCount !== 4 && byteCount !== 8) {
+    cursor.advance(byteCount);
+    return 0;
+  }
+  const bytes = await readEbmlBytes(cursor, byteCount);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, byteCount);
+  return byteCount === 4 ? view.getFloat32(0) : view.getFloat64(0);
+}
+
 async function readEbmlUnsigned(cursor, byteCount) {
   await cursor.ensure(byteCount);
   let value = 0;
@@ -863,6 +971,20 @@ function formatProgress(progress) {
 //                              (see formatProgress) during the pass, and once
 //                              more at 100% when it finishes. A throw from it is
 //                              swallowed so a buggy indicator cannot abort a load.
+// options.onFramesCertified    called during the pass with each next contiguous
+//                              run of decode-order frames whose place on the
+//                              display timeline is settled, as
+//                              (frames, watermarkTicks, decoderConfig). The
+//                              promise it carries: NO frame still to come, read
+//                              or unread, presents before watermarkTicks. A
+//                              throw from it DOES abort the pass — this one is
+//                              load-bearing, not an indicator.
+// options.maximumFrameReorderSeconds
+//                              how far a codec that reorders may be assumed to
+//                              reorder, tightening the provable 32768-tick bound
+//                              for onFramesCertified. An ASSERTION about the
+//                              file, not a fact read from it; leave it out to
+//                              certify only what the container proves.
 //
 // Returns:
 //   { presentationTimes,      // seconds, file (decode) order
@@ -898,6 +1020,9 @@ async function readMatroskaFrameTable(reader, options = {}) {
   let lastYieldedAt = startedAt;
   const state = {
     timestampScaleSeconds: 1e6 / 1e9,   // TimestampScale defaults to 1 ms
+    // Info/Duration, in timestamp-scale units, or 0 when the file states none.
+    // A claim about the clip's length, never a source of frame numbers.
+    declaredDurationTicks: 0,
     videoTrackNumber: null,
     defaultFrameDuration: 0,
     videoWidth: 0,
@@ -905,10 +1030,27 @@ async function readMatroskaFrameTable(reader, options = {}) {
     codecId: '',
     codecPrivate: null,
     clusterTimestamp: 0,
+    // A Cluster's Timestamp is mandatory and has to arrive before the blocks it
+    // times. Without this flag a cluster missing one would silently time its
+    // frames from zero — a whole cluster landing on top of the opening seconds
+    // of the clip, which sorts into a plausible-looking and completely wrong
+    // table. Reset per cluster; readMatroskaBlock refuses if it is still false.
+    clusterTimestampSeen: false,
     // Decode order, one entry per video frame: its timestamp in timescale ticks
     // (integer, exactly as the container writes it) and the byte range of its
     // encoded data, which the WebCodecs engine later fetches on demand.
     frames: [],
+    // How many of those frames have been handed to onFramesCertified, and the
+    // presentation time (ticks) that was promised when the last of them went out:
+    // no frame still to come — read or unread — presents before it.
+    certifiedFrameCount: 0,
+    certifiedWatermarkTicks: -Infinity,
+    // Cleared the first time a block's timestamp falls below its predecessor's,
+    // which for a codec that does not reorder means the file is not what it says
+    // it is. The certified watermark then drops back to the conservative
+    // cluster-based bound rather than trusting the codec's promise.
+    blocksAreInPresentationOrder: true,
+    lastBlockTicks: -Infinity,
   };
 
   // Build and hand a progress report to onProgress, never letting the indicator
@@ -931,6 +1073,71 @@ async function readMatroskaFrameTable(reader, options = {}) {
     }
   };
 
+  // Publishing a certified prefix means committing to a decoder configuration
+  // before the whole file has been read, and it must be the SAME configuration
+  // the finished pass would have produced — the tier is chosen from it, and a
+  // configuration that changed afterwards would mean the tier was chosen on
+  // incomplete information. Everything it needs is known from Tracks except for
+  // VP9, which keeps its profile and bit depth in the first keyframe (one small
+  // read, below) and takes its level from the frame rate. So a VP9 track that
+  // declares no DefaultDuration cannot be pinned early: its level would be read
+  // off however much of the clip had gone past, which is not necessarily the
+  // level of the whole clip. Such a track indexes in one shot, as before.
+  const onFramesCertified = (typeof options.onFramesCertified === 'function')
+    ? options.onFramesCertified : null;
+  let pinnedDecoderConfig = null;
+  let decoderConfigCanBePinned = true;
+  const pinDecoderConfig = async () => {
+    if (pinnedDecoderConfig || !decoderConfigCanBePinned) return pinnedDecoderConfig;
+    if (state.videoTrackNumber === null || !state.frames.length) return null;
+    if (state.codecId === 'V_VP9' && !(state.defaultFrameDuration > 0)) {
+      decoderConfigCanBePinned = false;
+      return null;
+    }
+    let firstKeyframeBytes = null;
+    if (needsFirstKeyframeBytes(state.codecId)) {
+      const keyframe = state.frames.find((frame) => frame.isSync);
+      if (!keyframe) return null;   // no keyframe read yet; try again next chunk
+      firstKeyframeBytes = await readFirstKeyframeBytes(reader, keyframe);
+    }
+    pinnedDecoderConfig = buildMatroskaDecoderConfig({
+      codecId: state.codecId,
+      codecPrivate: state.codecPrivate,
+      videoWidth: state.videoWidth,
+      videoHeight: state.videoHeight,
+      firstKeyframeBytes,
+      frameRate: estimateFrameRate([], state.defaultFrameDuration),
+    });
+    // A codec we cannot configure has no WebCodecs tier to publish a prefix
+    // into; the clip still indexes in one shot for the <video> element.
+    if (!pinnedDecoderConfig) decoderConfigCanBePinned = false;
+    return pinnedDecoderConfig;
+  };
+
+  // How far a reordering codec is allowed to reorder. Absent an assertion from
+  // the caller, the only honest answer is the widest offset a block can carry.
+  const reorderGuardTicks = (options.maximumFrameReorderSeconds > 0)
+    ? Math.ceil(options.maximumFrameReorderSeconds / state.timestampScaleSeconds)
+    : MATROSKA_MAXIMUM_BLOCK_TIMESTAMP_OFFSET;
+
+  const certifyFrames = async () => {
+    if (!onFramesCertified || !decoderConfigCanBePinned) return;
+    if (!await pinDecoderConfig()) return;
+    const certified = nextCertifiedRun(state, reorderGuardTicks);
+    if (!certified) return;
+    state.certifiedFrameCount = certified.end;
+    state.certifiedWatermarkTicks = certified.watermarkTicks;
+    onFramesCertified(certified.frames, certified.watermarkTicks, {
+      decoderConfig: pinnedDecoderConfig,
+      timescale: 1 / state.timestampScaleSeconds,
+      defaultFrameDuration: state.defaultFrameDuration,
+      declaredDuration: state.declaredDurationTicks * state.timestampScaleSeconds,
+      videoWidth: state.videoWidth,
+      videoHeight: state.videoHeight,
+      codecId: state.codecId,
+    });
+  };
+
   const cursor = new SequentialByteCursor(reader, {
     // How many bytes each refill fetches (default 1 MB), which is also the
     // granularity of the onProgress ticks. Exposed mostly so a test can force
@@ -947,6 +1154,14 @@ async function readMatroskaFrameTable(reader, options = {}) {
       // A refill is one megabyte of progress: report it before fetching the next
       // chunk (the yield below then lets the host repaint its indicator).
       report(cursor.position);
+      // Everything read since the last chunk whose display position is now
+      // settled goes out here, so a host can start naming and showing frames
+      // while the rest of the file is still going past.
+      await certifyFrames();
+      // Yield to a read the host is actually waiting on (a decode of a frame
+      // near the playhead) before taking the next megabyte for ourselves: this
+      // pass is bulk throughput, that one is latency.
+      await awaitPriorityReadsQuiet();
       // Hand the event loop a turn every so often. Awaiting the read itself
       // usually does this, but a fast local File can resolve quickly enough to
       // starve rendering for the length of the pass.
@@ -985,18 +1200,28 @@ async function readMatroskaFrameTable(reader, options = {}) {
   const presentationTimes =
     state.frames.map((frame) => frame.ticks * state.timestampScaleSeconds);
 
-  // VP9 writes no CodecPrivate in practice, and its profile and bit depth are
-  // needed for the codec string — they live in the first keyframe's own
-  // uncompressed header, so fetch just its opening bytes. One small read, after
-  // a pass that has already been over the whole file.
-  let firstKeyframeBytes = null;
-  if (needsFirstKeyframeBytes(state.codecId)) {
-    const keyframe = state.frames.find((frame) => frame.isSync) || state.frames[0];
-    const wanted = Math.min(keyframe.size, VP9_HEADER_PROBE_BYTES);
-    if (wanted > 0) {
-      firstKeyframeBytes = new Uint8Array(
-        await reader.read(keyframe.offset, keyframe.offset + wanted - 1));
+  // A configuration pinned early is the one this clip has been indexed under and
+  // the one the decoder is already running, so it stands. Otherwise build it now,
+  // the way this pass always has.
+  let decoderConfig = pinnedDecoderConfig;
+  if (!decoderConfig) {
+    // VP9 writes no CodecPrivate in practice, and its profile and bit depth are
+    // needed for the codec string — they live in the first keyframe's own
+    // uncompressed header, so fetch just its opening bytes. One small read, after
+    // a pass that has already been over the whole file.
+    let firstKeyframeBytes = null;
+    if (needsFirstKeyframeBytes(state.codecId)) {
+      const keyframe = state.frames.find((frame) => frame.isSync) || state.frames[0];
+      firstKeyframeBytes = await readFirstKeyframeBytes(reader, keyframe);
     }
+    decoderConfig = buildMatroskaDecoderConfig({
+      codecId: state.codecId,
+      codecPrivate: state.codecPrivate,
+      videoWidth: state.videoWidth,
+      videoHeight: state.videoHeight,
+      firstKeyframeBytes,
+      frameRate: estimateFrameRate(presentationTimes, state.defaultFrameDuration),
+    });
   }
 
   return {
@@ -1004,18 +1229,78 @@ async function readMatroskaFrameTable(reader, options = {}) {
     frames: state.frames,
     timescale: 1 / state.timestampScaleSeconds,
     defaultFrameDuration: state.defaultFrameDuration,
+    // What the file SAYS it runs to (Info/Duration), 0 when it says nothing.
+    declaredDuration: state.declaredDurationTicks * state.timestampScaleSeconds,
     videoWidth: state.videoWidth,
     videoHeight: state.videoHeight,
     codecId: state.codecId,
-    decoderConfig: buildMatroskaDecoderConfig({
-      codecId: state.codecId,
-      codecPrivate: state.codecPrivate,
-      videoWidth: state.videoWidth,
-      videoHeight: state.videoHeight,
-      firstKeyframeBytes,
-      frameRate: estimateFrameRate(presentationTimes, state.defaultFrameDuration),
-    }),
+    decoderConfig,
+    // How many frames went out through onFramesCertified. The rest are in
+    // `frames` as always; a caller that took the certified ones as they came
+    // knows to pick up from here.
+    certifiedFrameCount: state.certifiedFrameCount,
   };
+}
+
+// The opening bytes of a frame — enough of a VP9 keyframe's uncompressed header
+// to read its profile and bit depth out of.
+async function readFirstKeyframeBytes(reader, keyframe) {
+  const wanted = Math.min(keyframe.size, VP9_HEADER_PROBE_BYTES);
+  if (wanted <= 0) return null;
+  return new Uint8Array(
+    await reader.read(keyframe.offset, keyframe.offset + wanted - 1));
+}
+
+// The next contiguous run of decode-order frames whose place on the display
+// timeline is settled, or null when nothing new can be settled yet.
+//
+// Two things could still displace a frame we have read: a frame we have NOT read
+// (bounded by the container — see below), and a frame we HAVE read but not yet
+// handed over, which for a reordering codec can carry an earlier presentation
+// time than one before it in decode order. So the watermark this promises is the
+// smaller of those two bounds, and the run is the longest prefix whose every
+// frame sits strictly below it.
+//
+// The container's own bound:
+//   * a codec that does not reorder settles a frame as soon as the next one is
+//     read, because storage order IS presentation order;
+//   * otherwise the earliest time an unread block can carry is the current
+//     cluster's timestamp minus the widest offset a block can hold (or minus the
+//     caller's asserted reorder bound, where it gave one).
+function nextCertifiedRun(state, reorderGuardTicks) {
+  const frames = state.frames;
+  const from = state.certifiedFrameCount;
+  const length = frames.length;
+  if (from >= length) return null;
+
+  const containerWatermark =
+    (codecHasNoPresentationReordering(state.codecId) && state.blocksAreInPresentationOrder)
+      ? state.lastBlockTicks
+      : state.clusterTimestamp - reorderGuardTicks;
+  if (!(containerWatermark > state.certifiedWatermarkTicks)) return null;
+
+  // The earliest presentation time still in hand, from each possible cut point
+  // backwards: suffixMinimum[i - from] is the smallest tick over frames[i..).
+  const suffixMinimum = new Float64Array(length - from + 1);
+  suffixMinimum[length - from] = Infinity;
+  for (let i = length - 1; i >= from; i--) {
+    suffixMinimum[i - from] = Math.min(frames[i].ticks, suffixMinimum[i - from + 1]);
+  }
+
+  // Grow the run while its running maximum stays below everything left behind.
+  let end = from;
+  let runMaximum = -Infinity;
+  let watermarkTicks = state.certifiedWatermarkTicks;
+  while (end < length) {
+    const candidateMaximum = Math.max(runMaximum, frames[end].ticks);
+    const promise = Math.min(containerWatermark, suffixMinimum[end + 1 - from]);
+    if (!(candidateMaximum < promise)) break;
+    runMaximum = candidateMaximum;
+    watermarkTicks = promise;
+    end++;
+  }
+  if (end === from) return null;
+  return { frames: frames.slice(from, end), end, watermarkTicks };
 }
 
 // Frames per second, for the one place a codec string needs it (a VP9 level is
@@ -1061,6 +1346,12 @@ async function readMatroskaInfo(cursor, end, state) {
     if (id === EBML_ID.timestampScale) {
       // Nanoseconds per timestamp tick.
       state.timestampScaleSeconds = (await readEbmlUnsigned(cursor, size)) / 1e9;
+    } else if (id === EBML_ID.duration) {
+      // A float, in timestamp-scale units. Only a CLAIM about how long the clip
+      // runs — it names no frame and is never mapped from. It exists so a host
+      // watching an index grow can size a scrubber against the whole clip
+      // instead of a track that stretches under the cursor.
+      state.declaredDurationTicks = await readEbmlFloat(cursor, size);
     }
     cursor.position = contentStart + size;
   }
@@ -1124,6 +1415,7 @@ async function readMatroskaTrackEntry(cursor, end, state) {
 
 async function readMatroskaCluster(cursor, end, state) {
   state.clusterTimestamp = 0;
+  state.clusterTimestampSeen = false;
   while (cursor.position < end && !cursor.atEnd) {
     const idStart = cursor.position;
     const id = await readEbmlId(cursor);
@@ -1139,6 +1431,7 @@ async function readMatroskaCluster(cursor, end, state) {
 
     if (id === EBML_ID.clusterTimestamp) {
       state.clusterTimestamp = await readEbmlUnsigned(cursor, size);
+      state.clusterTimestampSeen = true;
     } else if (id === EBML_ID.simpleBlock) {
       // A SimpleBlock says outright whether it is a keyframe, in the top bit of
       // its flags byte.
@@ -1427,6 +1720,16 @@ async function readMatroskaBlock(cursor, blockEnd, state, keyframeFlagOverride) 
 
   if (state.videoTrackNumber === null) throw new Error('WebM cluster before Tracks');
   if (trackNumber !== state.videoTrackNumber) return -1;   // audio, subtitles, ...
+  // A Cluster's Timestamp is mandatory and every block in it is written as an
+  // offset from it, so a block reaching us before one has been read has no
+  // timestamp we can honestly compute. Reading it as an offset from zero would
+  // drop the whole cluster on top of the start of the clip — a table that sorts
+  // and looks fine and is wrong — so refuse instead.
+  if (!state.clusterTimestampSeen) {
+    throw new Error('this WebM has a Cluster whose blocks come before its '
+      + 'Timestamp (or that carries none at all), so their presentation times '
+      + 'cannot be read');
+  }
   // Lacing packs several frames into one block under a single timestamp, so
   // their individual times would have to be invented from DefaultDuration — and
   // their byte ranges parsed out of a lacing header. It is an audio feature and
@@ -1435,11 +1738,17 @@ async function readMatroskaBlock(cursor, blockEnd, state, keyframeFlagOverride) 
   if (flags & 0x06) throw new Error('this WebM laces its video blocks');
 
   const offset = cursor.position;   // the frame's own bytes start here
+  const ticks = state.clusterTimestamp + relative;
+  // Is storage order still presentation order? For a codec that does not reorder
+  // it has to be, and that is what lets a frame be certified the moment the next
+  // one is read (see nextCertifiedRun). One inversion and we stop believing it.
+  if (ticks < state.lastBlockTicks) state.blocksAreInPresentationOrder = false;
+  state.lastBlockTicks = ticks;
   state.frames.push({
     offset,
     size: blockEnd - offset,
     isSync: (keyframeFlagOverride === null) ? !!(flags & 0x80) : keyframeFlagOverride,
-    ticks: state.clusterTimestamp + relative,
+    ticks,
   });
   return state.frames.length - 1;
 }
@@ -2555,8 +2864,9 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 // fails here, and the <video> element cannot play those either. That is the
 // intended refusal, not a bug.
 // ==================================================================
-class ContainerIndex {
+class ContainerIndex extends EventTarget {
   constructor(reader) {
+    super();
     this.reader = reader;
     this.timescale = 1;
     this.containerFormat = null;     // 'isobmff' | 'matroska' | 'ogg' | 'avi'
@@ -2598,6 +2908,47 @@ class ContainerIndex {
     // freshly built one, or it would not have been trusted.
     this.fromCache = false;
     this.cacheWritePromise = null;
+
+    // ----------------------------------------------------------------
+    // Growth. An index that comes out of a full-file pass can be published in
+    // certified prefixes while the pass is still running, so a host can name and
+    // show the opening frames of a two-hour WebM without waiting for its last
+    // byte (see the certified-prefix note above _appendDisplayFrames).
+    //
+    // 'growing'   more frames are still coming
+    // 'complete'  the whole container has been read; this table is final
+    // 'truncated' the pass stopped early (a budget, a corrupt tail, an ordering
+    //             violation). What is here is final; nothing more is coming.
+    //
+    // A one-shot build is 'complete' from the moment it is handed back, so a host
+    // that never opts into growth sees exactly what it always did.
+    // ----------------------------------------------------------------
+    this.completionState = 'complete';
+    this.completionError = null;
+    // The presentation time (seconds, on the normalized display timeline) through
+    // which this index is certified. Equal to `duration` — named separately
+    // because that is the question a host asks of a growing index.
+    this.indexedThroughSeconds = 0;
+    // The container's DECLARED total duration in seconds, where it states one
+    // (Matroska's Info/Duration), so a scrubber can size itself before the pass
+    // finishes rather than grow a track under the user's cursor. 0 when the
+    // container states none. NEVER used for frame mapping — a declared duration
+    // is a claim, and only the scanned table names frames.
+    this.expectedDuration = 0;
+
+    // Backing buffers for the display tables, grown by doubling. The public
+    // presentationTimes / frameDurations / displayToDecode are subarray VIEWS
+    // onto these, so `.length` is always the certified frame count and every
+    // existing reader of them (frameAtTime, midpointOfFrame, both engines) works
+    // unchanged against a table that is still growing.
+    this._presentationTimesBuffer = null;
+    this._frameDurationsBuffer = null;
+    this._displayToDecodeBuffer = null;
+    this._displayCount = 0;
+    // The composition time display frame 0 sits at, frozen at the first publish
+    // so that t = 0 means one thing for the life of the index.
+    this._compositionTimeOrigin = 0;
+    this._editWindow = null;
   }
 
   // Has this index what a VideoDecoder needs — the byte ranges of every sample,
@@ -2612,12 +2963,33 @@ class ContainerIndex {
   // FRAGMENTED MP4 — see readMatroskaFrameTable / readOggFrameTable /
   // _demuxIsobmff). They are inert for a classic single-`moov` MP4, which is a
   // handful of range reads however long the clip is.
+  // options.publishPartialIndex makes a full-file pass publish each certified
+  // prefix as it goes (Matroska only so far), and options.onIndexCreated hands
+  // the index over the moment it exists — before a byte has been parsed — so a
+  // caller can subscribe to 'extended' / 'complete' / 'truncated' and use the
+  // opening frames while the rest of the file is still going past. Without
+  // publishPartialIndex the index is handed back finished, exactly as before.
   static async load(reader, options = {}) {
     const index = new ContainerIndex(reader);
-    if (await ContainerIndex._isMatroska(reader)) await index._demuxMatroska(reader, options);
-    else if (await ContainerIndex._isOgg(reader)) await index._demuxOgg(reader, options);
-    else if (await ContainerIndex._isAvi(reader)) await index._demuxAvi(reader, options);
-    else await index._demuxIsobmff(reader, options);
+    if (typeof options.onIndexCreated === 'function') options.onIndexCreated(index);
+    try {
+      if (await ContainerIndex._isMatroska(reader)) await index._demuxMatroska(reader, options);
+      else if (await ContainerIndex._isOgg(reader)) await index._demuxOgg(reader, options);
+      else if (await ContainerIndex._isAvi(reader)) await index._demuxAvi(reader, options);
+      else await index._demuxIsobmff(reader, options);
+    } catch (err) {
+      // A pass that had already published a certified prefix keeps it. Those
+      // frames were certified BEFORE they went out — the guarantee is that every
+      // frame number reported is exact and permanent, not that every clip can be
+      // read to the end — so a budget running out or a corrupt tail takes away
+      // only the frames we never got to. A build that had published nothing has
+      // nothing to stand on and throws, exactly as it always did.
+      if (index.completionState === 'growing' && index.numFrames > 0) {
+        index._truncateTables(err);
+        return index;
+      }
+      throw err;
+    }
     return index;
   }
 
@@ -2658,7 +3030,12 @@ class ContainerIndex {
     const buildMilliseconds = performance.now() - buildStartedAt;
     const minimumBuildMilliseconds = (options.cacheMinimumBuildMilliseconds === undefined)
       ? CACHE_MINIMUM_BUILD_MILLISECONDS : options.cacheMinimumBuildMilliseconds;
-    if (cacheKey && buildMilliseconds >= minimumBuildMilliseconds) {
+    // A truncated index is the frames we managed to read before the pass died,
+    // which is a property of that attempt and not of the clip. Caching it would
+    // make a network hiccup permanent: every later open of the same file would
+    // get the short table back without even trying to read the rest.
+    if (cacheKey && index.completionState === 'complete'
+        && buildMilliseconds >= minimumBuildMilliseconds) {
       // Fire-and-forget: the write never throws and the caller is not made to
       // wait on bookkeeping. The promise is exposed for tests that must not
       // race it.
@@ -2984,53 +3361,103 @@ class ContainerIndex {
   // configure still yields a perfectly good index, because Matroska HAS a native
   // tier. decoderConfig stays null, supportsWebCodecs reports false, and the clip
   // plays frame-exact through the <video> element exactly as it did before.
+  // Matroska stores no per-frame duration: a frame lasts until the next one
+  // starts. So a frame's duration is only final once the frame that shows after
+  // it has been read — which is the whole reason this path builds its table in
+  // runs rather than in one pass, and why one frame is always held back.
+  //
+  // With options.publishPartialIndex the same runs are published as they are
+  // certified (see readMatroskaFrameTable's onFramesCertified) instead of only at
+  // the end. The two orders of arrival go through the identical code below, which
+  // is what makes a progressively built index the same table as a one-shot build
+  // of the same file rather than merely a similar one.
   async _demuxMatroska(reader, options) {
-    const table = await readMatroskaFrameTable(reader, options);
-    this.containerFormat = 'matroska';
-    this.videoWidth = table.videoWidth;
-    this.videoHeight = table.videoHeight;
-    // Matroska carries no display rotation matrix (the element applies none
-    // either, so the two agree).
-    this.rotation = 0;
-    this.decoderConfig = table.decoderConfig;
-    // Matroska stores H.264 and HEVC the way an MP4 does — length-prefixed, with
-    // the parameter sets out of band in CodecPrivate — so unlike AVI there is
-    // nothing to convert before the decoder.
-    this.samplesAreAnnexB = false;
+    // Decode indices read but not yet placed on the display timeline: after each
+    // run this holds exactly the frame that shows last, whose duration the next
+    // run settles. At the end of the file it is the clip's final frame.
+    let heldBack = [];
+    let defaultFrameDurationTicks = 0;
+    let lastSettledDurationTicks = 0;
+    let started = false;
 
-    // Matroska stores no per-frame duration: a frame lasts until the next one
-    // starts. Synthesize that in the container's own integer tick units, in
-    // PRESENTATION order (blocks are written in decode order, and a Matroska
-    // block's timestamp is already a presentation time, so with B-frames they can
-    // arrive out of order). The last frame has no next one: fall back to the
-    // track's declared DefaultDuration, then to the previous frame's, then to a
-    // nominal 30 fps.
-    const frames = table.frames;
-    const timescale = table.timescale;
-    const displayOrder = frames.map((frame, k) => k)
-      .sort((a, b) => frames[a].ticks - frames[b].ticks);
-    const durations = new Array(frames.length);
-    for (let d = 0; d < displayOrder.length - 1; d++) {
-      durations[displayOrder[d]] =
-        frames[displayOrder[d + 1]].ticks - frames[displayOrder[d]].ticks;
-    }
-    if (displayOrder.length) {
-      const last = displayOrder[displayOrder.length - 1];
-      durations[last] = (table.defaultFrameDuration * timescale)
-        || (displayOrder.length > 1 ? durations[displayOrder[displayOrder.length - 2]] : timescale / 30);
-    }
+    const begin = (track) => {
+      if (started) return;
+      started = true;
+      this.containerFormat = 'matroska';
+      this.videoWidth = track.videoWidth;
+      this.videoHeight = track.videoHeight;
+      // Matroska carries no display rotation matrix (the element applies none
+      // either, so the two agree).
+      this.rotation = 0;
+      this.decoderConfig = track.decoderConfig;
+      // Matroska stores H.264 and HEVC the way an MP4 does — length-prefixed, with
+      // the parameter sets out of band in CodecPrivate — so unlike AVI there is
+      // nothing to convert before the decoder.
+      this.samplesAreAnnexB = false;
+      this.expectedDuration = track.declaredDuration || 0;
+      defaultFrameDurationTicks = track.defaultFrameDuration * track.timescale;
+      this._beginTables(track.timescale, null);
+    };
 
-    // The same sample-record shape the ISOBMFF and AVI paths hand to
-    // _buildTables, which does the rest: display order, the decode/display
-    // mappings, and the normalized timelines.
-    this._buildTables(frames.map((frame, k) => ({
-      offset: frame.offset,
-      size: frame.size,
-      is_sync: frame.isSync,
-      cts: frame.ticks,
-      duration: durations[k],
-      timescale,
-    })), null);
+    // Take a run of decode-order frames whose display positions are settled,
+    // append them to the decode table, and extend the display timeline by every
+    // one of them whose duration is now known.
+    const extend = (frames) => {
+      const decodeIndices = this._appendSamples(frames.map((frame) => ({
+        offset: frame.offset,
+        size: frame.size,
+        is_sync: frame.isSync,
+        cts: frame.ticks,
+        duration: 0,   // settled below, once the frame that follows it is known
+      })));
+      const displayOrder = heldBack.concat(decodeIndices)
+        .sort((a, b) => this.samples[a].cts - this.samples[b].cts);
+      const settled = displayOrder.slice(0, -1);
+      for (let d = 0; d < settled.length; d++) {
+        lastSettledDurationTicks =
+          this.samples[displayOrder[d + 1]].cts - this.samples[settled[d]].cts;
+        this.samples[settled[d]].duration = lastSettledDurationTicks;
+      }
+      heldBack = displayOrder.slice(settled.length);
+      this._appendDisplayFrames(settled);
+    };
+
+    // The clip's last frame has no next one to measure against: fall back to the
+    // track's declared DefaultDuration, then to the frame before it, then to a
+    // nominal 30fps.
+    const placeFinalFrame = () => {
+      for (const k of heldBack) {
+        this.samples[k].duration = defaultFrameDurationTicks
+          || lastSettledDurationTicks || (this.timescale / 30);
+        this._appendDisplayFrames([k]);
+      }
+      heldBack = [];
+    };
+
+    const table = await readMatroskaFrameTable(reader, {
+      ...options,
+      onFramesCertified: options.publishPartialIndex
+        ? (frames, watermarkTicks, track) => {
+          begin(track);
+          extend(frames);
+          this._publish();
+        }
+        : undefined,
+    });
+
+    // Whatever the certified runs did not cover — everything, for a one-shot
+    // build; the tail after the last certified run, for a progressive one.
+    begin({
+      decoderConfig: table.decoderConfig,
+      timescale: table.timescale,
+      defaultFrameDuration: table.defaultFrameDuration,
+      declaredDuration: table.declaredDuration,
+      videoWidth: table.videoWidth,
+      videoHeight: table.videoHeight,
+    });
+    extend(table.frames.slice(table.certifiedFrameCount));
+    placeFinalFrame();
+    this._finishTables();
   }
 
   // AVI: unlike the WebM and Ogg paths above, this builds a FULL decode-order
@@ -3130,65 +3557,211 @@ class ContainerIndex {
   // range the edit list presents. Frames outside it stay in the DECODE table
   // (the decoder needs them to reconstruct the ones inside) but are left out of
   // the DISPLAY tables, so display frame 0 is the first frame the viewer sees.
+  //
+  // The whole-table build every container but a progressive Matroska pass uses:
+  // begin, append everything, finish. It is the same three calls the progressive
+  // path makes, just once instead of many, which is what makes a progressively
+  // built index provably identical to the one-shot build of the same file.
   _buildTables(samples, editWindow) {
-    const n = samples.length;
-    this.timescale = n ? samples[0].timescale : 1;
+    this._beginTables(samples.length ? samples[0].timescale : 1, editWindow);
+    const decodeIndices = this._appendSamples(samples);
+    this._appendDisplayFrames(this._presentedInDisplayOrder(decodeIndices));
+    this._finishTables();
+  }
 
-    // Decode-order records (the first sample is always a keyframe). Always the
-    // full set — a trimming edit list removes frames from the presentation, not
-    // from what the decoder must run through to rebuild them.
-    this.samples = new Array(n);
-    const keyframes = [];
-    for (let k = 0; k < n; k++) {
-      const s = samples[k];
+  // Start an empty table. timescale and the edit window are fixed for the life of
+  // the index: both decide what a frame NUMBER means, so neither may be revised
+  // once a single frame has been published under them.
+  _beginTables(timescale, editWindow) {
+    this.completionState = 'growing';
+    this.timescale = timescale || 1;
+    this._editWindow = editWindow || null;
+    this.samples = [];
+    this.keyframeDecodeIndices = [];
+    this.microsToDisplay = new Map();
+    this._presentationTimesBuffer = null;
+    this._frameDurationsBuffer = null;
+    this._displayToDecodeBuffer = null;
+    this._displayCount = 0;
+    this._compositionTimeOrigin = 0;
+    this._refreshDisplayViews();
+  }
+
+  // Append decode-order sample records, returning the decode indices they landed
+  // at. Decode order is scan order and is never revised, so this is a pure
+  // append — a frame's decode index, once assigned, is permanent.
+  _appendSamples(samples) {
+    const base = this.samples.length;
+    const decodeIndices = [];
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const k = base + i;
       const isSync = !!s.is_sync || k === 0;
-      if (isSync) keyframes.push(k);
-      this.samples[k] = {
+      if (isSync) this.keyframeDecodeIndices.push(k);   // ascending == decode order
+      this.samples.push({
         offset: s.offset, size: s.size, isSync, cts: s.cts, duration: s.duration,
-      };
+      });
+      decodeIndices.push(k);
     }
-    this.keyframeDecodeIndices = keyframes;   // ascending == decode order
+    return decodeIndices;
+  }
 
-    // Which decode indices the edit list actually presents. A frame counts if
-    // its composition time falls in the window, with a quarter-frame tolerance
-    // to absorb the movie-vs-media timescale rounding in the window's bounds. No
-    // window (or a window that covers everything, e.g. an identity or shifting
-    // edit list) leaves every frame presented, and this whole path collapses to
-    // the untrimmed construction below.
-    const presented = [];
-    for (let k = 0; k < n; k++) {
+  // Which of these decode indices the edit list actually presents, in display
+  // order. A frame counts if its composition time falls in the window, with a
+  // quarter-frame tolerance to absorb the movie-vs-media timescale rounding in
+  // the window's bounds. No window (or one that covers everything, e.g. an
+  // identity or shifting edit list) presents every frame.
+  _presentedInDisplayOrder(decodeIndices) {
+    const window = this._editWindow;
+    const presented = window ? decodeIndices.filter((k) => {
       const s = this.samples[k];
       const slack = 0.25 * s.duration;
-      if (!editWindow
-          || (s.cts >= editWindow.start - slack && s.cts < editWindow.end - slack)) {
-        presented.push(k);
+      return s.cts >= window.start - slack && s.cts < window.end - slack;
+    }) : decodeIndices.slice();
+    // Display order is composition-time order (B-frame safe) — the same sort the
+    // one-shot build has always done, here over one batch at a time.
+    return presented.sort((a, b) => this.samples[a].cts - this.samples[b].cts);
+  }
+
+  // Extend the display timeline by a batch of decode indices already sorted into
+  // composition-time order, each carrying its FINAL duration.
+  //
+  // THE CERTIFIED-PREFIX INVARIANT. Display indices are append-only and
+  // immutable: display frame 412 must mean the same picture for the life of the
+  // index, because a host may already have written an annotation against it. A
+  // batch may therefore only be appended when no frame still to be scanned can
+  // present before its last frame — which is what each container's certified
+  // watermark establishes. Here we enforce the consequence of that rather than
+  // trust it: a batch whose first frame does not sort after the last frame
+  // already published means the watermark that produced it was wrong, and the
+  // numbers already handed out are wrong with it. That is not recoverable, so it
+  // throws rather than quietly repairing anything.
+  _appendDisplayFrames(decodeIndices) {
+    if (!decodeIndices.length) return;
+    const first = this.samples[decodeIndices[0]];
+    if (this._displayCount === 0) {
+      // Display frame 0 sits at t = 0. With a trim the first presented frame's
+      // cts is a nonzero offset, and (independently) with B-frames the first
+      // composition time is too; both engines want a timeline whose origin is the
+      // first frame the viewer sees. Frozen here, for good.
+      this._compositionTimeOrigin = first.cts;
+    } else {
+      const lastPublished = this.samples[this._displayToDecodeBuffer[this._displayCount - 1]];
+      if (first.cts < lastPublished.cts) {
+        throw new Error(
+          `container index: a frame at composition time ${first.cts} was scanned `
+          + `after display frame ${this._displayCount - 1} at ${lastPublished.cts} `
+          + 'had already been published, so the certified prefix was not certified '
+          + 'and every frame number reported for this clip is unreliable');
       }
     }
 
-    // Display order = presented samples sorted by composition time (B-frame
-    // safe). Times are normalized so display frame 0 sits at t = 0: with a trim
-    // the first presented frame's cts is a nonzero offset, and (independently)
-    // with B-frames the first composition time is too — both engines want a
-    // timeline whose origin is the first frame the viewer sees.
-    const order = presented.slice().sort((a, b) => this.samples[a].cts - this.samples[b].cts);
-    const p = order.length;
-    this.trimmedByEditList = p < n;
-    const cts0 = p ? this.samples[order[0]].cts : 0;
-    this.presentationTimes = new Float64Array(p);
-    this.frameDurations = new Float64Array(p);
-    this.displayToDecode = new Int32Array(p);
-    this.microsToDisplay = new Map();
-    for (let d = 0; d < p; d++) {
-      const k = order[d];
+    this._ensureDisplayCapacity(this._displayCount + decodeIndices.length);
+    for (const k of decodeIndices) {
       const s = this.samples[k];
-      this.presentationTimes[d] = (s.cts - cts0) / this.timescale;
-      this.frameDurations[d] = s.duration / this.timescale;
-      this.displayToDecode[d] = k;
+      const d = this._displayCount;
+      this._presentationTimesBuffer[d] = (s.cts - this._compositionTimeOrigin) / this.timescale;
+      this._frameDurationsBuffer[d] = s.duration / this.timescale;
+      this._displayToDecodeBuffer[d] = k;
       this.microsToDisplay.set(Math.round(s.cts * 1e6 / this.timescale), d);
+      this._displayCount = d + 1;
     }
-    this.numFrames = p;
-    this.duration = p
-      ? this.presentationTimes[p - 1] + this.frameDurations[p - 1] : 0;
+  }
+
+  // Grow the display buffers to hold at least `needed` frames, by doubling. Nine
+  // reallocations carry a two-hour 60fps clip, and each is a memcpy of a few
+  // megabytes — as against re-deriving the whole table on every publish, which
+  // would hold two full sample arrays live at once.
+  _ensureDisplayCapacity(needed) {
+    const capacity = this._presentationTimesBuffer ? this._presentationTimesBuffer.length : 0;
+    if (capacity >= needed) return;
+    let grown = capacity || 64;
+    while (grown < needed) grown *= 2;
+    const times = new Float64Array(grown);
+    const durations = new Float64Array(grown);
+    const toDecode = new Int32Array(grown);
+    if (this._presentationTimesBuffer) {
+      times.set(this._presentationTimesBuffer);
+      durations.set(this._frameDurationsBuffer);
+      toDecode.set(this._displayToDecodeBuffer);
+    }
+    this._presentationTimesBuffer = times;
+    this._frameDurationsBuffer = durations;
+    this._displayToDecodeBuffer = toDecode;
+  }
+
+  // Point the public tables at the certified prefix of the backing buffers.
+  _refreshDisplayViews() {
+    const count = this._displayCount;
+    this.presentationTimes = this._presentationTimesBuffer
+      ? this._presentationTimesBuffer.subarray(0, count) : new Float64Array(0);
+    this.frameDurations = this._frameDurationsBuffer
+      ? this._frameDurationsBuffer.subarray(0, count) : new Float64Array(0);
+    this.displayToDecode = this._displayToDecodeBuffer
+      ? this._displayToDecodeBuffer.subarray(0, count) : new Int32Array(0);
+  }
+
+  // Make the frames appended since the last publish visible, and say so.
+  //
+  // Deliberately synchronous from first statement to last: a listener runs inside
+  // dispatchEvent, so an engine that re-reads the tables here cannot observe them
+  // half-grown. Nothing in this method may await.
+  _publish() {
+    this._refreshDisplayViews();
+    const count = this._displayCount;
+    this.numFrames = count;
+    this.duration = count
+      ? this.presentationTimes[count - 1] + this.frameDurations[count - 1] : 0;
+    this.indexedThroughSeconds = this.duration;
+    this.dispatchEvent(new Event('extended'));
+  }
+
+  // Seal the table: compact the buffers down to the frames actually in them and
+  // publish the final state.
+  //
+  // The compaction is not cosmetic. serializeContainerIndex stores these arrays
+  // as they are, and structured-cloning a subarray VIEW clones the whole backing
+  // buffer behind it — so an index cached without this would carry its unused
+  // capacity into IndexedDB.
+  _finishTables() {
+    this._sealTables();
+    this.completionState = 'complete';
+    this.dispatchEvent(new Event('extended'));
+    this.dispatchEvent(new Event('complete'));
+  }
+
+  // The pass stopped before the end of the container. Everything published stays
+  // exactly as published — those frames were certified before they were handed
+  // out — but nothing more is coming.
+  _truncateTables(error) {
+    if (this.completionState !== 'growing') return;
+    this._sealTables();
+    this.completionState = 'truncated';
+    this.completionError = error || null;
+    this.dispatchEvent(new Event('extended'));
+    this.dispatchEvent(new Event('truncated'));
+  }
+
+  // Compact the display buffers down to the frames actually in them and settle
+  // the derived totals. Shared by both ways a pass can end.
+  _sealTables() {
+    const count = this._displayCount;
+    this.presentationTimes = this._presentationTimesBuffer
+      ? this._presentationTimesBuffer.slice(0, count) : new Float64Array(0);
+    this.frameDurations = this._frameDurationsBuffer
+      ? this._frameDurationsBuffer.slice(0, count) : new Float64Array(0);
+    this.displayToDecode = this._displayToDecodeBuffer
+      ? this._displayToDecodeBuffer.slice(0, count) : new Int32Array(0);
+    this._presentationTimesBuffer = this.presentationTimes;
+    this._frameDurationsBuffer = this.frameDurations;
+    this._displayToDecodeBuffer = this.displayToDecode;
+    // A trimming edit list is the only thing that leaves the decode table longer
+    // than the display one once the pass has finished.
+    this.trimmedByEditList = count < this.samples.length;
+    this.numFrames = count;
+    this.duration = count
+      ? this.presentationTimes[count - 1] + this.frameDurations[count - 1] : 0;
+    this.indexedThroughSeconds = this.duration;
   }
 }
 
@@ -3314,6 +3887,14 @@ class VideoEngine extends EventTarget {
     this._shownFrame = -1;
     this._lastBitmap = null;
     this._lastNow = 0;
+
+    // Set while the playhead sits on the last indexed frame of an index that is
+    // still growing. Playback is not over and not paused — it is waiting.
+    this._waitingForIndex = false;
+    // Listeners on the index, kept so _teardown can drop them: an index outlives
+    // the engine that adopted it (createBestEngine may hand the same one to a
+    // second engine after a WebCodecs load fails).
+    this._indexListeners = null;
   }
 
   get paused() { return !this.playing; }
@@ -3330,8 +3911,22 @@ class VideoEngine extends EventTarget {
   // load() has adopted an index.
   get codecString() { return this._decoderConfig ? this._decoderConfig.codec : null; }
   // The engine decodes each frame itself, so its frame indices are exact by
-  // construction — there is no browser presentation to be uncertain about.
+  // construction — there is no browser presentation to be uncertain about. True
+  // in all three index states below: a growing index has fewer frames than the
+  // clip, not less exact ones.
   get frameIndexIsExact() { return true; }
+
+  // 'complete'  every frame in the clip is indexed (the ordinary case)
+  // 'growing'   the index is still being built and numFrames is still rising;
+  //             the frames it names are final, and there will be more of them
+  // 'truncated' the index pass stopped early. What is here is final and correct;
+  //             the rest of the clip is not coming.
+  get frameIndexState() {
+    return this._index ? this._index.completionState : 'growing';
+  }
+  // True while playback is pinned at the last indexed frame waiting for the
+  // index to catch up — a stall on the indexer, not on the decoder.
+  get waitingForIndex() { return this._waitingForIndex; }
 
   frameAtTime(t) { return this._index ? this._index.frameAtTime(t) : 0; }
 
@@ -3406,16 +4001,76 @@ class VideoEngine extends EventTarget {
     this._decoderConfig = index.decoderConfig;
     this._annexBSamples = !!index.samplesAreAnnexB;
     this._timescale = index.timescale;
+    this.rotation = index.rotation;
+    this.videoWidth = index.videoWidth;
+    this.videoHeight = index.videoHeight;
+    this._readIndexTables();
+    this._sizeWindows();
+
+    // An index that is still being built hands over more frames as it certifies
+    // them. Re-read its tables each time rather than reach through the index on
+    // the decode driver's hot path.
+    if (this._indexListeners || index.completionState !== 'growing') return;
+    const onExtended = () => this._indexExtended();
+    const onSettled = () => {
+      if (index.completionState !== 'truncated') {
+        this.dispatchEvent(new Event('indexcomplete'));
+        return;
+      }
+      this.dispatchEvent(new Event('indextruncated'));
+      // Not `failed`: the frames this engine has are exact and it will go on
+      // playing them. What ended is the clip's growth, and a host showing a
+      // scrubber or a frame count needs to hear that in the channel it already
+      // watches for trouble.
+      const because = index.completionError && index.completionError.message;
+      this.dispatchEvent(new CustomEvent('errormessage', {
+        detail: {
+          message: `Only the first ${this.numFrames} frames of this clip could be `
+            + `indexed${because ? ` (${because})` : ''}. Those frames are exact; the `
+            + 'rest of the clip is unavailable.',
+          fatal: true,
+          incomplete: true,
+        },
+      }));
+    };
+    this._indexListeners = { index, onExtended, onSettled };
+    index.addEventListener('extended', onExtended);
+    index.addEventListener('complete', onSettled);
+    index.addEventListener('truncated', onSettled);
+  }
+
+  // Alias the index's tables. Safe to redo on a growing index precisely because
+  // it grows by APPENDING: every entry already read keeps its meaning, so a
+  // re-read can only ever add frames, never move one.
+  _readIndexTables() {
+    const index = this._index;
     this._samples = index.samples;
     this._keyframeDecodeIndices = index.keyframeDecodeIndices;
     this._displayToDecode = index.displayToDecode;
     this._microsToDisplay = index.microsToDisplay;
     this.numFrames = index.numFrames;
     this.duration = index.duration;
-    this.rotation = index.rotation;
-    this.videoWidth = index.videoWidth;
-    this.videoHeight = index.videoHeight;
-    this._sizeWindows();
+  }
+
+  // The index certified more frames. Synchronous from end to end: the index
+  // dispatches this from inside its own publish, so anything awaited here would
+  // let the host observe a half-grown table.
+  _indexExtended() {
+    this._readIndexTables();
+    // A frame the driver gave up on may simply not have been indexed yet — the
+    // decode run ran off the end of a sample table that was still short. Those
+    // verdicts are stale now, so clear them rather than leave a frame
+    // permanently undecodable for the rest of the session.
+    this._stalledFrame = -1;
+    this._restartTarget = -1;
+    this._restartCount = 0;
+    this._drained = false;
+    if (this._waitingForIndex) {
+      this._waitingForIndex = false;
+      this._lastNow = 0;   // do not charge the wait to the playhead
+    }
+    if (this.ready) this._request(this.frameAtTime(this.playhead));
+    this.dispatchEvent(new Event('indexextended'));
   }
 
   // The size a cached bitmap of this clip's frames comes out at, after the
@@ -3748,7 +4403,15 @@ class VideoEngine extends EventTarget {
       ? Math.min(MAX_BLOCK, Math.max(size, Math.min(wanted, MAX_BLOCK), MIN_BLOCK))
       : MAX_BLOCK;
     const end = Math.min(this._reader.size, offset + block) - 1;
-    this._byteBuffer = new Uint8Array(await this._reader.read(offset, end));
+    // Somebody is waiting on this one. Say so, so that an index pass still
+    // streaming the rest of the container out of the same source stands aside
+    // rather than racing us for the pipe (see read-priority-gate).
+    beginPriorityRead();
+    try {
+      this._byteBuffer = new Uint8Array(await this._reader.read(offset, end));
+    } finally {
+      endPriorityRead();
+    }
     this._byteBufferStart = offset;
   }
   _sliceSample(k) {
@@ -3798,7 +4461,14 @@ class VideoEngine extends EventTarget {
       if (this._lastNow) {
         this.playhead += (now - this._lastNow) / 1000 * this._playbackRate;
         if (this.playhead >= this.duration) {
-          if (this.loop) {
+          if (this.frameIndexState === 'growing') {
+            // Not the end of the clip — the end of what has been indexed so far.
+            // Hold on the last frame we can name and keep playing: the index
+            // publishing its next run releases us (see _indexExtended). Looping
+            // here would restart a clip the viewer is still in the middle of.
+            this.playhead = Math.max(0, this.duration - 1e-6);
+            this._waitingForIndex = true;
+          } else if (this.loop) {
             this.playhead -= this.duration;
             if (!(this.playhead >= 0 && this.playhead < this.duration)) this.playhead = 0;
           } else {
@@ -3905,6 +4575,18 @@ class VideoEngine extends EventTarget {
     this.ready = false;
     this.playing = false;
     this.failed = false;
+    this._waitingForIndex = false;
+    // Stop listening to the index before letting go of it: the same index can be
+    // handed on to another engine (createBestEngine falls back to the <video>
+    // element after a WebCodecs load failure), and a torn-down engine must not
+    // still be reacting to it.
+    if (this._indexListeners) {
+      const { index, onExtended, onSettled } = this._indexListeners;
+      index.removeEventListener('extended', onExtended);
+      index.removeEventListener('complete', onSettled);
+      index.removeEventListener('truncated', onSettled);
+      this._indexListeners = null;
+    }
     if (this._videoDecoder) {
       try { this._videoDecoder.close(); } catch (e) { /* already closed */ }
       this._videoDecoder = null;
@@ -4194,6 +4876,18 @@ class NativeVideoEngine extends EventTarget {
     }
     try {
       this._index = options.index || await ContainerIndex.fromSource(source);
+      // A <video> element plays the whole clip whether or not we have finished
+      // reading the container, so an index still growing underneath it would be
+      // asked, within seconds, which frame is on screen for a part of the clip it
+      // has not certified. The WebCodecs engine can hold the playhead at the last
+      // indexed frame because it owns the clock; this one cannot. So refuse a
+      // partial index here rather than answer for frames it has not read.
+      if (this._index.completionState === 'growing') {
+        throw new Error('NativeVideoEngine: this index is still being built, and a '
+          + '<video> element plays past whatever has been indexed so far — it '
+          + 'cannot be held at the last certified frame the way the WebCodecs '
+          + 'engine can. Wait for the index to finish before loading it here.');
+      }
       this.numFrames = this._index.numFrames;
       this.rotation = this._index.rotation;
 
@@ -4590,6 +5284,24 @@ async function createBestEngine(source, options = {}) {
     // for me". A host that wants to report whether the container could be indexed
     // needs that distinction.
     index: providedIndex,
+    // Hand back a playable engine as soon as enough of the clip has been indexed
+    // to be worth showing, instead of waiting for the whole container to be read.
+    // Only a full-file pass has anything to wait for (WebM today; a classic MP4
+    // indexes in a few range reads however long the clip is), and only the
+    // WebCodecs tier can use a partial index — the <video> element plays the
+    // whole clip whether or not we have named its frames yet, so an index still
+    // growing underneath it would have to answer for frames it has not certified.
+    //
+    // What the host gets is an engine whose numFrames GROWS: every frame number
+    // it reports is exact and permanent, and the set of frames it will report
+    // widens as the pass goes on. Watch engine.frameIndexState and its
+    // 'indexextended' / 'indexcomplete' / 'indextruncated' events. Off by
+    // default, because a growing numFrames is not what existing callers expect.
+    playWhileIndexing = false,
+    // How much of the clip must be indexed before that early engine comes back.
+    // An engine that can show one frame is not worth the complexity of handling
+    // one; a second or so of video is.
+    minimumIndexedFramesBeforePlayback = 30,
   } = options;
 
   let index = (providedIndex !== undefined) ? providedIndex : null;
@@ -4597,15 +5309,44 @@ async function createBestEngine(source, options = {}) {
   // (an unsupported container, mp4box.js absent, or the WebM pass timing out).
   let indexBuildError = null;
   if (providedIndex === undefined) {
-    try {
-      index = await ContainerIndex.fromSource(source, {
-        timeoutMilliseconds: indexTimeoutMilliseconds,
-        maxBytes: indexMaxBytes,
-        onProgress,
-      });
-    } catch (err) {
-      indexBuildError = err;
-    }
+    // Publishing certified prefixes is only worth asking for when there is a
+    // WebCodecs tier for them to land on.
+    const wantCertifiedPrefixes = playWhileIndexing && prefer !== 'native'
+      && !!canvas && typeof VideoDecoder !== 'undefined';
+    let earlyIndex = null;
+    let onIndexExtended = null;
+    const readyToPlay = new Promise((resolve) => {
+      onIndexExtended = (growing) => {
+        if (earlyIndex || growing.completionState !== 'growing') return;
+        if (growing.numFrames < minimumIndexedFramesBeforePlayback) return;
+        // The same two gates the ladder below applies, asked early: without a
+        // sample table and a decoder configuration there is no WebCodecs tier
+        // for a partial index to play on, and a codec this browser accepts and
+        // then dies on belongs on the <video> element, which needs the whole
+        // index. Either way, wait for the finished build.
+        const growingCodec = growing.decoderConfig && growing.decoderConfig.codec;
+        if (!growing.supportsWebCodecs
+            || webCodecsMayFailMidStream(growingCodec, detectBrowserEngine())) return;
+        earlyIndex = growing;
+        resolve(growing);
+      };
+    });
+
+    const buildPromise = ContainerIndex.fromSource(source, {
+      timeoutMilliseconds: indexTimeoutMilliseconds,
+      maxBytes: indexMaxBytes,
+      onProgress,
+      publishPartialIndex: wantCertifiedPrefixes,
+      onIndexCreated: wantCertifiedPrefixes ? (created) => {
+        created.addEventListener('extended', () => onIndexExtended(created));
+      } : undefined,
+    }).then((built) => { index = built; return built; },
+      (err) => { indexBuildError = err; return null; });
+
+    // Whichever comes first: enough of the clip to play, or the whole pass.
+    if (wantCertifiedPrefixes) await Promise.race([readyToPlay, buildPromise]);
+    else await buildPromise;
+    if (!index) index = earlyIndex;
   }
 
   // Index or refuse. Every engine this function returns reports true per-frame
@@ -4658,6 +5399,15 @@ async function createBestEngine(source, options = {}) {
       engine.destroy();
       console.warn('exact-video-engine: WebCodecs could not play this clip; '
         + 'falling back to the native <video> element.', err);
+      // The <video> element plays the whole clip regardless of how far the index
+      // has got, so it needs a finished one to name frames against — see the
+      // refusal in NativeVideoEngine.load. Wait for the pass we left running.
+      if (index.completionState === 'growing') {
+        await new Promise((resolve) => {
+          index.addEventListener('complete', resolve, { once: true });
+          index.addEventListener('truncated', resolve, { once: true });
+        });
+      }
     }
   }
 

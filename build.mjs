@@ -32,6 +32,7 @@ const MODULE_ORDER = [
   'src/header.js',
   'src/decode-support.js',
   'src/range-readers.js',
+  'src/read-priority-gate.js',
   'src/index-cache.js',
   'src/matroska.js',
   'src/ogg.js',

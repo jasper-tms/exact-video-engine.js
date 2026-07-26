@@ -87,8 +87,10 @@ show — rather than play a clip it would have to guess about:
   whose *codec* WebCodecs cannot decode — uncompressed, MJPEG — is refused here
   too: AVI has no native fallback, so an index it cannot decode from is useless.)
 - **An indexing pass that ran out of its budget** (`indexTimeoutMilliseconds` /
-  `indexMaxBytes`, see the WebM and MKV section). A partial table is a wrong
-  table.
+  `indexMaxBytes`, see the WebM and MKV section) before naming a single frame. A
+  partial table is a wrong table — unless every frame in it was *certified* as
+  final before it was handed out, which is what "Playing while the index is still
+  being built" below is about.
 - **A browser without `requestVideoFrameCallback`, when the clip must play
   natively.** Even a perfect index cannot say which frame a `<video>` element is
   showing without the presented-frame clock, so the native path refuses rather
@@ -212,6 +214,75 @@ callback is swallowed, so a broken indicator can never abort a load. A classic
 MP4 emits no ticks — its index is instant — so drive a spinner's visibility off
 the `createBestEngine` promise and let `onProgress` fill in the full-file
 passes (WebM, fragmented MP4, Ogg).
+
+### Playing while the index is still being built
+
+A progress bar is still a bar. Set `playWhileIndexing` and the WebM pass hands
+back a playable engine as soon as enough of the clip has been indexed to be worth
+showing, and keeps indexing the rest underneath it:
+
+```js
+const engine = await createBestEngine(source, {
+  canvas, video,
+  playWhileIndexing: true,
+  minimumIndexedFramesBeforePlayback: 30,   // default
+});
+
+engine.frameIndexState;   // 'growing' | 'complete' | 'truncated'
+engine.numFrames;         // rises as the pass goes on
+engine.addEventListener('indexextended', () => scrubber.value = engine.numFrames - 1);
+engine.addEventListener('indexcomplete', () => scrubber.classList.remove('partial'));
+engine.addEventListener('indextruncated', () => {
+  // The pass stopped early. What is here is final and correct; the rest of the
+  // clip is not coming. engine.numFrames will not rise again.
+});
+```
+
+The rule this keeps is not "index or refuse" relaxed, but restated at the level
+it actually holds:
+
+> **Every frame number this engine reports is exact and permanent. The set of
+> frames it is willing to report grows.**
+
+Display indices are append-only and immutable. If frame 412 ever came to mean a
+different picture once more of the file had been read, a host that had already
+written an annotation against 412 would have been handed exactly the silent
+off-by-one this library exists to prevent. So a frame is published only once
+**no frame still to be read can present before it** — the *certified* prefix.
+
+How far ahead of the playhead that certification runs depends on the codec, and
+on what the container proves rather than on what muxers usually do:
+
+- **VP8 and VP9** do not reorder frames for presentation, so storage order *is*
+  presentation order and a frame is certified the moment the next one is read.
+  Effectively no lag; this is most real `.webm`.
+- **H.264, HEVC and AV1 in Matroska** can reorder, and nothing in the container
+  bounds by how much. A block's timestamp is its cluster's plus a *signed 16-bit*
+  offset, so the honest bound is that window: 32768 ticks, or 32.8 seconds at the
+  default 1 ms timestamp scale. A clip shorter than that — or one written as a
+  single cluster — certifies nothing early and simply indexes in one pass, which
+  is the correct conservative answer rather than a failure.
+
+If the pass later dies (a budget, a dropped connection, a corrupt tail), the
+frames already published *stay*: they were certified before they went out. The
+index moves to `'truncated'`, `numFrames` stops rising, and the host is told.
+Nothing is cached in that state — a network hiccup should not become a permanently
+short table for that clip.
+
+To size a scrubber against the whole clip rather than a track that stretches
+under the cursor, use the index's `expectedDuration` — the length the container
+*declares* (Matroska's `Info/Duration`), fixed from the first publish, `0` when
+the file declares none. It is a claim, so it never names a frame; only the
+scanned table does that.
+
+Two things it deliberately does not do. It is **off by default**, because a
+growing `numFrames` is not what existing callers expect. And it applies **only to
+the WebCodecs tier**: a `<video>` element plays the whole clip whether or not we
+have named its frames yet, so it would be asked within seconds which frame is on
+screen for a part of the clip that has not been certified. The WebCodecs engine
+can hold the playhead at the last indexed frame because it owns the clock — it
+does exactly that, rather than looping — and the native path cannot, so it refuses
+a growing index outright. Ogg, which has no WebCodecs tier, is unaffected for now.
 
 ### Fragmented MP4
 
@@ -344,7 +415,7 @@ plays through.
 | `loop` | Whether playback wraps at the end. |
 | `playbackRate` | Playback speed multiplier. |
 | `duration` | Clip duration in seconds. |
-| `numFrames` | Frame count. |
+| `numFrames` | Frame count. Grows while `frameIndexState` is `growing` — see "Playing while the index is still being built". |
 | `currentFrame` | Integer display frame index on screen. |
 | `currentFrameFloat` | Continuous playhead in frame units (index + fraction of the frame's display interval) — drive synchronized/interpolated overlays from this, never from `currentTime * frameRate`. |
 | `currentTime` | Playhead in seconds (get/set), with display frame 0 at t = 0 in both engines. |
@@ -355,7 +426,10 @@ plays through.
 | `rotation` | The track's display rotation in degrees: 0, 90, 180, or 270. Informational — both engines already present upright. |
 | `displayElement` | The canvas or `<video>` the engine presents into. |
 | `tier` | What this engine got, e.g. `webcodecs` or `native (container index, presented clock)`. Useful for a dev label. |
-| `frameIndexIsExact` | True on every engine `createBestEngine` returns (a clip that could not be indexed is refused instead). Goes false only if the runtime watcher later catches the table disagreeing with the frames actually presented, alongside a fatal `errormessage`. |
+| `frameIndexIsExact` | True on every engine `createBestEngine` returns (a clip that could not be indexed is refused instead). Goes false only if the runtime watcher later catches the table disagreeing with the frames actually presented, alongside a fatal `errormessage`. True in all three `frameIndexState`s: a growing index has *fewer* frames than the clip, not less exact ones. |
+| `frameIndexState` | `complete` (the ordinary case), `growing` (the index is still being built and `numFrames` is still rising), or `truncated` (the pass stopped early; what is here is final, the rest of the clip is not coming). `VideoEngine` only — the native path refuses a growing index. |
+| `waitingForIndex` | True while playback is pinned at the last indexed frame waiting for the index to catch up. A stall on the indexer, not on the decoder — and not the end of the clip, so `loop` does not fire. |
+| events `indexextended` / `indexcomplete` / `indextruncated` | The index published more frames, finished, or stopped early. `indextruncated` also emits a fatal `errormessage`. |
 | `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when the index carries no decoder configuration (Ogg, or a Matroska codec we do not configure). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. |
 | `failed` | True once the engine can no longer stand behind its output: an unrecoverable `VideoDecoder` error (`VideoEngine`), or the container index caught disagreeing with the presented frames during playback (`NativeVideoEngine`). Both also emit a fatal `errormessage`. |
 | `destroy()` | Release resources when done (decoders are a limited browser resource). |

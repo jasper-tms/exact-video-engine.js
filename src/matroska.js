@@ -1,3 +1,5 @@
+import { awaitPriorityReadsQuiet } from './read-priority-gate.js';
+
 // ==================================================================
 // Matroska/WebM frame table — the second way to get real timestamps, and (since
 // v2.2) a full decode table as well.
@@ -54,6 +56,7 @@ const EBML_ID = {
   seekHead: 0x114D9B74,
   info: 0x1549A966,
   timestampScale: 0x2AD7B1,
+  duration: 0x4489,
   tracks: 0x1654AE6B,
   trackEntry: 0xAE,
   trackNumber: 0xD7,
@@ -85,6 +88,24 @@ const EBML_SEGMENT_LEVEL_IDS = new Set([
 ]);
 
 const MATROSKA_TRACK_TYPE_VIDEO = 1;
+
+// A block's timestamp is its cluster's plus a SIGNED 16-BIT offset, so the
+// earliest presentation time a block of the cluster starting at T can carry is
+// T - 32768 ticks. Nothing in the format ties that offset to the cluster's own
+// span, so this — not any observation about how muxers actually lay clusters out
+// — is what bounds how far back a frame we have not read yet could present.
+const MATROSKA_MAXIMUM_BLOCK_TIMESTAMP_OFFSET = 32768;
+
+// Codecs with no presentation reordering: their frames are stored in the order
+// they are shown, so a block's timestamp can never fall below one already read.
+// VP8 has no B-frames at all, and VP9's altref frames are hidden inside
+// superframes rather than reordered for display. That is a property of the
+// codecs, not a habit of muxers, which is why it is safe to certify a frame the
+// moment the next one is read instead of waiting out the 32768-tick window
+// above. Everything else (H.264, HEVC, AV1 in Matroska) can reorder.
+function codecHasNoPresentationReordering(codecId) {
+  return codecId === 'V_VP8' || codecId === 'V_VP9';
+}
 
 // Thrown when the pass runs out of its time (or byte) budget. Named so a caller
 // can tell "this clip is too big to index in the time you gave me" (fall back to
@@ -170,6 +191,18 @@ async function readEbmlVariableInt(cursor) {
   return allOnes ? null : value;
 }
 
+// An IEEE float element (Matroska writes Duration as one, 4 or 8 bytes wide).
+// Anything else is not a float this format defines, so it reads as absent.
+async function readEbmlFloat(cursor, byteCount) {
+  if (byteCount !== 4 && byteCount !== 8) {
+    cursor.advance(byteCount);
+    return 0;
+  }
+  const bytes = await readEbmlBytes(cursor, byteCount);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, byteCount);
+  return byteCount === 4 ? view.getFloat32(0) : view.getFloat64(0);
+}
+
 async function readEbmlUnsigned(cursor, byteCount) {
   await cursor.ensure(byteCount);
   let value = 0;
@@ -227,6 +260,20 @@ export function formatProgress(progress) {
 //                              (see formatProgress) during the pass, and once
 //                              more at 100% when it finishes. A throw from it is
 //                              swallowed so a buggy indicator cannot abort a load.
+// options.onFramesCertified    called during the pass with each next contiguous
+//                              run of decode-order frames whose place on the
+//                              display timeline is settled, as
+//                              (frames, watermarkTicks, decoderConfig). The
+//                              promise it carries: NO frame still to come, read
+//                              or unread, presents before watermarkTicks. A
+//                              throw from it DOES abort the pass — this one is
+//                              load-bearing, not an indicator.
+// options.maximumFrameReorderSeconds
+//                              how far a codec that reorders may be assumed to
+//                              reorder, tightening the provable 32768-tick bound
+//                              for onFramesCertified. An ASSERTION about the
+//                              file, not a fact read from it; leave it out to
+//                              certify only what the container proves.
 //
 // Returns:
 //   { presentationTimes,      // seconds, file (decode) order
@@ -262,6 +309,9 @@ export async function readMatroskaFrameTable(reader, options = {}) {
   let lastYieldedAt = startedAt;
   const state = {
     timestampScaleSeconds: 1e6 / 1e9,   // TimestampScale defaults to 1 ms
+    // Info/Duration, in timestamp-scale units, or 0 when the file states none.
+    // A claim about the clip's length, never a source of frame numbers.
+    declaredDurationTicks: 0,
     videoTrackNumber: null,
     defaultFrameDuration: 0,
     videoWidth: 0,
@@ -269,10 +319,27 @@ export async function readMatroskaFrameTable(reader, options = {}) {
     codecId: '',
     codecPrivate: null,
     clusterTimestamp: 0,
+    // A Cluster's Timestamp is mandatory and has to arrive before the blocks it
+    // times. Without this flag a cluster missing one would silently time its
+    // frames from zero — a whole cluster landing on top of the opening seconds
+    // of the clip, which sorts into a plausible-looking and completely wrong
+    // table. Reset per cluster; readMatroskaBlock refuses if it is still false.
+    clusterTimestampSeen: false,
     // Decode order, one entry per video frame: its timestamp in timescale ticks
     // (integer, exactly as the container writes it) and the byte range of its
     // encoded data, which the WebCodecs engine later fetches on demand.
     frames: [],
+    // How many of those frames have been handed to onFramesCertified, and the
+    // presentation time (ticks) that was promised when the last of them went out:
+    // no frame still to come — read or unread — presents before it.
+    certifiedFrameCount: 0,
+    certifiedWatermarkTicks: -Infinity,
+    // Cleared the first time a block's timestamp falls below its predecessor's,
+    // which for a codec that does not reorder means the file is not what it says
+    // it is. The certified watermark then drops back to the conservative
+    // cluster-based bound rather than trusting the codec's promise.
+    blocksAreInPresentationOrder: true,
+    lastBlockTicks: -Infinity,
   };
 
   // Build and hand a progress report to onProgress, never letting the indicator
@@ -295,6 +362,71 @@ export async function readMatroskaFrameTable(reader, options = {}) {
     }
   };
 
+  // Publishing a certified prefix means committing to a decoder configuration
+  // before the whole file has been read, and it must be the SAME configuration
+  // the finished pass would have produced — the tier is chosen from it, and a
+  // configuration that changed afterwards would mean the tier was chosen on
+  // incomplete information. Everything it needs is known from Tracks except for
+  // VP9, which keeps its profile and bit depth in the first keyframe (one small
+  // read, below) and takes its level from the frame rate. So a VP9 track that
+  // declares no DefaultDuration cannot be pinned early: its level would be read
+  // off however much of the clip had gone past, which is not necessarily the
+  // level of the whole clip. Such a track indexes in one shot, as before.
+  const onFramesCertified = (typeof options.onFramesCertified === 'function')
+    ? options.onFramesCertified : null;
+  let pinnedDecoderConfig = null;
+  let decoderConfigCanBePinned = true;
+  const pinDecoderConfig = async () => {
+    if (pinnedDecoderConfig || !decoderConfigCanBePinned) return pinnedDecoderConfig;
+    if (state.videoTrackNumber === null || !state.frames.length) return null;
+    if (state.codecId === 'V_VP9' && !(state.defaultFrameDuration > 0)) {
+      decoderConfigCanBePinned = false;
+      return null;
+    }
+    let firstKeyframeBytes = null;
+    if (needsFirstKeyframeBytes(state.codecId)) {
+      const keyframe = state.frames.find((frame) => frame.isSync);
+      if (!keyframe) return null;   // no keyframe read yet; try again next chunk
+      firstKeyframeBytes = await readFirstKeyframeBytes(reader, keyframe);
+    }
+    pinnedDecoderConfig = buildMatroskaDecoderConfig({
+      codecId: state.codecId,
+      codecPrivate: state.codecPrivate,
+      videoWidth: state.videoWidth,
+      videoHeight: state.videoHeight,
+      firstKeyframeBytes,
+      frameRate: estimateFrameRate([], state.defaultFrameDuration),
+    });
+    // A codec we cannot configure has no WebCodecs tier to publish a prefix
+    // into; the clip still indexes in one shot for the <video> element.
+    if (!pinnedDecoderConfig) decoderConfigCanBePinned = false;
+    return pinnedDecoderConfig;
+  };
+
+  // How far a reordering codec is allowed to reorder. Absent an assertion from
+  // the caller, the only honest answer is the widest offset a block can carry.
+  const reorderGuardTicks = (options.maximumFrameReorderSeconds > 0)
+    ? Math.ceil(options.maximumFrameReorderSeconds / state.timestampScaleSeconds)
+    : MATROSKA_MAXIMUM_BLOCK_TIMESTAMP_OFFSET;
+
+  const certifyFrames = async () => {
+    if (!onFramesCertified || !decoderConfigCanBePinned) return;
+    if (!await pinDecoderConfig()) return;
+    const certified = nextCertifiedRun(state, reorderGuardTicks);
+    if (!certified) return;
+    state.certifiedFrameCount = certified.end;
+    state.certifiedWatermarkTicks = certified.watermarkTicks;
+    onFramesCertified(certified.frames, certified.watermarkTicks, {
+      decoderConfig: pinnedDecoderConfig,
+      timescale: 1 / state.timestampScaleSeconds,
+      defaultFrameDuration: state.defaultFrameDuration,
+      declaredDuration: state.declaredDurationTicks * state.timestampScaleSeconds,
+      videoWidth: state.videoWidth,
+      videoHeight: state.videoHeight,
+      codecId: state.codecId,
+    });
+  };
+
   const cursor = new SequentialByteCursor(reader, {
     // How many bytes each refill fetches (default 1 MB), which is also the
     // granularity of the onProgress ticks. Exposed mostly so a test can force
@@ -311,6 +443,14 @@ export async function readMatroskaFrameTable(reader, options = {}) {
       // A refill is one megabyte of progress: report it before fetching the next
       // chunk (the yield below then lets the host repaint its indicator).
       report(cursor.position);
+      // Everything read since the last chunk whose display position is now
+      // settled goes out here, so a host can start naming and showing frames
+      // while the rest of the file is still going past.
+      await certifyFrames();
+      // Yield to a read the host is actually waiting on (a decode of a frame
+      // near the playhead) before taking the next megabyte for ourselves: this
+      // pass is bulk throughput, that one is latency.
+      await awaitPriorityReadsQuiet();
       // Hand the event loop a turn every so often. Awaiting the read itself
       // usually does this, but a fast local File can resolve quickly enough to
       // starve rendering for the length of the pass.
@@ -349,18 +489,28 @@ export async function readMatroskaFrameTable(reader, options = {}) {
   const presentationTimes =
     state.frames.map((frame) => frame.ticks * state.timestampScaleSeconds);
 
-  // VP9 writes no CodecPrivate in practice, and its profile and bit depth are
-  // needed for the codec string — they live in the first keyframe's own
-  // uncompressed header, so fetch just its opening bytes. One small read, after
-  // a pass that has already been over the whole file.
-  let firstKeyframeBytes = null;
-  if (needsFirstKeyframeBytes(state.codecId)) {
-    const keyframe = state.frames.find((frame) => frame.isSync) || state.frames[0];
-    const wanted = Math.min(keyframe.size, VP9_HEADER_PROBE_BYTES);
-    if (wanted > 0) {
-      firstKeyframeBytes = new Uint8Array(
-        await reader.read(keyframe.offset, keyframe.offset + wanted - 1));
+  // A configuration pinned early is the one this clip has been indexed under and
+  // the one the decoder is already running, so it stands. Otherwise build it now,
+  // the way this pass always has.
+  let decoderConfig = pinnedDecoderConfig;
+  if (!decoderConfig) {
+    // VP9 writes no CodecPrivate in practice, and its profile and bit depth are
+    // needed for the codec string — they live in the first keyframe's own
+    // uncompressed header, so fetch just its opening bytes. One small read, after
+    // a pass that has already been over the whole file.
+    let firstKeyframeBytes = null;
+    if (needsFirstKeyframeBytes(state.codecId)) {
+      const keyframe = state.frames.find((frame) => frame.isSync) || state.frames[0];
+      firstKeyframeBytes = await readFirstKeyframeBytes(reader, keyframe);
     }
+    decoderConfig = buildMatroskaDecoderConfig({
+      codecId: state.codecId,
+      codecPrivate: state.codecPrivate,
+      videoWidth: state.videoWidth,
+      videoHeight: state.videoHeight,
+      firstKeyframeBytes,
+      frameRate: estimateFrameRate(presentationTimes, state.defaultFrameDuration),
+    });
   }
 
   return {
@@ -368,18 +518,78 @@ export async function readMatroskaFrameTable(reader, options = {}) {
     frames: state.frames,
     timescale: 1 / state.timestampScaleSeconds,
     defaultFrameDuration: state.defaultFrameDuration,
+    // What the file SAYS it runs to (Info/Duration), 0 when it says nothing.
+    declaredDuration: state.declaredDurationTicks * state.timestampScaleSeconds,
     videoWidth: state.videoWidth,
     videoHeight: state.videoHeight,
     codecId: state.codecId,
-    decoderConfig: buildMatroskaDecoderConfig({
-      codecId: state.codecId,
-      codecPrivate: state.codecPrivate,
-      videoWidth: state.videoWidth,
-      videoHeight: state.videoHeight,
-      firstKeyframeBytes,
-      frameRate: estimateFrameRate(presentationTimes, state.defaultFrameDuration),
-    }),
+    decoderConfig,
+    // How many frames went out through onFramesCertified. The rest are in
+    // `frames` as always; a caller that took the certified ones as they came
+    // knows to pick up from here.
+    certifiedFrameCount: state.certifiedFrameCount,
   };
+}
+
+// The opening bytes of a frame — enough of a VP9 keyframe's uncompressed header
+// to read its profile and bit depth out of.
+async function readFirstKeyframeBytes(reader, keyframe) {
+  const wanted = Math.min(keyframe.size, VP9_HEADER_PROBE_BYTES);
+  if (wanted <= 0) return null;
+  return new Uint8Array(
+    await reader.read(keyframe.offset, keyframe.offset + wanted - 1));
+}
+
+// The next contiguous run of decode-order frames whose place on the display
+// timeline is settled, or null when nothing new can be settled yet.
+//
+// Two things could still displace a frame we have read: a frame we have NOT read
+// (bounded by the container — see below), and a frame we HAVE read but not yet
+// handed over, which for a reordering codec can carry an earlier presentation
+// time than one before it in decode order. So the watermark this promises is the
+// smaller of those two bounds, and the run is the longest prefix whose every
+// frame sits strictly below it.
+//
+// The container's own bound:
+//   * a codec that does not reorder settles a frame as soon as the next one is
+//     read, because storage order IS presentation order;
+//   * otherwise the earliest time an unread block can carry is the current
+//     cluster's timestamp minus the widest offset a block can hold (or minus the
+//     caller's asserted reorder bound, where it gave one).
+function nextCertifiedRun(state, reorderGuardTicks) {
+  const frames = state.frames;
+  const from = state.certifiedFrameCount;
+  const length = frames.length;
+  if (from >= length) return null;
+
+  const containerWatermark =
+    (codecHasNoPresentationReordering(state.codecId) && state.blocksAreInPresentationOrder)
+      ? state.lastBlockTicks
+      : state.clusterTimestamp - reorderGuardTicks;
+  if (!(containerWatermark > state.certifiedWatermarkTicks)) return null;
+
+  // The earliest presentation time still in hand, from each possible cut point
+  // backwards: suffixMinimum[i - from] is the smallest tick over frames[i..).
+  const suffixMinimum = new Float64Array(length - from + 1);
+  suffixMinimum[length - from] = Infinity;
+  for (let i = length - 1; i >= from; i--) {
+    suffixMinimum[i - from] = Math.min(frames[i].ticks, suffixMinimum[i - from + 1]);
+  }
+
+  // Grow the run while its running maximum stays below everything left behind.
+  let end = from;
+  let runMaximum = -Infinity;
+  let watermarkTicks = state.certifiedWatermarkTicks;
+  while (end < length) {
+    const candidateMaximum = Math.max(runMaximum, frames[end].ticks);
+    const promise = Math.min(containerWatermark, suffixMinimum[end + 1 - from]);
+    if (!(candidateMaximum < promise)) break;
+    runMaximum = candidateMaximum;
+    watermarkTicks = promise;
+    end++;
+  }
+  if (end === from) return null;
+  return { frames: frames.slice(from, end), end, watermarkTicks };
 }
 
 // Frames per second, for the one place a codec string needs it (a VP9 level is
@@ -425,6 +635,12 @@ async function readMatroskaInfo(cursor, end, state) {
     if (id === EBML_ID.timestampScale) {
       // Nanoseconds per timestamp tick.
       state.timestampScaleSeconds = (await readEbmlUnsigned(cursor, size)) / 1e9;
+    } else if (id === EBML_ID.duration) {
+      // A float, in timestamp-scale units. Only a CLAIM about how long the clip
+      // runs — it names no frame and is never mapped from. It exists so a host
+      // watching an index grow can size a scrubber against the whole clip
+      // instead of a track that stretches under the cursor.
+      state.declaredDurationTicks = await readEbmlFloat(cursor, size);
     }
     cursor.position = contentStart + size;
   }
@@ -488,6 +704,7 @@ async function readMatroskaTrackEntry(cursor, end, state) {
 
 async function readMatroskaCluster(cursor, end, state) {
   state.clusterTimestamp = 0;
+  state.clusterTimestampSeen = false;
   while (cursor.position < end && !cursor.atEnd) {
     const idStart = cursor.position;
     const id = await readEbmlId(cursor);
@@ -503,6 +720,7 @@ async function readMatroskaCluster(cursor, end, state) {
 
     if (id === EBML_ID.clusterTimestamp) {
       state.clusterTimestamp = await readEbmlUnsigned(cursor, size);
+      state.clusterTimestampSeen = true;
     } else if (id === EBML_ID.simpleBlock) {
       // A SimpleBlock says outright whether it is a keyframe, in the top bit of
       // its flags byte.
@@ -791,6 +1009,16 @@ async function readMatroskaBlock(cursor, blockEnd, state, keyframeFlagOverride) 
 
   if (state.videoTrackNumber === null) throw new Error('WebM cluster before Tracks');
   if (trackNumber !== state.videoTrackNumber) return -1;   // audio, subtitles, ...
+  // A Cluster's Timestamp is mandatory and every block in it is written as an
+  // offset from it, so a block reaching us before one has been read has no
+  // timestamp we can honestly compute. Reading it as an offset from zero would
+  // drop the whole cluster on top of the start of the clip — a table that sorts
+  // and looks fine and is wrong — so refuse instead.
+  if (!state.clusterTimestampSeen) {
+    throw new Error('this WebM has a Cluster whose blocks come before its '
+      + 'Timestamp (or that carries none at all), so their presentation times '
+      + 'cannot be read');
+  }
   // Lacing packs several frames into one block under a single timestamp, so
   // their individual times would have to be invented from DefaultDuration — and
   // their byte ranges parsed out of a lacing header. It is an audio feature and
@@ -799,11 +1027,17 @@ async function readMatroskaBlock(cursor, blockEnd, state, keyframeFlagOverride) 
   if (flags & 0x06) throw new Error('this WebM laces its video blocks');
 
   const offset = cursor.position;   // the frame's own bytes start here
+  const ticks = state.clusterTimestamp + relative;
+  // Is storage order still presentation order? For a codec that does not reorder
+  // it has to be, and that is what lets a frame be certified the moment the next
+  // one is read (see nextCertifiedRun). One inversion and we stop believing it.
+  if (ticks < state.lastBlockTicks) state.blocksAreInPresentationOrder = false;
+  state.lastBlockTicks = ticks;
   state.frames.push({
     offset,
     size: blockEnd - offset,
     isSync: (keyframeFlagOverride === null) ? !!(flags & 0x80) : keyframeFlagOverride,
-    ticks: state.clusterTimestamp + relative,
+    ticks,
   });
   return state.frames.length - 1;
 }

@@ -55,6 +55,24 @@ export async function createBestEngine(source, options = {}) {
     // for me". A host that wants to report whether the container could be indexed
     // needs that distinction.
     index: providedIndex,
+    // Hand back a playable engine as soon as enough of the clip has been indexed
+    // to be worth showing, instead of waiting for the whole container to be read.
+    // Only a full-file pass has anything to wait for (WebM today; a classic MP4
+    // indexes in a few range reads however long the clip is), and only the
+    // WebCodecs tier can use a partial index — the <video> element plays the
+    // whole clip whether or not we have named its frames yet, so an index still
+    // growing underneath it would have to answer for frames it has not certified.
+    //
+    // What the host gets is an engine whose numFrames GROWS: every frame number
+    // it reports is exact and permanent, and the set of frames it will report
+    // widens as the pass goes on. Watch engine.frameIndexState and its
+    // 'indexextended' / 'indexcomplete' / 'indextruncated' events. Off by
+    // default, because a growing numFrames is not what existing callers expect.
+    playWhileIndexing = false,
+    // How much of the clip must be indexed before that early engine comes back.
+    // An engine that can show one frame is not worth the complexity of handling
+    // one; a second or so of video is.
+    minimumIndexedFramesBeforePlayback = 30,
   } = options;
 
   let index = (providedIndex !== undefined) ? providedIndex : null;
@@ -62,15 +80,44 @@ export async function createBestEngine(source, options = {}) {
   // (an unsupported container, mp4box.js absent, or the WebM pass timing out).
   let indexBuildError = null;
   if (providedIndex === undefined) {
-    try {
-      index = await ContainerIndex.fromSource(source, {
-        timeoutMilliseconds: indexTimeoutMilliseconds,
-        maxBytes: indexMaxBytes,
-        onProgress,
-      });
-    } catch (err) {
-      indexBuildError = err;
-    }
+    // Publishing certified prefixes is only worth asking for when there is a
+    // WebCodecs tier for them to land on.
+    const wantCertifiedPrefixes = playWhileIndexing && prefer !== 'native'
+      && !!canvas && typeof VideoDecoder !== 'undefined';
+    let earlyIndex = null;
+    let onIndexExtended = null;
+    const readyToPlay = new Promise((resolve) => {
+      onIndexExtended = (growing) => {
+        if (earlyIndex || growing.completionState !== 'growing') return;
+        if (growing.numFrames < minimumIndexedFramesBeforePlayback) return;
+        // The same two gates the ladder below applies, asked early: without a
+        // sample table and a decoder configuration there is no WebCodecs tier
+        // for a partial index to play on, and a codec this browser accepts and
+        // then dies on belongs on the <video> element, which needs the whole
+        // index. Either way, wait for the finished build.
+        const growingCodec = growing.decoderConfig && growing.decoderConfig.codec;
+        if (!growing.supportsWebCodecs
+            || webCodecsMayFailMidStream(growingCodec, detectBrowserEngine())) return;
+        earlyIndex = growing;
+        resolve(growing);
+      };
+    });
+
+    const buildPromise = ContainerIndex.fromSource(source, {
+      timeoutMilliseconds: indexTimeoutMilliseconds,
+      maxBytes: indexMaxBytes,
+      onProgress,
+      publishPartialIndex: wantCertifiedPrefixes,
+      onIndexCreated: wantCertifiedPrefixes ? (created) => {
+        created.addEventListener('extended', () => onIndexExtended(created));
+      } : undefined,
+    }).then((built) => { index = built; return built; },
+      (err) => { indexBuildError = err; return null; });
+
+    // Whichever comes first: enough of the clip to play, or the whole pass.
+    if (wantCertifiedPrefixes) await Promise.race([readyToPlay, buildPromise]);
+    else await buildPromise;
+    if (!index) index = earlyIndex;
   }
 
   // Index or refuse. Every engine this function returns reports true per-frame
@@ -123,6 +170,15 @@ export async function createBestEngine(source, options = {}) {
       engine.destroy();
       console.warn('exact-video-engine: WebCodecs could not play this clip; '
         + 'falling back to the native <video> element.', err);
+      // The <video> element plays the whole clip regardless of how far the index
+      // has got, so it needs a finished one to name frames against — see the
+      // refusal in NativeVideoEngine.load. Wait for the pass we left running.
+      if (index.completionState === 'growing') {
+        await new Promise((resolve) => {
+          index.addEventListener('complete', resolve, { once: true });
+          index.addEventListener('truncated', resolve, { once: true });
+        });
+      }
     }
   }
 

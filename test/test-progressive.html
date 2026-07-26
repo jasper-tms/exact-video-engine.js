@@ -1,0 +1,151 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine progressive-index test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<!-- Sized to the clips' exact aspect (150x90) so nothing is letterboxed and the
+     bar's position in the rendering maps straight back to its position in the
+     source frame. -->
+<div id="pane" style="width: 150px; height: 90px">
+  <canvas id="engine-canvas"></canvas>
+</div>
+<video id="native-video" muted playsinline></video>
+<script>
+// Drives the WebCodecs engine against an index that is STILL BEING BUILT, and
+// checks the one promise that makes that safe end to end:
+//
+//   Every frame number reported is exact and PERMANENT. The set of frames the
+//   engine will report grows; what any one of them means never changes.
+//
+// progressive-index-test.mjs proves that of the TABLE, in Node, by comparing
+// published prefixes against the finished table. This proves it of the PICTURE:
+// the frames named while the index was growing are walked, their pixels read,
+// and then walked again after the pass finished — and every one of them must
+// still be the same picture. The clips identify each frame by the position of a
+// white bar (frame n -> bar at x = 5n of 150), so "which frame is on screen" is
+// recoverable from the pixels with no trust in any clock.
+const BARS_ACROSS = 30;
+
+// The frame the pixels say is showing: find the bar (columns brighter than
+// half), take its centre, and convert that to a bar index.
+function visibleFrame(canvas) {
+  const width = canvas.width, height = canvas.height;
+  const row = canvas.getContext('2d')
+    .getImageData(0, Math.floor(height / 2), width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < width; x++) {
+    if (row[x * 4] > 128) { sum += x; count += 1; }
+  }
+  if (!count) return -1;   // no bar found: nothing painted
+  return Math.floor((sum / count) / (width / BARS_ACROSS));
+}
+
+const probe = document.createElement('canvas');
+probe.width = 150;
+probe.height = 90;
+const probeContext = probe.getContext('2d');
+
+// A reader that takes its time, so the pass is observably in progress rather
+// than over before the first assertion. The fixtures are a couple of kilobytes —
+// on a real clip this is what the network does for free.
+class SlowRangeReader extends UrlRangeReader {
+  async read(start, endInclusive) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return super.read(start, endInclusive);
+  }
+}
+
+// Walk a run of frames and record, for each, what the engine says is on screen
+// and what is actually on screen.
+async function walk(engine, canvas, frames) {
+  const rows = [];
+  for (const n of frames) {
+    engine.seekToFrame(n);
+    await engine.ensureFrame(n);
+    engine.update(performance.now());   // paints the frame at the playhead
+    probeContext.drawImage(canvas, 0, 0, probe.width, probe.height);
+    rows.push({ asked: n, visible: visibleFrame(probe), reported: engine.currentFrame });
+  }
+  return rows;
+}
+
+window.run = async function run(file) {
+  const source = `/test/clips/${file}`;
+  const canvas = document.getElementById('engine-canvas');
+  const video = document.getElementById('native-video');
+
+  // Build the index in certified prefixes, over a deliberately slow reader, and
+  // take hold of it the moment it exists.
+  const reader = new SlowRangeReader(source);
+  await reader.init();
+  let growing = null;
+  const buildPromise = ContainerIndex.load(reader, {
+    chunkBytes: 128,           // small, so a few-KB clip certifies many times
+    publishPartialIndex: true,
+    onIndexCreated: (created) => { growing = created; },
+  });
+
+  // Wait until enough frames are named to be worth showing.
+  const MINIMUM_FRAMES = 5;
+  await new Promise((resolve, reject) => {
+    const check = () => {
+      if (growing && growing.numFrames >= MINIMUM_FRAMES) { resolve(); return true; }
+      return false;
+    };
+    const poll = setInterval(() => { if (check()) clearInterval(poll); }, 5);
+    buildPromise.then(() => { clearInterval(poll); resolve(); }, (err) => {
+      clearInterval(poll);
+      reject(err);
+    });
+  });
+
+  if (!growing || !growing.supportsWebCodecs) {
+    window.__result = { skipped: 'this clip has no WebCodecs tier to play a prefix on' };
+    return;
+  }
+
+  const engine = await createBestEngine(source, { canvas, video, index: growing });
+  const stateAtLoad = engine.frameIndexState;
+  const framesAtLoad = engine.numFrames;
+  const durationAtLoad = engine.duration;
+
+  // Every frame the engine was willing to name at that moment.
+  const early = [];
+  for (let n = 0; n < framesAtLoad; n++) early.push(n);
+  const earlyRows = await walk(engine, canvas, early);
+
+  // A frame past the frontier is not nameable yet: seekToFrame clamps to the
+  // last one that is, exactly as it clamps to the last frame of a finished clip.
+  engine.seekToFrame(10000);
+  const clampedFrame = engine.currentFrame;
+  const clampedWithin = clampedFrame <= engine.numFrames - 1;
+
+  // Let the pass finish.
+  const settled = await new Promise((resolve) => {
+    if (growing.completionState !== 'growing') { resolve(growing.completionState); return; }
+    engine.addEventListener('indexcomplete', () => resolve('complete'), { once: true });
+    engine.addEventListener('indextruncated', () => resolve('truncated'), { once: true });
+  });
+  await buildPromise.catch(() => {});
+
+  // The same frames again, now that the whole clip is indexed. Every one of them
+  // must still be the same picture it was.
+  const lateRows = await walk(engine, canvas, early);
+
+  window.__result = {
+    tier: engine.tier,
+    frameIndexIsExact: engine.frameIndexIsExact,
+    stateAtLoad,
+    framesAtLoad,
+    durationAtLoad,
+    stateAfter: engine.frameIndexState,
+    settled,
+    framesAfter: engine.numFrames,
+    durationAfter: engine.duration,
+    clampedFrame,
+    clampedWithin,
+    earlyRows,
+    lateRows,
+  };
+};
+</script>

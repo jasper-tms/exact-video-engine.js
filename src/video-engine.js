@@ -1,5 +1,6 @@
 import { ContainerIndex } from './container-index.js';
 import { convertAnnexBToAvcc } from './avi.js';
+import { beginPriorityRead, endPriorityRead } from './read-priority-gate.js';
 
 // Frames the cache holds beyond the read-ahead window's far edge. Decoded
 // frames arrive a little past the target while the playhead is still catching
@@ -123,6 +124,14 @@ export class VideoEngine extends EventTarget {
     this._shownFrame = -1;
     this._lastBitmap = null;
     this._lastNow = 0;
+
+    // Set while the playhead sits on the last indexed frame of an index that is
+    // still growing. Playback is not over and not paused — it is waiting.
+    this._waitingForIndex = false;
+    // Listeners on the index, kept so _teardown can drop them: an index outlives
+    // the engine that adopted it (createBestEngine may hand the same one to a
+    // second engine after a WebCodecs load fails).
+    this._indexListeners = null;
   }
 
   get paused() { return !this.playing; }
@@ -139,8 +148,22 @@ export class VideoEngine extends EventTarget {
   // load() has adopted an index.
   get codecString() { return this._decoderConfig ? this._decoderConfig.codec : null; }
   // The engine decodes each frame itself, so its frame indices are exact by
-  // construction — there is no browser presentation to be uncertain about.
+  // construction — there is no browser presentation to be uncertain about. True
+  // in all three index states below: a growing index has fewer frames than the
+  // clip, not less exact ones.
   get frameIndexIsExact() { return true; }
+
+  // 'complete'  every frame in the clip is indexed (the ordinary case)
+  // 'growing'   the index is still being built and numFrames is still rising;
+  //             the frames it names are final, and there will be more of them
+  // 'truncated' the index pass stopped early. What is here is final and correct;
+  //             the rest of the clip is not coming.
+  get frameIndexState() {
+    return this._index ? this._index.completionState : 'growing';
+  }
+  // True while playback is pinned at the last indexed frame waiting for the
+  // index to catch up — a stall on the indexer, not on the decoder.
+  get waitingForIndex() { return this._waitingForIndex; }
 
   frameAtTime(t) { return this._index ? this._index.frameAtTime(t) : 0; }
 
@@ -215,16 +238,76 @@ export class VideoEngine extends EventTarget {
     this._decoderConfig = index.decoderConfig;
     this._annexBSamples = !!index.samplesAreAnnexB;
     this._timescale = index.timescale;
+    this.rotation = index.rotation;
+    this.videoWidth = index.videoWidth;
+    this.videoHeight = index.videoHeight;
+    this._readIndexTables();
+    this._sizeWindows();
+
+    // An index that is still being built hands over more frames as it certifies
+    // them. Re-read its tables each time rather than reach through the index on
+    // the decode driver's hot path.
+    if (this._indexListeners || index.completionState !== 'growing') return;
+    const onExtended = () => this._indexExtended();
+    const onSettled = () => {
+      if (index.completionState !== 'truncated') {
+        this.dispatchEvent(new Event('indexcomplete'));
+        return;
+      }
+      this.dispatchEvent(new Event('indextruncated'));
+      // Not `failed`: the frames this engine has are exact and it will go on
+      // playing them. What ended is the clip's growth, and a host showing a
+      // scrubber or a frame count needs to hear that in the channel it already
+      // watches for trouble.
+      const because = index.completionError && index.completionError.message;
+      this.dispatchEvent(new CustomEvent('errormessage', {
+        detail: {
+          message: `Only the first ${this.numFrames} frames of this clip could be `
+            + `indexed${because ? ` (${because})` : ''}. Those frames are exact; the `
+            + 'rest of the clip is unavailable.',
+          fatal: true,
+          incomplete: true,
+        },
+      }));
+    };
+    this._indexListeners = { index, onExtended, onSettled };
+    index.addEventListener('extended', onExtended);
+    index.addEventListener('complete', onSettled);
+    index.addEventListener('truncated', onSettled);
+  }
+
+  // Alias the index's tables. Safe to redo on a growing index precisely because
+  // it grows by APPENDING: every entry already read keeps its meaning, so a
+  // re-read can only ever add frames, never move one.
+  _readIndexTables() {
+    const index = this._index;
     this._samples = index.samples;
     this._keyframeDecodeIndices = index.keyframeDecodeIndices;
     this._displayToDecode = index.displayToDecode;
     this._microsToDisplay = index.microsToDisplay;
     this.numFrames = index.numFrames;
     this.duration = index.duration;
-    this.rotation = index.rotation;
-    this.videoWidth = index.videoWidth;
-    this.videoHeight = index.videoHeight;
-    this._sizeWindows();
+  }
+
+  // The index certified more frames. Synchronous from end to end: the index
+  // dispatches this from inside its own publish, so anything awaited here would
+  // let the host observe a half-grown table.
+  _indexExtended() {
+    this._readIndexTables();
+    // A frame the driver gave up on may simply not have been indexed yet — the
+    // decode run ran off the end of a sample table that was still short. Those
+    // verdicts are stale now, so clear them rather than leave a frame
+    // permanently undecodable for the rest of the session.
+    this._stalledFrame = -1;
+    this._restartTarget = -1;
+    this._restartCount = 0;
+    this._drained = false;
+    if (this._waitingForIndex) {
+      this._waitingForIndex = false;
+      this._lastNow = 0;   // do not charge the wait to the playhead
+    }
+    if (this.ready) this._request(this.frameAtTime(this.playhead));
+    this.dispatchEvent(new Event('indexextended'));
   }
 
   // The size a cached bitmap of this clip's frames comes out at, after the
@@ -557,7 +640,15 @@ export class VideoEngine extends EventTarget {
       ? Math.min(MAX_BLOCK, Math.max(size, Math.min(wanted, MAX_BLOCK), MIN_BLOCK))
       : MAX_BLOCK;
     const end = Math.min(this._reader.size, offset + block) - 1;
-    this._byteBuffer = new Uint8Array(await this._reader.read(offset, end));
+    // Somebody is waiting on this one. Say so, so that an index pass still
+    // streaming the rest of the container out of the same source stands aside
+    // rather than racing us for the pipe (see read-priority-gate).
+    beginPriorityRead();
+    try {
+      this._byteBuffer = new Uint8Array(await this._reader.read(offset, end));
+    } finally {
+      endPriorityRead();
+    }
     this._byteBufferStart = offset;
   }
   _sliceSample(k) {
@@ -607,7 +698,14 @@ export class VideoEngine extends EventTarget {
       if (this._lastNow) {
         this.playhead += (now - this._lastNow) / 1000 * this._playbackRate;
         if (this.playhead >= this.duration) {
-          if (this.loop) {
+          if (this.frameIndexState === 'growing') {
+            // Not the end of the clip — the end of what has been indexed so far.
+            // Hold on the last frame we can name and keep playing: the index
+            // publishing its next run releases us (see _indexExtended). Looping
+            // here would restart a clip the viewer is still in the middle of.
+            this.playhead = Math.max(0, this.duration - 1e-6);
+            this._waitingForIndex = true;
+          } else if (this.loop) {
             this.playhead -= this.duration;
             if (!(this.playhead >= 0 && this.playhead < this.duration)) this.playhead = 0;
           } else {
@@ -714,6 +812,18 @@ export class VideoEngine extends EventTarget {
     this.ready = false;
     this.playing = false;
     this.failed = false;
+    this._waitingForIndex = false;
+    // Stop listening to the index before letting go of it: the same index can be
+    // handed on to another engine (createBestEngine falls back to the <video>
+    // element after a WebCodecs load failure), and a torn-down engine must not
+    // still be reacting to it.
+    if (this._indexListeners) {
+      const { index, onExtended, onSettled } = this._indexListeners;
+      index.removeEventListener('extended', onExtended);
+      index.removeEventListener('complete', onSettled);
+      index.removeEventListener('truncated', onSettled);
+      this._indexListeners = null;
+    }
     if (this._videoDecoder) {
       try { this._videoDecoder.close(); } catch (e) { /* already closed */ }
       this._videoDecoder = null;

@@ -31,7 +31,8 @@ open Matroska at all, it simply would not play. Ogg is still in this boat.
 Opening a WebM means reading through the whole file. A large one, or a slow
 link, blows the deadline — the user waits, watches a progress bar, and then gets
 *degraded* frame accuracy as the reward. The bigger the file, the worse this
-gets.
+gets. (And even when it finished, the user sat looking at an empty pane for the
+whole scan — now addressed too; see the status note.)
 
 **FIXED: 5. Anything that isn't MP4/MOV or WebM is approximate only.**
 Ogg, streaming formats (HLS), and other containers play, but with guessed frame
@@ -93,7 +94,23 @@ distant cloud bucket, even for a small file.
 - [x] **4** — WebM timeouts degrade — *fixed (index or refuse).* A pass that
   blows its budget now refuses with a clear error instead of degrading to
   guessed frame numbers; the host can raise `indexTimeoutMilliseconds`, and the
-  index cache (#8) makes a finished pass a once-per-clip cost.
+  index cache (#8) makes a finished pass a once-per-clip cost. And the *waiting*
+  is addressed too: `playWhileIndexing` hands back a playable engine once enough
+  of the clip is indexed to be worth showing, and goes on indexing underneath it,
+  so a long WebM opens at once instead of after its last byte. What makes that
+  safe is that a frame is published only when no frame still to be read can
+  present before it — every reported frame number stays exact and permanent, and
+  only the *set* of reported frames grows. VP8 and VP9 do not reorder, so they
+  certify a frame as soon as the next one is read; a reordering codec in
+  Matroska has only the signed-16-bit block offset to bound it (32.8 s at the
+  default timestamp scale), so short clips of those still index in one pass. Off
+  by default, and WebCodecs-only — a `<video>` element plays past whatever has
+  been indexed, so the native path refuses a growing index. *Follow-ups left
+  open:* certified prefixes for fragmented MP4 (its `cslg` box gives a provable
+  bound where one is present) and for Ogg (per-page granule reconciliation, which
+  would also make the Ogg index self-validating); and reading
+  `max_num_reorder_frames` out of the SPS to give H.264/HEVC a real bound instead
+  of the 32768-tick worst case.
 - [x] **5** — Non-MP4/WebM containers are approximate only — *fixed (index or
   refuse).* There is no approximate mode at all anymore: every returned engine
   has a real per-frame timestamp table, and everything else throws a clear
