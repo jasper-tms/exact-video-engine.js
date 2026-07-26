@@ -301,15 +301,31 @@ ffmpeg -y -loglevel error -f lavfi \
     -i "color=c=black:s=48x32:d=0.3:r=10,format=pal8" \
     -c:v rawvideo -f avi clips/counter-rawvideo.avi
 
-# 5. MJPEG AVI — a second undecodable-by-WebCodecs case (most browsers ship no
-# MJPEG VideoDecoder). Also refused cleanly. Cheap to add, so it is.
+# 5. MJPEG AVI — the shape a webcam, a machine-vision camera or an older
+# camcorder writes, and for a long time the other honest-no case here. It is not
+# one any more: no browser has an MJPEG VideoDecoder, but every browser has a
+# JPEG decoder, and each of these frames is one whole JPEG image
+# (src/image-frame-decoder.js). So this is a full 150x90 counter clip like the
+# H.264 AVIs above rather than a token 48x32 — its pixels are walked now.
+#
+# -q:v 1 (best quality) so the bar's edges stay a hard black/white step through
+# the JPEG's DCT, which is what visibleFrame()'s "columns brighter than half"
+# reads. yuvj420p is the full-range flavour every JPEG decoder expects.
 ffmpeg -y -loglevel error -f lavfi \
-    -i "color=c=black:s=48x32:d=0.3:r=10,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
-    -c:v mjpeg -f avi clips/counter-mjpeg.avi
+    -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+    -c:v mjpeg -q:v 1 -pix_fmt yuvj420p -f avi clips/counter-mjpeg.avi
+
+# 6. The same MJPEG frames in a QuickTime/MP4 container, where the sample entry
+# is `jpeg` rather than the AVI FourCC `MJPG`. Indexed by mp4box like any other
+# ISOBMFF file and decoded down the same image-frame path, so this is what proves
+# the path is the container's business and not AVI's.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+    -c:v mjpeg -q:v 1 -pix_fmt yuvj420p clips/counter-mjpeg.mov
 
 echo "Wrote AVI fixtures:"
 ls clips/counter-idx1.avi clips/counter-opendml.avi clips/counter-avi-25fps.avi \
-    clips/counter-rawvideo.avi clips/counter-mjpeg.avi
+    clips/counter-rawvideo.avi clips/counter-mjpeg.avi clips/counter-mjpeg.mov
 
 # ==================================================================
 # Matroska codec fixtures (added when the Matroska scan gained a sample table,

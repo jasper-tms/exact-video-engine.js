@@ -84,8 +84,9 @@ show — rather than play a clip it would have to guess about:
 - **A container we cannot parse** (HLS/MPEG-TS or other segmented delivery, live
   streams, raw elementary streams, or anything else that is not MP4/MOV,
   WebM/MKV, Ogg, or AVI). No table can exist, so no engine is returned. (An AVI
-  whose *codec* WebCodecs cannot decode — uncompressed, MJPEG — is refused here
-  too: AVI has no native fallback, so an index it cannot decode from is useless.)
+  whose *codec* this browser cannot decode — uncompressed BI_RGB, MPEG-4 ASP — is
+  refused here too: AVI has no native fallback, so an index it cannot decode from
+  is useless.)
 - **An indexing pass that ran out of its budget** (`indexTimeoutMilliseconds` /
   `indexMaxBytes`, see the WebM and MKV section) before naming a single frame. A
   partial table is a wrong table — unless every frame in it was *certified* as
@@ -353,16 +354,52 @@ SPS). It still honors the same deadline, byte ceiling, progress reporting, and
 cache treatment as the full-file scans, and refuses rather than hangs on a
 malformed file — it simply spends far less of the budget in the normal case.
 
-Only H.264 is supported today. AVI stores it as an Annex B bitstream, but the
-engine does not feed WebCodecs that directly: WebKit's decoder answers
+H.264 and Motion JPEG are supported. AVI stores H.264 as an Annex B bitstream,
+but the engine does not feed WebCodecs that directly: WebKit's decoder answers
 `isConfigSupported()` = true for an Annex-B (no-`description`) config and then
 fails the actual decode — a dishonest yes. So the engine configures the decoder
 in length-prefixed **AVCC** mode instead (an `avcC` description built from the
 first keyframe's SPS/PPS) and converts each frame from Annex B to AVCC before
 decoding. AVCC is the form every engine — Chromium, Firefox, and WebKit/Safari —
 decodes, so this is the path that works everywhere without leaning on any native
-AVI support. Uncompressed (`rawvideo`) and MJPEG AVI are intentionally out of
-scope and refused cleanly; a raw-frame backend is a separate future task.
+AVI support. Motion JPEG takes the image-frame path below. Uncompressed
+(`rawvideo`/BI_RGB) is intentionally out of scope and refused cleanly.
+
+### Motion JPEG
+
+A Motion JPEG clip is a run of complete JPEG images, one per frame — what
+webcams, machine-vision and microscope cameras, and older camcorders write, and
+much of what sits in a `.avi` on a lab drive. No browser ships an MJPEG
+`VideoDecoder`, so every one of those clips used to be refused: correctly, since
+there was no decoder to configure.
+
+But every browser has had a JPEG decoder since long before any of this. The
+container index already gives each frame an exact byte range and an exact
+presentation time; the only missing piece was something to turn one frame's
+bytes into a `VideoFrame`, which `createImageBitmap` does everywhere. So
+`src/image-frame-decoder.js` is a `VideoDecoder` in shape — same constructor,
+same `configure`/`decode`/`flush`/`reset`/`close`, same `decodeQueueSize` and
+`output` callback — and the engine's decode driver uses it without knowing the
+difference. Which frames to decode, and when, is the same problem either way.
+
+Two things fall out of every frame being independent, and both are pure gain.
+`bitmapForFrame()` on frame 40000 costs one frame's work rather than a whole
+group of pictures, because there is no keyframe to walk forward from. And
+nothing reorders, so `playWhileIndexing` certifies immediately.
+
+It works in both containers that carry MJPEG: the `MJPG` FourCC in AVI, and the
+`jpeg` sample entry in QuickTime/MP4. (mp4box does not recognize `jpeg` as a
+visual sample entry and files such a track under *metadata*, so the engine
+recognizes that one case itself rather than accept "no video track in file" for
+a file that plainly has one.) QuickTime's Motion JPEG A and B (`mjpa`, `mjpb`)
+are deliberately **not** included: those wrap their fields in extra framing
+rather than storing one plain JPEG per sample, so a JPEG decoder handed one
+would fail or decode half a picture.
+
+`engine.codecString` reports `mjpeg` for these clips. WebCodecs registers no
+codec string for Motion JPEG — there is no `VideoDecoder` to name — so that is
+this library's own marker, and it means exactly "each frame is a whole JPEG
+image".
 
 ### The index cache
 

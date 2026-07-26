@@ -2,6 +2,7 @@ import { ContainerIndex } from './container-index.js';
 import { VideoEngine } from './video-engine.js';
 import { NativeVideoEngine } from './native-video-engine.js';
 import { detectBrowserEngine, webCodecsMayFailMidStream } from './decode-support.js';
+import { isImageFrameCodec, canDecodeImageFrames } from './image-frame-decoder.js';
 
 // ==================================================================
 // createBestEngine — walk the ladder and return a loaded engine.
@@ -84,7 +85,8 @@ export async function createBestEngine(source, options = {}) {
     // Publishing certified prefixes is only worth asking for when there is a
     // WebCodecs tier for them to land on.
     const wantCertifiedPrefixes = playWhileIndexing && prefer !== 'native'
-      && !!canvas && typeof VideoDecoder !== 'undefined';
+      && !!canvas
+      && (typeof VideoDecoder !== 'undefined' || canDecodeImageFrames());
     let earlyIndex = null;
     let onIndexExtended = null;
     const readyToPlay = new Promise((resolve) => {
@@ -157,9 +159,15 @@ export async function createBestEngine(source, options = {}) {
       + 'frame-exact.');
   }
 
+  // A Motion JPEG clip decodes through the browser's JPEG decoder rather than a
+  // VideoDecoder (see src/image-frame-decoder.js), so it is the wrong thing to
+  // feature-detect for one — and the right thing is available in browsers where
+  // WebCodecs decoding is not.
+  const decoderIsAvailable = isImageFrameCodec(codec)
+    ? canDecodeImageFrames() : typeof VideoDecoder !== 'undefined';
+
   if (prefer !== 'native' && !webCodecsUnreliable
-      && canvas && index && index.supportsWebCodecs
-      && typeof VideoDecoder !== 'undefined') {
+      && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
     const engine = new VideoEngine(canvas, { windowAhead });
     try {
       await engine.load(source, { index });

@@ -711,6 +711,149 @@ function hydrateContainerIndex(index, payload) {
 
   return true;
 }
+// A decoder for containers whose "video codec" is really a run of still images.
+//
+// Motion JPEG is a sequence of complete JPEG images, one per frame, and it is
+// what a great deal of real footage actually is: webcams, machine-vision and
+// microscope cameras, older camcorders, and much of what sits in a `.avi` on a
+// lab drive. No browser ships an MJPEG `VideoDecoder` — so until now this engine
+// refused every one of those clips, having correctly decided it could not
+// configure a decoder for them.
+//
+// But every browser has had a JPEG decoder since before any of this existed. The
+// container index already gives each frame an exact byte range and an exact
+// presentation time; all that is missing is something to turn one frame's bytes
+// into a `VideoFrame`, which `createImageBitmap` does everywhere.
+//
+// So this class is a `VideoDecoder` in shape — same constructor, same
+// `configure` / `decode` / `flush` / `reset` / `close`, same `decodeQueueSize`
+// and `output` callback — and the engine's decode driver uses it without knowing
+// the difference. That is deliberate: the driver's hard parts (keyframe runs,
+// read-ahead windows, the byte-budgeted frame cache) are about WHICH frames to
+// decode, not about how, and none of it needed to change.
+//
+// Two things fall out of every frame being independent, and both are pure gain:
+// there is no keyframe to walk forward from, so `bitmapForFrame()` on frame
+// 40000 costs exactly one frame's work rather than a GOP's; and there is no
+// reordering, so a progressively built index certifies immediately.
+//
+// `createImageBitmap` rather than `ImageDecoder`: ImageDecoder would save a copy
+// and is the better fit on paper, but it is not in Safari, and a second code
+// path that only some browsers take is a second code path to be wrong in. A JPEG
+// frame is small and this is one decode per displayed frame either way.
+
+// The codec string this engine uses for Motion JPEG. WebCodecs registers no
+// string for it — there is no `VideoDecoder` to name — so this is our own
+// marker, carried on decoderConfig.codec and exposed as engine.codecString the
+// same as any other. Anything reading that field should treat it as "frames are
+// whole JPEG images" and nothing more.
+const MOTION_JPEG_CODEC = 'mjpeg';
+
+// Does this codec string mean "each sample is a complete still image", and so
+// belong to ImageFrameDecoder rather than to a VideoDecoder?
+function isImageFrameCodec(codec) {
+  return codec === MOTION_JPEG_CODEC;
+}
+
+// Can this browser decode image frames at all? The `VideoDecoder` a caller would
+// otherwise have feature-detected is not involved, so it is the wrong question
+// to ask: what this path needs is a JPEG decoder and the `VideoFrame`
+// constructor. Both are present wherever WebCodecs is, and `VideoFrame` can be
+// present where `VideoDecoder` is not much use.
+function canDecodeImageFrames() {
+  return typeof createImageBitmap === 'function' && typeof VideoFrame !== 'undefined';
+}
+
+class ImageFrameDecoder {
+  constructor({ output, error }) {
+    this._output = output;
+    this._onError = error;
+    this.state = 'unconfigured';   // 'unconfigured' | 'configured' | 'closed'
+    // How many frames have been handed over and not yet emitted. The decode
+    // driver throttles on this exactly as it does for a VideoDecoder.
+    this.decodeQueueSize = 0;
+    // Decoding is serialized through this chain rather than run concurrently, so
+    // frames come out in the order they went in. A VideoDecoder's output order is
+    // part of its contract and the driver's bookkeeping leans on it; N concurrent
+    // createImageBitmap calls would not keep that promise.
+    this._chain = Promise.resolve();
+    // Bumped by reset() and close(), so work already queued against a previous
+    // configuration is dropped rather than emitted into the new one.
+    this._generation = 0;
+  }
+
+  // Nothing to set up: a JPEG frame carries its own dimensions and colour
+  // information. The configuration is accepted so callers need no special case,
+  // and its codec is checked so a wrong one fails here rather than silently
+  // decoding something else.
+  configure(config) {
+    if (this.state === 'closed') throw new Error('ImageFrameDecoder is closed');
+    if (!config || !isImageFrameCodec(config.codec)) {
+      throw new TypeError(
+        `ImageFrameDecoder cannot decode '${config && config.codec}'`);
+    }
+    this.state = 'configured';
+  }
+
+  decode(chunk) {
+    if (this.state !== 'configured') {
+      throw new Error('ImageFrameDecoder is not configured');
+    }
+    // Copy the bytes out now: the caller is free to reuse or detach the chunk the
+    // moment decode() returns, and this frame may not be touched for a while.
+    const bytes = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(bytes);
+    const { timestamp, duration } = chunk;
+    const generation = this._generation;
+
+    this.decodeQueueSize += 1;
+    this._chain = this._chain
+      .then(() => this._decodeOne(bytes, timestamp, duration, generation))
+      .then(() => { this.decodeQueueSize -= 1; },
+        () => { this.decodeQueueSize -= 1; });
+  }
+
+  async _decodeOne(bytes, timestamp, duration, generation) {
+    if (generation !== this._generation || this.state !== 'configured') return;
+    let bitmap = null;
+    try {
+      bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+      // The engine may have reset or closed us while that was in flight.
+      if (generation !== this._generation || this.state !== 'configured') return;
+      // VideoFrame copies the image, so the bitmap can go straight after.
+      this._output(new VideoFrame(bitmap, { timestamp, duration }));
+    } catch (error) {
+      // A frame that will not decode is fatal in the same way a VideoDecoder
+      // error is: the engine marks itself failed and tells the host, rather than
+      // showing the wrong picture or hanging on a frame that is never coming.
+      this.state = 'closed';
+      this._onError(error);
+    } finally {
+      if (bitmap) bitmap.close();
+    }
+  }
+
+  // Every frame handed over so far has been emitted once this resolves.
+  async flush() {
+    await this._chain;
+  }
+
+  // Drop everything queued. There is no decoder state to rebuild — the next
+  // decode() stands alone, which is the whole point of this format.
+  reset() {
+    this._generation += 1;
+    this._chain = Promise.resolve();
+    this.decodeQueueSize = 0;
+    this.state = 'unconfigured';
+  }
+
+  close() {
+    this._generation += 1;
+    this._chain = Promise.resolve();
+    this.decodeQueueSize = 0;
+    this.state = 'closed';
+  }
+}
 // How far a codec is allowed to reorder frames, read out of the bitstream's own
 // sequence parameter set.
 //
@@ -2762,9 +2905,9 @@ function streamTag(streamIndex) {
 //     samplesAreAnnexB } — samplesAreAnnexB is true for H.264, whose frame bytes
 //     are an Annex B bitstream the decode path must convert to AVCC (the
 //     decoderConfig carries a matching `avcC` description; see buildDecoderConfig).
-// decoderConfig is null when the FourCC is not a codec we can form a valid
-// WebCodecs configuration for (uncompressed, MJPEG, …) — the caller then refuses
-// the clip cleanly rather than fabricating a config. Throws
+// decoderConfig is null when the FourCC is not a codec we can decode
+// (uncompressed, MPEG-4 ASP, …) — the caller then refuses the clip cleanly
+// rather than fabricating a config. Throws
 // IndexBudgetExceededError when it runs out of budget, and a plain Error when the
 // file is not an AVI we can read.
 async function readAviFrameTable(reader, options = {}) {
@@ -2927,9 +3070,9 @@ async function readAviFrameTable(reader, options = {}) {
     fourCc: header.stream.fourCc,
     frames,
     decoderConfig,
-    // H.264 (the only supported codec) is stored Annex B and configured in AVCC
-    // mode, so its frame bytes need converting before decode. If a
-    // length-prefixed codec is ever added, it sets this false.
+    // H.264 is stored Annex B and configured in AVCC mode, so its frame bytes
+    // need converting before decode. Motion JPEG's do not: each sample is a
+    // whole JPEG image, handed to the image decoder exactly as it sits.
     samplesAreAnnexB: !!decoderConfig && isH264FourCc(header.stream.fourCc),
   };
 }
@@ -3209,6 +3352,16 @@ function isH264FourCc(fourCc) {
   return normalized === 'H264' || normalized === 'AVC1' || normalized === 'X264';
 }
 
+// Motion JPEG, likewise written under several FourCCs. Deliberately NOT included
+// are 'MJPA' and 'MJPB' (QuickTime's Motion JPEG A and B): those wrap their
+// fields in extra framing rather than storing a plain JPEG per frame, so
+// handing one to a JPEG decoder would fail or, worse, decode half a picture.
+function isMotionJpegFourCc(fourCc) {
+  const normalized = fourCc.toUpperCase();
+  return normalized === 'MJPG' || normalized === 'JPEG' || normalized === 'AVRN'
+    || normalized === 'DMB1';
+}
+
 // Turn the biCompression FourCC into a WebCodecs decoder configuration, or null
 // when we cannot form a valid one (which the caller treats as "refuse this clip
 // cleanly" — never fabricate a config that VideoDecoder.configure would reject or,
@@ -3224,10 +3377,25 @@ function isH264FourCc(fourCc) {
 // SPS and PPS, and the caller converts each frame's Annex B to AVCC before feeding
 // it (convertAnnexBToAvcc). The avc1.PPCCLL codec string comes from the SPS.
 //
-// Uncompressed video (biCompression 0 / 'DIB ' / 'RAW '), MJPEG, and everything
-// else return null: a raw-frame backend is a separate future task, and WebCodecs
-// has no MJPEG decoder on most browsers.
+// Motion JPEG is the second supported codec, and it needs nothing read out of a
+// frame at all: every sample is a complete JPEG image carrying its own
+// dimensions and colour information, so the configuration is the codec marker
+// and the picture size from the stream header. No browser has an MJPEG
+// VideoDecoder, which is why this used to be refused — but every browser has a
+// JPEG decoder, and src/image-frame-decoder.js is the adapter that reaches it.
+//
+// Uncompressed video (biCompression 0 / 'DIB ' / 'RAW ') and everything else
+// still return null: a raw-frame path needs the whole BI_RGB pixel-format
+// matrix (bit depth, palette, bottom-up row order) and is a separate task.
 function buildDecoderConfig(fourCc, width, height, firstKeyframeBytes) {
+  if (isMotionJpegFourCc(fourCc)) {
+    return {
+      codec: MOTION_JPEG_CODEC,
+      codedWidth: width,
+      codedHeight: height,
+      optimizeForLatency: true,
+    };
+  }
   if (isH264FourCc(fourCc)) {
     if (!firstKeyframeBytes) return null;
     const parameterSets = parseAvcParameterSets(firstKeyframeBytes);
@@ -3413,6 +3581,43 @@ class CertifiedPrefixViolationError extends Error {
 // what it says. `avc3` and `hev1` keep their parameter sets in the frames rather
 // than in the `stsd`, so their description is empty or absent and the answer is
 // honestly "unknown" — the same as for a codec that declares nothing at all.
+// A QuickTime/MP4 track whose samples are whole JPEG images. The sample entry
+// is plain `jpeg`; Motion JPEG A and B (`mjpa`, `mjpb`) are deliberately absent,
+// since those wrap their fields in extra framing rather than storing one JPEG
+// per sample, and a JPEG decoder handed one would fail or decode half a picture.
+// mp4box sorts a track into video, audio or metadata by recognizing its sample
+// entry, and `jpeg` is not one it knows — so a Motion JPEG QuickTime file
+// arrives with an empty videoTracks list and its video track filed under
+// metadata. Nothing is missing from the file or from what mp4box parsed of it;
+// only the classification is wrong. So rather than teach mp4box a sample entry,
+// recognize this one case and supply the `video` shape a video track would have
+// carried. Returns null for any file where that is not what is going on, which
+// leaves the caller's "no video track" refusal exactly as it was.
+function motionJpegTrack(file, info) {
+  for (const track of (info.tracks || [])) {
+    const trak = file.getTrackById(track.id);
+    const entry = trak && trak.mdia && trak.mdia.minf.stbl.stsd.entries[0];
+    if (!entry || !isobmffMotionJpegSampleEntry(entry.type)) continue;
+    // The handler is the file's own statement that this track is visual, and it
+    // is right even where mp4box's classification is not.
+    if (trak.mdia.hdlr && trak.mdia.hdlr.handler !== 'vide') continue;
+    const width = entry.width || track.track_width;
+    const height = entry.height || track.track_height;
+    if (!width || !height) continue;
+    return {
+      ...track,
+      codec: entry.type,
+      video: { width, height },
+      matrix: track.matrix || (trak.tkhd && trak.tkhd.matrix),
+    };
+  }
+  return null;
+}
+
+function isobmffMotionJpegSampleEntry(codec) {
+  return codec === 'jpeg';
+}
+
 function isobmffReorderDepth(codec, description) {
   if (/^avc[13]/.test(codec)) return declaredFrameReorderDepth('avcC', description);
   if (/^(hvc1|hev1)/.test(codec)) return declaredFrameReorderDepth('hvcC', description);
@@ -3731,7 +3936,8 @@ class ContainerIndex extends EventTarget {
     if (demuxError) throw demuxError;
     if (!info) { file.flush(); throw new Error('no moov found (not a valid MP4?)'); }
 
-    const videoTrack = info.videoTracks && info.videoTracks[0];
+    const videoTrack = (info.videoTracks && info.videoTracks[0])
+      || motionJpegTrack(file, info);
     if (!videoTrack) { file.flush(); throw new Error('no video track in file'); }
 
     // Is this a fragmented MP4 (fMP4/CMAF)? Its samples live in `moof` boxes
@@ -3750,7 +3956,8 @@ class ContainerIndex extends EventTarget {
     // what lets that pass publish frames while it is still running: an index
     // cannot hand out a frame before it knows its own geometry.
     this.decoderConfig = {
-      codec: videoTrack.codec,
+      codec: isobmffMotionJpegSampleEntry(videoTrack.codec)
+        ? MOTION_JPEG_CODEC : videoTrack.codec,
       codedWidth: videoTrack.video.width,
       codedHeight: videoTrack.video.height,
       description: this._codecDescription(file, videoTrack.id),
@@ -4154,9 +4361,10 @@ class ContainerIndex extends EventTarget {
 
     if (!table.decoderConfig) {
       throw new Error(
-        `this AVI's video codec (${JSON.stringify(table.fourCc)}) is not one WebCodecs `
-        + 'can decode, and AVI has no native <video> fallback, so the clip is refused. '
-        + '(Uncompressed and MJPEG AVI are intentionally out of scope.)');
+        `this AVI's video codec (${JSON.stringify(table.fourCc)}) is not one this `
+        + 'browser can decode, and AVI has no native <video> fallback, so the clip '
+        + 'is refused. (H.264 and Motion JPEG are the AVI codecs supported; '
+        + 'uncompressed BI_RGB is intentionally out of scope.)');
     }
 
     // Synthesize the decode-order sample records _buildTables consumes. The frame
@@ -4649,9 +4857,19 @@ class VideoEngine extends EventTarget {
       }
       this._adoptIndex(index);
 
-      const support = await VideoDecoder.isConfigSupported(this._decoderConfig);
-      if (!support.supported) {
-        throw new Error('codec not supported: ' + this._decoderConfig.codec);
+      // A Motion JPEG clip has no VideoDecoder to ask — its frames are whole
+      // still images and ImageFrameDecoder reaches the browser's JPEG decoder
+      // instead — so the question to ask is whether THAT is available.
+      if (isImageFrameCodec(this._decoderConfig.codec)) {
+        if (!canDecodeImageFrames()) {
+          throw new Error('this browser cannot decode image frames: '
+            + this._decoderConfig.codec);
+        }
+      } else {
+        const support = await VideoDecoder.isConfigSupported(this._decoderConfig);
+        if (!support.supported) {
+          throw new Error('codec not supported: ' + this._decoderConfig.codec);
+        }
       }
 
       this._configureDecoder();
@@ -4793,8 +5011,14 @@ class VideoEngine extends EventTarget {
   }
 
   // ---- decode (streaming, frame-windowed) ---------------------------------
+  // Both decoders are driven identically from here on: same constructor, same
+  // configure/decode/flush/reset/close, same decodeQueueSize and output
+  // callback. Which frames to decode, and when, is the same problem whether a
+  // frame arrives from a VideoDecoder or from the browser's JPEG decoder.
   _configureDecoder() {
-    this._videoDecoder = new VideoDecoder({
+    const Decoder = isImageFrameCodec(this._decoderConfig.codec)
+      ? ImageFrameDecoder : VideoDecoder;
+    this._videoDecoder = new Decoder({
       output: (frame) => this._absorb(frame),
       error: (e) => this._decoderFailed(e),
     });
@@ -5988,7 +6212,8 @@ async function createBestEngine(source, options = {}) {
     // Publishing certified prefixes is only worth asking for when there is a
     // WebCodecs tier for them to land on.
     const wantCertifiedPrefixes = playWhileIndexing && prefer !== 'native'
-      && !!canvas && typeof VideoDecoder !== 'undefined';
+      && !!canvas
+      && (typeof VideoDecoder !== 'undefined' || canDecodeImageFrames());
     let earlyIndex = null;
     let onIndexExtended = null;
     const readyToPlay = new Promise((resolve) => {
@@ -6061,9 +6286,15 @@ async function createBestEngine(source, options = {}) {
       + 'frame-exact.');
   }
 
+  // A Motion JPEG clip decodes through the browser's JPEG decoder rather than a
+  // VideoDecoder (see src/image-frame-decoder.js), so it is the wrong thing to
+  // feature-detect for one — and the right thing is available in browsers where
+  // WebCodecs decoding is not.
+  const decoderIsAvailable = isImageFrameCodec(codec)
+    ? canDecodeImageFrames() : typeof VideoDecoder !== 'undefined';
+
   if (prefer !== 'native' && !webCodecsUnreliable
-      && canvas && index && index.supportsWebCodecs
-      && typeof VideoDecoder !== 'undefined') {
+      && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
     const engine = new VideoEngine(canvas, { windowAhead });
     try {
       await engine.load(source, { index });

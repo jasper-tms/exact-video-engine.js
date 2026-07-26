@@ -7,7 +7,7 @@
 //   counter-avi-25fps.avi 25 H.264 frames, 25 fps, 170x94, idx1 (a second rate
 //                         and non-multiple-of-16 dimensions)
 //   counter-rawvideo.avi  uncompressed — must be refused (no decoderConfig)
-//   counter-mjpeg.avi     MJPEG — must be refused (no decoderConfig)
+//   counter-mjpeg.avi     MJPEG — must PLAY (every frame is a whole JPEG image)
 //
 // This is the KEY difference from the Ogg/Matroska table tests: those assert an
 // index that CANNOT feed WebCodecs (supportsWebCodecs === false, no sample table,
@@ -221,10 +221,12 @@ for (const [label, path] of [['idx1', IDX1], ['opendml', OPENDML]]) {
 }
 
 // --- undecodable codecs are refused cleanly, in bounded time -----------------
-// rawvideo (uncompressed) and MJPEG have no WebCodecs decoder here, and AVI has no
-// native fallback, so both must be refused: the parse declines to produce a
-// decoderConfig, and ContainerIndex.load surfaces a clear error rather than a
-// crash or a hang. A watchdog proves "bounded time".
+// Uncompressed AVI has no decoder here — WebCodecs has none, the browser's image
+// decoders do not take BI_RGB, and AVI has no native fallback — so it must be
+// refused: the parse declines to produce a decoderConfig, and ContainerIndex.load
+// surfaces a clear error rather than a crash or a hang. A watchdog proves
+// "bounded time". (MJPEG used to be in this list and is not any more: see the
+// image-frame section below.)
 async function withinTime(promise, milliseconds) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -239,7 +241,6 @@ async function withinTime(promise, milliseconds) {
 
 for (const [label, path, present] of [
   ['rawvideo', RAWVIDEO, existsSync(RAWVIDEO)],
-  ['mjpeg', MJPEG, existsSync(MJPEG)],
 ]) {
   if (!present) { console.log(`SKIP avi-table ${label}: fixture absent`); continue; }
 
@@ -258,6 +259,56 @@ for (const [label, path, present] of [
     loaded instanceof Error && !(loaded.message === 'did not settle in time')
     && /AVI|codec|decode/i.test(loaded.message),
     loaded ? `${loaded.name}: ${loaded.message}` : 'resolved without refusing');
+}
+
+// --- Motion JPEG is configured for the image-frame path ----------------------
+// The parse must produce a decoderConfig — without one the caller refuses the
+// clip, since AVI has no native tier — and that config must name the image-frame
+// codec rather than anything a VideoDecoder would be handed. The frames
+// themselves must each be a complete JPEG image (SOI ... EOI), which is the
+// whole premise of decoding them with createImageBitmap: if the byte ranges the
+// index reports were off by even the 8-byte chunk header, this would fail.
+if (!existsSync(MJPEG)) {
+  console.log('SKIP avi-table mjpeg: fixture absent');
+} else {
+  const bytes = new Uint8Array(await readFile(MJPEG));
+  const table = await readAviFrameTable(await readerFor(MJPEG));
+  check('mjpeg parse produces a decoderConfig',
+    !!table.decoderConfig,
+    table.decoderConfig ? 'present' : 'none, so the clip would be refused');
+  check('mjpeg config names the image-frame codec',
+    table.decoderConfig && table.decoderConfig.codec === 'mjpeg',
+    table.decoderConfig && table.decoderConfig.codec);
+  check('mjpeg config carries the picture size',
+    table.decoderConfig && table.decoderConfig.codedWidth === 150
+      && table.decoderConfig.codedHeight === 90,
+    table.decoderConfig
+      && `${table.decoderConfig.codedWidth}x${table.decoderConfig.codedHeight}`);
+  // Nothing to convert: a JPEG frame goes to the decoder exactly as it sits.
+  check('mjpeg samples are not Annex B', table.samplesAreAnnexB === false,
+    `${table.samplesAreAnnexB}`);
+  check('mjpeg frame count', table.frames.length === 30, `${table.frames.length}`);
+
+  let wholeImages = 0;
+  for (const frame of table.frames) {
+    const jpeg = bytes.subarray(frame.offset, frame.offset + frame.size);
+    if (jpeg[0] === 0xFF && jpeg[1] === 0xD8
+        && jpeg[jpeg.length - 2] === 0xFF && jpeg[jpeg.length - 1] === 0xD9) wholeImages++;
+  }
+  check('every mjpeg sample is a complete JPEG image (SOI ... EOI)',
+    wholeImages === table.frames.length,
+    `${wholeImages} of ${table.frames.length}`);
+
+  // Every frame independent means every frame a keyframe, which is what lets a
+  // named frame's pixels be fetched without walking a group of pictures.
+  check('every mjpeg sample is a keyframe',
+    table.frames.every((f) => f.isSync),
+    `${table.frames.filter((f) => f.isSync).length} of ${table.frames.length}`);
+
+  const index = await ContainerIndex.load(await readerFor(MJPEG));
+  check('mjpeg index reaches the WebCodecs tier', index.supportsWebCodecs === true,
+    `${index.supportsWebCodecs}`);
+  check('mjpeg index names every frame', index.numFrames === 30, `${index.numFrames}`);
 }
 
 process.exit(failures ? 1 : 0);

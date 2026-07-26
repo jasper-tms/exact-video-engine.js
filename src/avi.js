@@ -43,6 +43,7 @@
 // ==================================================================
 
 import { IndexBudgetExceededError } from './matroska.js';
+import { MOTION_JPEG_CODEC } from './image-frame-decoder.js';
 
 // AVIIF_KEYFRAME: the flag in an idx1 entry's dwFlags marking a keyframe. The
 // OpenDML index instead encodes "not a keyframe" in the high bit of its size
@@ -96,9 +97,9 @@ function streamTag(streamIndex) {
 //     samplesAreAnnexB } — samplesAreAnnexB is true for H.264, whose frame bytes
 //     are an Annex B bitstream the decode path must convert to AVCC (the
 //     decoderConfig carries a matching `avcC` description; see buildDecoderConfig).
-// decoderConfig is null when the FourCC is not a codec we can form a valid
-// WebCodecs configuration for (uncompressed, MJPEG, …) — the caller then refuses
-// the clip cleanly rather than fabricating a config. Throws
+// decoderConfig is null when the FourCC is not a codec we can decode
+// (uncompressed, MPEG-4 ASP, …) — the caller then refuses the clip cleanly
+// rather than fabricating a config. Throws
 // IndexBudgetExceededError when it runs out of budget, and a plain Error when the
 // file is not an AVI we can read.
 export async function readAviFrameTable(reader, options = {}) {
@@ -261,9 +262,9 @@ export async function readAviFrameTable(reader, options = {}) {
     fourCc: header.stream.fourCc,
     frames,
     decoderConfig,
-    // H.264 (the only supported codec) is stored Annex B and configured in AVCC
-    // mode, so its frame bytes need converting before decode. If a
-    // length-prefixed codec is ever added, it sets this false.
+    // H.264 is stored Annex B and configured in AVCC mode, so its frame bytes
+    // need converting before decode. Motion JPEG's do not: each sample is a
+    // whole JPEG image, handed to the image decoder exactly as it sits.
     samplesAreAnnexB: !!decoderConfig && isH264FourCc(header.stream.fourCc),
   };
 }
@@ -543,6 +544,16 @@ function isH264FourCc(fourCc) {
   return normalized === 'H264' || normalized === 'AVC1' || normalized === 'X264';
 }
 
+// Motion JPEG, likewise written under several FourCCs. Deliberately NOT included
+// are 'MJPA' and 'MJPB' (QuickTime's Motion JPEG A and B): those wrap their
+// fields in extra framing rather than storing a plain JPEG per frame, so
+// handing one to a JPEG decoder would fail or, worse, decode half a picture.
+function isMotionJpegFourCc(fourCc) {
+  const normalized = fourCc.toUpperCase();
+  return normalized === 'MJPG' || normalized === 'JPEG' || normalized === 'AVRN'
+    || normalized === 'DMB1';
+}
+
 // Turn the biCompression FourCC into a WebCodecs decoder configuration, or null
 // when we cannot form a valid one (which the caller treats as "refuse this clip
 // cleanly" — never fabricate a config that VideoDecoder.configure would reject or,
@@ -558,10 +569,25 @@ function isH264FourCc(fourCc) {
 // SPS and PPS, and the caller converts each frame's Annex B to AVCC before feeding
 // it (convertAnnexBToAvcc). The avc1.PPCCLL codec string comes from the SPS.
 //
-// Uncompressed video (biCompression 0 / 'DIB ' / 'RAW '), MJPEG, and everything
-// else return null: a raw-frame backend is a separate future task, and WebCodecs
-// has no MJPEG decoder on most browsers.
+// Motion JPEG is the second supported codec, and it needs nothing read out of a
+// frame at all: every sample is a complete JPEG image carrying its own
+// dimensions and colour information, so the configuration is the codec marker
+// and the picture size from the stream header. No browser has an MJPEG
+// VideoDecoder, which is why this used to be refused — but every browser has a
+// JPEG decoder, and src/image-frame-decoder.js is the adapter that reaches it.
+//
+// Uncompressed video (biCompression 0 / 'DIB ' / 'RAW ') and everything else
+// still return null: a raw-frame path needs the whole BI_RGB pixel-format
+// matrix (bit depth, palette, bottom-up row order) and is a separate task.
 function buildDecoderConfig(fourCc, width, height, firstKeyframeBytes) {
+  if (isMotionJpegFourCc(fourCc)) {
+    return {
+      codec: MOTION_JPEG_CODEC,
+      codedWidth: width,
+      codedHeight: height,
+      optimizeForLatency: true,
+    };
+  }
   if (isH264FourCc(fourCc)) {
     if (!firstKeyframeBytes) return null;
     const parameterSets = parseAvcParameterSets(firstKeyframeBytes);

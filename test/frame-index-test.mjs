@@ -212,6 +212,24 @@ const CASES = [
   { file: 'counter-opendml.avi', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
     tier: 'webcodecs' },
 
+  // Motion JPEG, whose frames are whole JPEG images rather than a coded video
+  // stream. No browser has an MJPEG VideoDecoder, so these do not decode through
+  // one: src/image-frame-decoder.js hands each frame's bytes to the browser's own
+  // JPEG decoder and wraps the result in a VideoFrame, behind an interface the
+  // decode driver cannot tell from a VideoDecoder's. They report the `webcodecs`
+  // tier because that is the engine playing them — the tier is which ENGINE owns
+  // the clock and the canvas, not which decoder it fed.
+  //
+  // Two containers, because the path belongs to neither: in AVI the codec is the
+  // FourCC `MJPG` read by the engine's own RIFF parser, and in QuickTime it is
+  // the `jpeg` sample entry read by mp4box. Exact frames on both prove the byte
+  // ranges are right to the byte — a JPEG decoder is unforgiving about being
+  // handed a frame that starts eight bytes early.
+  { file: 'counter-mjpeg.avi', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  { file: 'counter-mjpeg.mov', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+
   // A WebM whose FIRST track entry is audio and whose second is the video (the
   // 30 counter frames). The Matroska cluster scan must skip the audio track and
   // index only the video blocks; an off-by-one that indexed the first track would

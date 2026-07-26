@@ -5,6 +5,7 @@ import { readOggFrameTable } from './ogg.js';
 import { readAviFrameTable } from './avi.js';
 import { declaredFrameReorderDepth } from './frame-reorder-bound.js';
 import { longestCertifiedRun, DeclaredReorderWatermark } from './certified-prefix.js';
+import { MOTION_JPEG_CODEC } from './image-frame-decoder.js';
 
 // A build faster than this is not worth caching: a classic single-moov MP4
 // indexes in a few range reads and would only churn the cache, while a
@@ -79,6 +80,43 @@ export class CertifiedPrefixViolationError extends Error {
 // what it says. `avc3` and `hev1` keep their parameter sets in the frames rather
 // than in the `stsd`, so their description is empty or absent and the answer is
 // honestly "unknown" — the same as for a codec that declares nothing at all.
+// A QuickTime/MP4 track whose samples are whole JPEG images. The sample entry
+// is plain `jpeg`; Motion JPEG A and B (`mjpa`, `mjpb`) are deliberately absent,
+// since those wrap their fields in extra framing rather than storing one JPEG
+// per sample, and a JPEG decoder handed one would fail or decode half a picture.
+// mp4box sorts a track into video, audio or metadata by recognizing its sample
+// entry, and `jpeg` is not one it knows — so a Motion JPEG QuickTime file
+// arrives with an empty videoTracks list and its video track filed under
+// metadata. Nothing is missing from the file or from what mp4box parsed of it;
+// only the classification is wrong. So rather than teach mp4box a sample entry,
+// recognize this one case and supply the `video` shape a video track would have
+// carried. Returns null for any file where that is not what is going on, which
+// leaves the caller's "no video track" refusal exactly as it was.
+function motionJpegTrack(file, info) {
+  for (const track of (info.tracks || [])) {
+    const trak = file.getTrackById(track.id);
+    const entry = trak && trak.mdia && trak.mdia.minf.stbl.stsd.entries[0];
+    if (!entry || !isobmffMotionJpegSampleEntry(entry.type)) continue;
+    // The handler is the file's own statement that this track is visual, and it
+    // is right even where mp4box's classification is not.
+    if (trak.mdia.hdlr && trak.mdia.hdlr.handler !== 'vide') continue;
+    const width = entry.width || track.track_width;
+    const height = entry.height || track.track_height;
+    if (!width || !height) continue;
+    return {
+      ...track,
+      codec: entry.type,
+      video: { width, height },
+      matrix: track.matrix || (trak.tkhd && trak.tkhd.matrix),
+    };
+  }
+  return null;
+}
+
+function isobmffMotionJpegSampleEntry(codec) {
+  return codec === 'jpeg';
+}
+
 function isobmffReorderDepth(codec, description) {
   if (/^avc[13]/.test(codec)) return declaredFrameReorderDepth('avcC', description);
   if (/^(hvc1|hev1)/.test(codec)) return declaredFrameReorderDepth('hvcC', description);
@@ -397,7 +435,8 @@ export class ContainerIndex extends EventTarget {
     if (demuxError) throw demuxError;
     if (!info) { file.flush(); throw new Error('no moov found (not a valid MP4?)'); }
 
-    const videoTrack = info.videoTracks && info.videoTracks[0];
+    const videoTrack = (info.videoTracks && info.videoTracks[0])
+      || motionJpegTrack(file, info);
     if (!videoTrack) { file.flush(); throw new Error('no video track in file'); }
 
     // Is this a fragmented MP4 (fMP4/CMAF)? Its samples live in `moof` boxes
@@ -416,7 +455,8 @@ export class ContainerIndex extends EventTarget {
     // what lets that pass publish frames while it is still running: an index
     // cannot hand out a frame before it knows its own geometry.
     this.decoderConfig = {
-      codec: videoTrack.codec,
+      codec: isobmffMotionJpegSampleEntry(videoTrack.codec)
+        ? MOTION_JPEG_CODEC : videoTrack.codec,
       codedWidth: videoTrack.video.width,
       codedHeight: videoTrack.video.height,
       description: this._codecDescription(file, videoTrack.id),
@@ -820,9 +860,10 @@ export class ContainerIndex extends EventTarget {
 
     if (!table.decoderConfig) {
       throw new Error(
-        `this AVI's video codec (${JSON.stringify(table.fourCc)}) is not one WebCodecs `
-        + 'can decode, and AVI has no native <video> fallback, so the clip is refused. '
-        + '(Uncompressed and MJPEG AVI are intentionally out of scope.)');
+        `this AVI's video codec (${JSON.stringify(table.fourCc)}) is not one this `
+        + 'browser can decode, and AVI has no native <video> fallback, so the clip '
+        + 'is refused. (H.264 and Motion JPEG are the AVI codecs supported; '
+        + 'uncompressed BI_RGB is intentionally out of scope.)');
     }
 
     // Synthesize the decode-order sample records _buildTables consumes. The frame

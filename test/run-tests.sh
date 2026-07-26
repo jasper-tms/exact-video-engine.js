@@ -17,6 +17,8 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-vp8.webm ] \
         || [ ! -f test/clips/counter-av1.webm ] \
         || [ ! -f test/clips/counter-hevc.mkv ] \
+        || [ ! -f test/clips/counter-mjpeg.avi ] \
+        || [ ! -f test/clips/counter-mjpeg.mov ] \
         || [ ! -f test/clips/corrupt-pure-garbage.bin ]; then
     bash test/make-test-clips.sh
 fi

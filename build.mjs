@@ -34,6 +34,7 @@ const MODULE_ORDER = [
   'src/range-readers.js',
   'src/read-priority-gate.js',
   'src/index-cache.js',
+  'src/image-frame-decoder.js',
   'src/frame-reorder-bound.js',
   'src/certified-prefix.js',
   'src/matroska.js',
