@@ -1,6 +1,6 @@
 {
   "name": "exact-video-engine.js",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Frame-perfect video playback for the browser, on WebCodecs where it is available and a <video> element where it is not, without giving up exact frame indices in the fallback.",
   "keywords": [
     "video",

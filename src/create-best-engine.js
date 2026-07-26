@@ -31,6 +31,10 @@ export async function createBestEngine(source, options = {}) {
     // Passed through to VideoEngine; ignored by the <video> element, which does
     // its own buffering. See the VideoEngine constructor.
     windowAhead,
+    // Passed through to VideoEngine; the <video> element has no comparable
+    // control (the browser resamples its own decoded frames, not us), so this
+    // is a no-op on that tier. See the VideoEngine constructor.
+    imageSmoothingEnabled,
     // How long the WebM index is allowed to take. Building it means reading the
     // whole file (Matroska keeps no central sample table), which is quick from
     // disk and as slow as the network from a URL — so it gets a deadline. A clip
@@ -168,7 +172,7 @@ export async function createBestEngine(source, options = {}) {
 
   if (prefer !== 'native' && !webCodecsUnreliable
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
-    const engine = new VideoEngine(canvas, { windowAhead });
+    const engine = new VideoEngine(canvas, { windowAhead, imageSmoothingEnabled });
     try {
       await engine.load(source, { index });
       return engine;

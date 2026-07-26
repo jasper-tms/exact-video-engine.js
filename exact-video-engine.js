@@ -4675,6 +4675,15 @@ class VideoEngine extends EventTarget {
   // options.cacheBytes: the memory ceiling for decoded frames (default 96 MB).
   // This, not windowAhead, is what bounds the engine's memory — the window is
   // cut to fit it, so a 4K clip caches few frames and a 360p clip caches many.
+  //
+  // options.imageSmoothingEnabled: true by default, matching every prior
+  // release — the presentation canvas is sized to the pane in device pixels
+  // (_syncCanvasSize), which on a HiDPI screen is routinely larger than the
+  // decoded frame, so the browser's default bilinear resampling makes ordinary
+  // upscaled playback look smooth rather than blocky. A host reading or
+  // displaying exact pixel values (an annotation tool matching source pixels
+  // 1:1, say) wants the opposite: pass false to keep every presented frame an
+  // exact, uninterpolated blow-up of the decoded one.
   constructor(presentationCanvas, options = {}) {
     super();
     this.canvas = presentationCanvas;
@@ -4743,6 +4752,7 @@ class VideoEngine extends EventTarget {
     // iOS Safari's few-hundred-MB ceiling for image memory, which the
     // presentation canvas and the decoder's own frame pool also draw against.
     this._cacheBytes = Math.max(8 << 20, options.cacheBytes ?? (96 << 20));
+    this._imageSmoothingEnabled = options.imageSmoothingEnabled ?? true;
     // Filled in by _sizeWindows() from _cacheBytes and the clip's frame size.
     this._windowBack = this._wantedWindowBack;
     this._windowAhead = this._wantedWindowAhead;
@@ -5461,6 +5471,10 @@ class VideoEngine extends EventTarget {
     const cw = this.canvas.width, ch = this.canvas.height, ctx = this.context;
     if (!cw || !ch) return;   // pane not laid out yet; resizeCanvas will repaint
     ctx.clearRect(0, 0, cw, ch);
+    // Assigning canvas.width/height (_syncCanvasSize, on every real resize)
+    // resets all context state back to its defaults, imageSmoothingEnabled
+    // included — so this must be reasserted on every draw, not just once.
+    ctx.imageSmoothingEnabled = this._imageSmoothingEnabled;
     const rotation = this.rotation || 0;
     const swapAxes = rotation === 90 || rotation === 270;
     const displayW = swapAxes ? bitmap.height : bitmap.width;
@@ -6190,6 +6204,10 @@ async function createBestEngine(source, options = {}) {
     // Passed through to VideoEngine; ignored by the <video> element, which does
     // its own buffering. See the VideoEngine constructor.
     windowAhead,
+    // Passed through to VideoEngine; the <video> element has no comparable
+    // control (the browser resamples its own decoded frames, not us), so this
+    // is a no-op on that tier. See the VideoEngine constructor.
+    imageSmoothingEnabled,
     // How long the WebM index is allowed to take. Building it means reading the
     // whole file (Matroska keeps no central sample table), which is quick from
     // disk and as slow as the network from a URL — so it gets a deadline. A clip
@@ -6327,7 +6345,7 @@ async function createBestEngine(source, options = {}) {
 
   if (prefer !== 'native' && !webCodecsUnreliable
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
-    const engine = new VideoEngine(canvas, { windowAhead });
+    const engine = new VideoEngine(canvas, { windowAhead, imageSmoothingEnabled });
     try {
       await engine.load(source, { index });
       return engine;
