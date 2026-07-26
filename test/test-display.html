@@ -44,12 +44,13 @@
 const TEST_FRAME = 7;     // not 0, so a stuck-on-first-frame canvas fails too
 const BARS_ACROSS = 30;   // the clips are 150px wide with a 5px bar per frame
 
-// The clips identify each frame by the position of a white bar, so the frame on
-// screen is recoverable from the pixels alone. Reading the bar's centre rather
-// than its brightest column keeps the canvas's rescaling from shifting the
-// answer by one.
+// The clips identify each frame by the position of a white bar in their bottom
+// half, so the frame on screen is recoverable from the pixels alone. Reading
+// the bar's centre rather than its brightest column keeps the canvas's
+// rescaling from shifting the answer by one. (The top half carries the frame
+// number in digits, which is for a human and is deliberately not sampled.)
 function visibleFrame(context, width, height) {
-  const row = context.getImageData(0, Math.floor(height / 2), width, 1).data;
+  const row = context.getImageData(0, Math.floor(height * 3 / 4), width, 1).data;
   let sum = 0, count = 0;
   for (let x = 0; x < width; x++) {
     if (row[x * 4] > 128) { sum += x; count += 1; }

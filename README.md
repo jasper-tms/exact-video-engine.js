@@ -711,11 +711,19 @@ lands.
 **Frame index** walks every frame of the counter clips through each engine and
 checks that asking for frame `n` both puts frame `n` on screen and reports
 frame `n` back. Ground truth is the pixels: each frame identifies itself by the
-position of a white bar, so nothing is taken on trust from a clock. Each case
-also pins which *tier* the ladder landed on, because a case that checked only
-frames would pass just as happily on the fallback — which is exactly what the
-WebM cases used to do. The clips are chosen to make the index's exactness
-falsifiable:
+position of a white bar in its **bottom half**, so nothing is taken on trust
+from a clock. Each frame's **top half** carries the same number in large plain
+digits — nothing in the suite reads it, and it is there so a person can open any
+of these clips in a player, in `demo.html`, or in the app being debugged and see
+at a glance which frame is on screen instead of counting bar positions. Both
+halves are drawn by `test/make-counter-frames.py`, and every counter fixture
+below is encoded from the same bytes, so two of them differing in container or
+codec really do differ in nothing else.
+
+Each case also pins which *tier* the ladder landed on, because a case that
+checked only frames would pass just as happily on the fallback — which is exactly
+what the WebM cases used to do. The clips are chosen to make the index's
+exactness falsifiable:
 
 - `counter-vfr.mp4` is variable-frame-rate: no assumed constant rate maps it
   correctly, so all 30 frames landing right proves the real timestamp table is
@@ -738,6 +746,13 @@ falsifiable:
 - `counter-elst.mp4` carries an edit list, so its first frame presents at
   `mediaTime` 0.133 rather than 0. It passes only if the timeline calibration is
   genuinely finding that offset instead of getting away with a zero one.
+- `counter-idx1.avi` and `counter-opendml.avi` are the same frames as H.264 in
+  AVI, carrying the legacy `idx1` index and the OpenDML hierarchical index
+  respectively — the only container here with no native tier to fall back to.
+- `counter-mjpeg.avi` and `counter-mjpeg.mov` are those frames as Motion JPEG,
+  which decodes through the browser's JPEG decoder rather than a `VideoDecoder`
+  (see "Motion JPEG" above). Two containers, because the path belongs to
+  neither.
 
 **Matroska table** (plain Node) checks the half of that index a browser walk
 cannot see: that every frame's recorded byte range lies inside the file, that no

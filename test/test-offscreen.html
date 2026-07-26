@@ -28,15 +28,17 @@
 const TEST_FRAME = 7;     // not 0, so a stuck-on-first-frame engine fails too
 const BARS_ACROSS = 30;   // the clips are 150px wide with a 5px bar per frame
 
-// Frame n of the counter clips is a white bar at x = 5n, so the frame a bitmap
-// holds is recoverable from its pixels alone.
+// Frame n of the counter clips is a white bar at x = 5n across their bottom
+// half, so the frame a bitmap holds is recoverable from its pixels alone. The
+// top half carries the same number in digits, for a human rather than for this,
+// and is deliberately not sampled.
 function frameInBitmap(bitmap) {
   const canvas = document.createElement('canvas');
   canvas.width = bitmap.width;
   canvas.height = bitmap.height;
   const context = canvas.getContext('2d');
   context.drawImage(bitmap, 0, 0);
-  const row = context.getImageData(0, Math.floor(bitmap.height / 2), bitmap.width, 1).data;
+  const row = context.getImageData(0, Math.floor(bitmap.height * 3 / 4), bitmap.width, 1).data;
   let sum = 0, count = 0;
   for (let x = 0; x < bitmap.width; x++) {
     if (row[x * 4] > 128) { sum += x; count += 1; }

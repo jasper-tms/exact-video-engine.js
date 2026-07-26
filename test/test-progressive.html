@@ -27,11 +27,13 @@
 const BARS_ACROSS = 30;
 
 // The frame the pixels say is showing: find the bar (columns brighter than
-// half), take its centre, and convert that to a bar index.
+// half), take its centre, and convert that to a bar index. Sampled from the
+// BOTTOM half, where the bar is: the top half carries the same frame number in
+// plain digits, for a human rather than for this.
 function visibleFrame(canvas) {
   const width = canvas.width, height = canvas.height;
   const row = canvas.getContext('2d')
-    .getImageData(0, Math.floor(height / 2), width, 1).data;
+    .getImageData(0, Math.floor(height * 3 / 4), width, 1).data;
   let sum = 0, count = 0;
   for (let x = 0; x < width; x++) {
     if (row[x * 4] > 128) { sum += x; count += 1; }

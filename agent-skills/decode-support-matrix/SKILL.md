@@ -9,7 +9,7 @@ The engine has two backends behind one interface: `VideoEngine` (WebCodecs —
 demuxes with mp4box, decodes every frame itself) and `NativeVideoEngine`
 (`<video>` element — the browser decodes and presents). `createBestEngine()`
 picks per clip. This skill records which real-world video formats each backend
-can actually decode (tested 2026-07; the container rows through engine v2.2).
+can actually decode (tested 2026-07; the container rows through engine v2.1.0).
 
 ## Frame-exactness is decided by the index, not the decoder
 
@@ -24,7 +24,7 @@ Container indexing is codec-agnostic and separate from decoding:
   a full-file read with the same deadline/byte budget and progress reporting as
   the WebM scan, but a complete index (sample table included), so fragmented
   clips play through WebCodecs like classic ones.
-- **WebM/Matroska** has a built-in indexer that (since v2.2) builds a FULL
+- **WebM/Matroska** has a built-in indexer that (since v2.1.0) builds a FULL
   decode table — byte ranges and keyframe flags, not just timestamps — plus a
   decoderConfig from the track's CodecID/CodecPrivate, for H.264, HEVC, VP8, VP9
   and AV1. So WebM and MKV now reach the WebCodecs backend. A CodecID we cannot
@@ -95,7 +95,7 @@ WebKit reports the same *"Decoder failure"* string for two different problems:
 | HEVC 8-bit **in MKV** | same as HEVC in MP4 on the same browser — the container is not the variable (see below) | (Playwright's Chromium has no HEVC decoder at all) | Chromium/Firefox demux MKV but still need an HEVC decoder |
 | H.264 8-bit **in AVI** (engine ships AVCC + `avcC`; see the AVI section) | works | works | AVI is WebCodecs-only — no native tier used |
 
-Tested 2026-07-25 (engine v2.2, the Matroska sample table) on Playwright's
+Tested 2026-07-25 (engine v2.1.0, the Matroska sample table) on Playwright's
 chromium/firefox/webkit, counter clip in each container, all 30 frames exact via
 the `webcodecs` tier except where noted.
 
@@ -108,9 +108,9 @@ Matroska fixture is a parser-only test rather than a browser walk.
 
 ## AVI-in-WebCodecs: WebKit needs AVCC, not Annex B (a second dishonest yes)
 
-AVI (added v2.1) reaches the WebCodecs backend without mp4box — `src/avi.js`
+AVI (added v2.1.0) reaches the WebCodecs backend without mp4box — `src/avi.js`
 parses the RIFF/`idx1`/OpenDML index itself and builds a full sample table plus a
-`decoderConfig` — as does Matroska since v2.2. What is unique to AVI is that it is
+`decoderConfig` — as does Matroska since v2.1.0. What is unique to AVI is that it is
 **WebCodecs-only**: Chromium and Firefox refuse AVI through a `<video>` element
 outright, so there is no reliable native tier, and `createBestEngine` never uses
 one for AVI. (Matroska always has that tier, which is why an unconfigurable codec
@@ -133,7 +133,7 @@ length-prefixed AVCC before decoding (`convertAnnexBToAvcc`, gated on the index'
 WebKit/VideoToolbox — decodes natively, so this is the one path that works
 everywhere and does not depend on any native AVI support.
 
-Tested 2026-07 (engine v2.1), counter clip muxed to AVI (High 8-bit 4:2:0), both
+Tested 2026-07 (engine v2.1.0), counter clip muxed to AVI (High 8-bit 4:2:0), both
 idx1 and OpenDML index flavors, `mode: webcodecs`, all 30 frames exact, tier
 `webcodecs` on all three:
 
@@ -157,6 +157,33 @@ WebKit's WebCodecs path, not Dolby Vision and not the .MOV container (the
 two-classes section above has the one alternative not yet ruled out). The same
 phone plays the same file perfectly through `<video>` (AVFoundation), so the
 hardware is fine and only the WebCodecs plumbing is not.
+
+## Motion JPEG does not use a VideoDecoder at all
+
+No browser engine ships an MJPEG `VideoDecoder`, and none is asked for. Since
+v2.2 a clip whose frames are whole still images is decoded by
+`src/image-frame-decoder.js`, which hands each frame's bytes to
+`createImageBitmap` and wraps the result in a `VideoFrame`. It presents the
+`VideoDecoder` interface exactly (configure/decode/flush/reset/close,
+decodeQueueSize, output callback), so `VideoEngine`'s decode driver is unchanged
+and such a clip still reports `tier: 'webcodecs'` — the tier names which ENGINE
+owns the clock and the canvas, not which decoder it fed.
+
+| Format | WebKit/iOS | Chromium desktop | Firefox | Native `<video>` |
+|---|---|---|---|---|
+| **MJPEG in AVI** (`MJPG` FourCC) | works | works | works | AVI has no native tier |
+| **MJPEG in QuickTime** (`jpeg` sample entry) | works | works | works | not relied on |
+
+Tested 2026-07-26 (engine v2.2), the 150x90 counter clip in both containers, all
+30 frames exact on all three Playwright engines. `createImageBitmap` on a JPEG
+blob is universal, so unlike every row in the matrix above there is no
+per-browser variation to record here — which is the point of the approach.
+
+Do NOT feed `mjpa`/`mjpb` (QuickTime Motion JPEG A and B) down this path: those
+wrap their fields in extra framing rather than storing one plain JPEG per sample,
+and both the AVI FourCC check and the ISOBMFF sample-entry check exclude them
+deliberately. `engine.codecString` is `mjpeg` for clips on this path; WebCodecs
+registers no codec string for Motion JPEG, so that marker is this library's own.
 
 ## Practical guidance
 

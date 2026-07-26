@@ -6,14 +6,21 @@
 # quadrant on blue), then remuxes of it with 90/180/270-degree display-rotation
 # metadata.
 #
-# Frame-index clips: 30 frames, each identifying itself by the POSITION of a
-# white bar (frame n puts a 5-pixel bar at x = 5n, on black). The index is read
-# back from the bar's position rather than a pixel value, so it survives the
-# browser's YUV-to-RGB conversion exactly, which a brightness code would not.
-# The frame is 150 pixels wide so that the 30 frames tile it exactly, one bar
-# slot each: frame 0's bar sits flush against the left edge and frame 29's flush
-# against the right, and no column of the image belongs to no frame. Keep the
-# width at 5 * the frame count if either ever changes.
+# Frame-index clips: 30 frames, each saying which frame it is in two ways at once
+# (see make-counter-frames.py, which draws them).
+#
+#   * The BOTTOM half carries a white bar, 5 pixels wide, at x = 5n. This is what
+#     the test suite reads, and it reads nothing else. Position survives the
+#     browser's YUV-to-RGB conversion exactly, which a brightness code would not,
+#     and the frame is 150 pixels wide so the 30 bars tile it exactly, one slot
+#     each: frame 0's bar sits flush against the left edge and frame 29's flush
+#     against the right, with no column belonging to no frame. Keep the width at
+#     5 * the frame count if either ever changes.
+#   * The TOP half carries the frame number in large plain digits. Nothing in the
+#     suite looks at it. It is for the human who opens one of these clips in a
+#     player, or loads it into the demo page or an app being debugged, and wants
+#     to see which frame is on screen without counting bar positions by eye.
+#
 # Two versions of the same 30 frames:
 #   counter-cfr.mp4  constant 30 fps
 #   counter-vfr.mp4  variable: 33 ms per frame, but every 5th frame is held for
@@ -22,6 +29,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p clips
+
+# The counter frames are drawn once, here, and every clip below is encoded from
+# the same bytes -- so two fixtures differing in container or codec really do
+# differ in nothing else. They are drawn in Python rather than by ffmpeg's
+# drawtext filter because drawtext needs an ffmpeg built with libfreetype, and
+# plenty are not (including the one this was written against); a bar alone could
+# be drawn with geq, but digits cannot.
+python3 make-counter-frames.py 150 90 30 clips/counter-frames-150x90.gray
+python3 make-counter-frames.py 170 94 25 clips/counter-frames-170x94.gray
+
+# Spelled as arrays so each ffmpeg invocation can splice in "the counter frames"
+# as its input without repeating the six arguments that say how to read raw
+# bytes. Headerless grayscale: no container, no timestamps, just frames.
+COUNTER_FRAMES=(-f rawvideo -pix_fmt gray -video_size 150x90 -framerate 30
+    -i clips/counter-frames-150x90.gray)
+COUNTER_FRAMES_170x94=(-f rawvideo -pix_fmt gray -video_size 170x94 -framerate 25
+    -i clips/counter-frames-170x94.gray)
 
 ffmpeg -y -loglevel error -f lavfi \
     -i "color=c=blue:s=320x180:d=2:r=30,drawbox=x=0:y=0:w=160:h=90:color=red:t=fill" \
@@ -46,12 +70,17 @@ done
 #     would make the native-index cases in frame-index-test.mjs mismap on every
 #     browser. The original lossless clips had no B-frames as a side effect of
 #     -qp 0; -bf 0 keeps that property explicit now that the encode is lossy.
+#   * -sc_threshold 0 (no scene-change keyframes) so the group of pictures is
+#     exactly what -g 10 says: keyframes at frames 0, 10 and 20 and nowhere else,
+#     which is what the table tests assert and what counter-elst.mp4's cut
+#     depends on. Without it x264 inserts a fourth keyframe where the frame
+#     number's digits change shape enough to read as a cut -- a real hazard now
+#     that these frames carry printed numbers rather than a bar alone.
 # -qp 1 is still visually lossless at the scale that matters here: the bar edges
 # stay a hard black/white step, so visibleFrame()'s "columns brighter than half"
 # detection reads the same bar position on all three browsers' YUV-to-RGB paths.
-ffmpeg -y -loglevel error -f lavfi \
-    -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
-    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 clips/counter-cfr.mp4
+ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -sc_threshold 0 clips/counter-cfr.mp4
 
 # settb pins the timebase to milliseconds so the setpts expression below is in
 # whole ms and needs no rounding; without it the encoder re-times against the
@@ -59,7 +88,7 @@ ffmpeg -y -loglevel error -f lavfi \
 ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
     -vf "settb=1/1000,setpts='33*N + 33*floor(N/5)'" \
     -fps_mode passthrough -video_track_timescale 1000 \
-    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 clips/counter-vfr.mp4
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -sc_threshold 0 clips/counter-vfr.mp4
 
 # The same 30 frames again, in WebM. mp4box cannot parse this container at all,
 # so these clips are what prove the engine's own Matroska cluster scan: without
@@ -165,12 +194,11 @@ else
 fi
 if [ -n "$FFMPEG_THEORA" ] \
         && "$FFMPEG_THEORA" -hide_banner -encoders 2>/dev/null | grep -q libtheora; then
-    "$FFMPEG_THEORA" -y -loglevel error -f lavfi \
-        -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+    "$FFMPEG_THEORA" -y -loglevel error "${COUNTER_FRAMES[@]}" \
         -pix_fmt yuv420p -c:v libtheora -q:v 10 clips/counter-cfr.ogv
     "$FFMPEG_THEORA" -y -loglevel error \
         -f lavfi -i "sine=frequency=440:duration=1" \
-        -f lavfi -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+        "${COUNTER_FRAMES[@]}" \
         -map 0:a -map 1:v -shortest \
         -c:a libvorbis -pix_fmt yuv420p -c:v libtheora -q:v 10 \
         clips/counter-vorbis-audio.ogv
@@ -210,8 +238,7 @@ python3 make-trimming-edit-list.py clips/counter-cfr.mp4 clips/counter-trimming-
 # hvcC without decoding — so the clip's content is unimportant; it reuses the
 # counter pattern. -tag:v hvc1 so the sample entry is hvc1 (not hev1); either way
 # the hvcC declares general_profile_idc 2 (Main 10), which is what is detected.
-ffmpeg -y -loglevel error -f lavfi \
-    -i "color=c=black:s=150x90:d=1:r=30,format=gray10le,geq=lum='if(between(X,5*N,5*N+4),1023,0)'" \
+ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
     -pix_fmt yuv420p10le -c:v libx265 -tag:v hvc1 -x265-params log-level=none \
     -g 10 clips/counter-hevc10.mp4
 
@@ -273,9 +300,8 @@ ls clips/counter-fragmented.mp4 clips/counter-audio-first.webm \
 # which is the WebCodecs-decodable happy path. Same coding choices as
 # counter-cfr.mp4 (High 8-bit 4:2:0, no B-frames) so every browser's WebCodecs
 # decodes it and the bar edges stay a hard step for the pixel readback.
-ffmpeg -y -loglevel error -f lavfi \
-    -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
-    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -f avi clips/counter-idx1.avi
+ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -sc_threshold 0 -f avi clips/counter-idx1.avi
 
 # 2. OpenDML (indx super-index + ix00) AVI, H.264 — the same 30 frames, but with
 # the hierarchical index the real >2 GB capture files use. ffmpeg only emits an
@@ -288,9 +314,8 @@ python3 make-opendml-avi.py clips/counter-idx1.avi clips/counter-opendml.avi
 # and stride assumptions: 25 fps, 170x94, H.264 idx1. Parser-only (the browser
 # pixel walk uses the 150x90 counter above), so the odd geometry is free to be
 # awkward. 25 frames at 1/25 s spacing is what the table test pins.
-ffmpeg -y -loglevel error -f lavfi \
-    -i "color=c=black:s=170x94:d=1:r=25,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
-    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -f avi clips/counter-avi-25fps.avi
+ffmpeg -y -loglevel error "${COUNTER_FRAMES_170x94[@]}" \
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -sc_threshold 0 -f avi clips/counter-avi-25fps.avi
 
 # 4. Uncompressed rawvideo AVI (biCompression 0 / BI_RGB, the pal8 shape that
 # motivated the task) — the honest-no case. WebCodecs has no raw-frame decoder and
@@ -311,16 +336,14 @@ ffmpeg -y -loglevel error -f lavfi \
 # -q:v 1 (best quality) so the bar's edges stay a hard black/white step through
 # the JPEG's DCT, which is what visibleFrame()'s "columns brighter than half"
 # reads. yuvj420p is the full-range flavour every JPEG decoder expects.
-ffmpeg -y -loglevel error -f lavfi \
-    -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
     -c:v mjpeg -q:v 1 -pix_fmt yuvj420p -f avi clips/counter-mjpeg.avi
 
 # 6. The same MJPEG frames in a QuickTime/MP4 container, where the sample entry
 # is `jpeg` rather than the AVI FourCC `MJPG`. Indexed by mp4box like any other
 # ISOBMFF file and decoded down the same image-frame path, so this is what proves
 # the path is the container's business and not AVI's.
-ffmpeg -y -loglevel error -f lavfi \
-    -i "color=c=black:s=150x90:d=1:r=30,format=gray,geq=lum='if(between(X,5*N,5*N+4),255,0)'" \
+ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
     -c:v mjpeg -q:v 1 -pix_fmt yuvj420p clips/counter-mjpeg.mov
 
 echo "Wrote AVI fixtures:"
@@ -371,7 +394,7 @@ ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
 # case here would pin a property of the test browsers rather than of this engine.
 # matroska-table-test.mjs is where it earns its keep.
 ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
-    -pix_fmt yuv420p -c:v libx265 -x265-params log-level=none -crf 5 -g 10 \
+    -pix_fmt yuv420p -c:v libx265 -x265-params log-level=none:scenecut=0 -crf 5 -g 10 \
     clips/counter-hevc.mkv
 
 echo "Wrote Matroska codec fixtures:"
