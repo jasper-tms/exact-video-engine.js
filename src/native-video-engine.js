@@ -218,6 +218,15 @@ export class NativeVideoEngine extends EventTarget {
 
   get currentFrame() { return Math.floor(this.currentFrameFloat); }
 
+  // The frame actually painted onto the element right now. Unlike VideoEngine
+  // this engine's own `currentFrame` is already clamped to what has been
+  // presented (see the class comment), so this is mostly `_presentedFrame()`
+  // by another name — exposed under a shared name with `VideoEngine.presentedFrame`
+  // so a host can tell "has my seek landed on screen yet" without branching on
+  // `tier`. -1 (matching VideoEngine's sentinel), not null, until a first
+  // frame has presented.
+  get presentedFrame() { return this._presentedFrame() ?? -1; }
+
   seekToFrame(n) {
     n = Math.max(0, Math.min(Math.max(0, this.numFrames - 1), n | 0));
     // Seek to the midpoint of the frame's display interval, not its start: the

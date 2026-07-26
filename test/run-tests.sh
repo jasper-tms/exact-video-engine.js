@@ -73,6 +73,7 @@ for browser in chromium webkit firefox; do
     TEST_BROWSER="$browser" node test/frame-index-test.mjs || status=1
     TEST_BROWSER="$browser" node test/display-test.mjs || status=1
     TEST_BROWSER="$browser" node test/offscreen-test.mjs || status=1
+    TEST_BROWSER="$browser" node test/presented-frame-test.mjs || status=1
 done
 
 # Chromium-only. These lean on a Chrome DevTools Protocol session (startup's

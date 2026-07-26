@@ -1,0 +1,109 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine presentedFrame test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<!-- Both display elements are supplied so createBestEngine can walk its full
+     ladder: WebCodecs onto the canvas, or a fallback onto the <video> element. -->
+<div id="pane" style="width: 300px; height: 180px"><canvas id="engine-canvas"></canvas></div>
+<video id="native-video" muted playsinline style="width: 300px; height: 180px"></video>
+<script>
+// presentedFrame exists to answer "has a seek actually landed on screen yet",
+// as opposed to currentFrame, which on VideoEngine (the WebCodecs tier) moves
+// the instant seekToFrame is called — before that frame is necessarily
+// decoded. This regression-tests both halves of that contract:
+//
+//   1. Right after a far seek, before waiting for it, presentedFrame must
+//      still read the frame that was on screen before the seek (proving it
+//      does not jump early the way currentFrame does).
+//   2. Once the host actually waits for the frame (ensureFrame + a couple of
+//      update() ticks, exactly what a host's rAF loop would do), presentedFrame
+//      must reach the target AND the pixels on screen must match it — proving
+//      the getter is not just internal bookkeeping but tracks real pixels.
+//
+// NativeVideoEngine's own currentFrame is already presentation-clamped (see
+// its class comment), so part 1 looks different there: currentFrame itself
+// should also still read the pre-seek frame, not just presentedFrame. Asserting
+// that distinction is what pins the tier asymmetry this feature was built to
+// paper over for a host that wants one tier-agnostic way to ask the question.
+const BASELINE_FRAME = 0;
+const TARGET_FRAME = 25;    // far enough from BASELINE that WebCodecs cannot
+                            // have it decoded and cached already
+const BARS_ACROSS = 30;     // the clips are 150px wide with a 5px bar per frame
+
+// Same pixel-reading trick as test-display.html: the clips identify each frame
+// by the position of a white bar in their bottom half.
+function visibleFrame(context, width, height) {
+  const row = context.getImageData(0, Math.floor(height * 3 / 4), width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < width; x++) {
+    if (row[x * 4] > 128) { sum += x; count += 1; }
+  }
+  if (!count) return -1;
+  return Math.floor((sum / count) / (width / BARS_ACROSS));
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const mode = params.get('mode') || 'webcodecs';   // 'webcodecs' or 'native'
+  const canvas = document.getElementById('engine-canvas');
+  const video = document.getElementById('native-video');
+
+  const source = await (await fetch('clips/' + params.get('file')).then((r) => r.blob()));
+  const engine = await createBestEngine(source, { canvas, video, prefer: mode });
+
+  // Establish a known, fully-settled baseline before the seek under test.
+  engine.seekToFrame(BASELINE_FRAME);
+  await engine.ensureFrame(BASELINE_FRAME);
+  engine.update(performance.now());
+  await nextAnimationFrame();
+  engine.update(performance.now());
+
+  // The seek under test: land far away, but do not wait for it yet.
+  engine.seekToFrame(TARGET_FRAME);
+  const immediatelyAfterSeek = {
+    currentFrame: engine.currentFrame,
+    presentedFrame: engine.presentedFrame,
+  };
+
+  // Now actually wait for it, the way a host's rAF loop eventually would.
+  await engine.ensureFrame(TARGET_FRAME);
+  for (let tick = 0; tick < 2; tick++) {
+    await nextAnimationFrame();
+    engine.update(performance.now());
+  }
+
+  // For the <video> tier there is no bitmap to name (see VideoEngine.bitmapForFrame's
+  // doc comment), but the element still has pixels on screen — draw it to a
+  // scratch canvas to read them the same way.
+  let context, width, height;
+  if (engine.displayElement === canvas) {
+    context = canvas.getContext('2d');
+    width = canvas.width;
+    height = canvas.height;
+  } else {
+    const scratch = document.createElement('canvas');
+    scratch.width = width = video.videoWidth;
+    scratch.height = height = video.videoHeight;
+    context = scratch.getContext('2d');
+    context.drawImage(video, 0, 0, width, height);
+  }
+
+  window.__result = {
+    tier: engine.tier,
+    baselineFrame: BASELINE_FRAME,
+    targetFrame: TARGET_FRAME,
+    immediatelyAfterSeek,
+    afterWaiting: {
+      currentFrame: engine.currentFrame,
+      presentedFrame: engine.presentedFrame,
+      visible: visibleFrame(context, width, height),
+    },
+  };
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>

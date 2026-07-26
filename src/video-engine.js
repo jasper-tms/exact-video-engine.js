@@ -181,6 +181,13 @@ export class VideoEngine extends EventTarget {
 
   get currentFrame() { return this.frameAtTime(this.playhead); }
 
+  // The frame actually painted onto the canvas right now, as opposed to
+  // `currentFrame` (the playhead's target, which lands the instant a host
+  // seeks — before that frame is necessarily decoded). A host that needs to
+  // know whether the pixels on screen have caught up to a seek should compare
+  // against this, not `currentFrame`.
+  get presentedFrame() { return this._shownFrame; }
+
   // Continuous playhead in frame units (frame index + fraction through that
   // frame's display interval) — what a host should drive any frame-indexed
   // display it renders in sync with the video (interpolated overlays etc.)

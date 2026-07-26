@@ -4824,6 +4824,13 @@ class VideoEngine extends EventTarget {
 
   get currentFrame() { return this.frameAtTime(this.playhead); }
 
+  // The frame actually painted onto the canvas right now, as opposed to
+  // `currentFrame` (the playhead's target, which lands the instant a host
+  // seeks — before that frame is necessarily decoded). A host that needs to
+  // know whether the pixels on screen have caught up to a seek should compare
+  // against this, not `currentFrame`.
+  get presentedFrame() { return this._shownFrame; }
+
   // Continuous playhead in frame units (frame index + fraction through that
   // frame's display interval) — what a host should drive any frame-indexed
   // display it renders in sync with the video (interpolated overlays etc.)
@@ -5746,6 +5753,15 @@ class NativeVideoEngine extends EventTarget {
   }
 
   get currentFrame() { return Math.floor(this.currentFrameFloat); }
+
+  // The frame actually painted onto the element right now. Unlike VideoEngine
+  // this engine's own `currentFrame` is already clamped to what has been
+  // presented (see the class comment), so this is mostly `_presentedFrame()`
+  // by another name — exposed under a shared name with `VideoEngine.presentedFrame`
+  // so a host can tell "has my seek landed on screen yet" without branching on
+  // `tier`. -1 (matching VideoEngine's sentinel), not null, until a first
+  // frame has presented.
+  get presentedFrame() { return this._presentedFrame() ?? -1; }
 
   seekToFrame(n) {
     n = Math.max(0, Math.min(Math.max(0, this.numFrames - 1), n | 0));

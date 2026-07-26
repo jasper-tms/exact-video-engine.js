@@ -515,7 +515,8 @@ plays through.
 | `duration` | Clip duration in seconds. While `frameIndexState` is `growing` this is the length indexed *so far*, rising with `numFrames` — see "Playing while the index is still being built". |
 | `expectedDuration` | The whole clip's length in seconds as the container *declares* it (Matroska's `Info/Duration`), fixed from the index's first publish; `0` when the container declares none. What to size a scrubber against while the index grows. A claim, never a mapping input — it names no frame. |
 | `numFrames` | Frame count. Grows while `frameIndexState` is `growing` — see "Playing while the index is still being built". |
-| `currentFrame` | Integer display frame index on screen. |
+| `currentFrame` | Integer playhead frame index: where `seekToFrame`/playback has aimed the playhead. On `NativeVideoEngine` this is already clamped to what has been presented (see `presentedFrame`); on `VideoEngine` it lands the instant you seek, ahead of the decode — use `presentedFrame` if you need to know what is actually on screen right now. |
+| `presentedFrame` | Integer frame index actually painted onto the canvas/element right now. `-1` until a first frame has presented. Diverges from `currentFrame` on `VideoEngine` for as long as a seek's target frame is still decoding; on `NativeVideoEngine` the two rarely differ since `currentFrame` is already presentation-clamped. Compare this against the frame you asked for to know whether a seek has actually landed on screen. |
 | `currentFrameFloat` | Continuous playhead in frame units (index + fraction of the frame's display interval) — drive synchronized/interpolated overlays from this, never from `currentTime * frameRate`. |
 | `currentTime` | Playhead in seconds (get/set), with display frame 0 at t = 0 in both engines. |
 | `seekToFrame(n)` | Land on display frame `n`. |
