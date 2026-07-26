@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Generate test clips if needed, serve the repo root, and run every test.
-# Requires ffmpeg, node, and Playwright (npm install playwright).
+# Requires ffmpeg, node, and Playwright (npm install).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -52,7 +52,11 @@ TEST_PORT="${TEST_PORT:-8798}"
 export TEST_PORT
 python3 test/serve.py "$TEST_PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null' EXIT
+# `|| true` is load-bearing: bash takes a failing EXIT trap's status as the
+# script's own, and `kill` fails whenever the server has already gone. Without it
+# this script's exit code reports whether the server outlived the tests, not
+# whether the tests passed -- green runs exit 1 and CI reads them as failures.
+trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 sleep 1
 
 status=0
