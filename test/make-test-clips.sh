@@ -183,15 +183,28 @@ ffmpeg -y -loglevel error -i clips/counter-vfr.mp4 \
 # ffmpeg if it can encode Theora, else the full static build that imageio-ffmpeg
 # ships (fetched through uv, which caches it). If neither is available the Ogg
 # fixtures are skipped with a warning, and the tests that need them skip too.
-if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libtheora; then
+#
+# The encoder list is captured to a variable before being searched, rather than
+# piped straight into `grep -q`. Under this script's `set -o pipefail`, that pipe
+# is a race: `grep -q` exits the instant it matches, ffmpeg takes SIGPIPE writing
+# what is left, and pipefail reports the whole pipeline as failed even though the
+# encoder was found. Whether it loses depends on how much ffmpeg still had to
+# write — so a build with MORE encoders compiled in is likelier to be wrongly
+# reported as having none, which is exactly the wrong way round.
+has_encoder() {   # has_encoder <ffmpeg> <encoder name>
+    local listing
+    listing="$("$1" -hide_banner -encoders 2>/dev/null || true)"
+    case "$listing" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
+if has_encoder ffmpeg libtheora; then
     FFMPEG_THEORA=ffmpeg
 else
     FFMPEG_THEORA="$(uvx --from imageio-ffmpeg python -c \
         'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())' \
         2>/dev/null | tail -1)" || FFMPEG_THEORA=""
 fi
-if [ -n "$FFMPEG_THEORA" ] \
-        && "$FFMPEG_THEORA" -hide_banner -encoders 2>/dev/null | grep -q libtheora; then
+if [ -n "$FFMPEG_THEORA" ] && has_encoder "$FFMPEG_THEORA" libtheora; then
     "$FFMPEG_THEORA" -y -loglevel error "${COUNTER_FRAMES[@]}" \
         -pix_fmt yuv420p -c:v libtheora -q:v 10 clips/counter-cfr.ogv
     "$FFMPEG_THEORA" -y -loglevel error \
@@ -346,6 +359,29 @@ ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
 echo "Wrote AVI fixtures:"
 ls clips/counter-idx1.avi clips/counter-opendml.avi clips/counter-avi-25fps.avi \
     clips/counter-rawvideo.avi clips/counter-mjpeg.avi clips/counter-mjpeg.mov
+
+# ==================================================================
+# MPEG-4 Part 2 (`mp4v`) — what OpenCV's VideoWriter writes by default, and so
+# what a great deal of scientific footage is stored as.
+#
+# Like the `jpeg` sample entry above, `mp4v` is one mp4box registers no parser
+# for, so the track arrives classified as metadata with no dimensions; the
+# rescue in src/container-index.js reads the entry's own bytes and its `esds`
+# instead. Unlike `jpeg`, there is no decoder to fall back on: only WebKit
+# decodes MPEG-4 Part 2 (through the <video> element; no browser's WebCodecs
+# does), so frame-index-test.mjs expects a walk there and a clean refusal on
+# Chromium and Firefox.
+#
+# -vtag mp4v pins the four-character code: ffmpeg would otherwise write `FMP4`
+# for this encoder, which is the AVI-style tag and not what OpenCV produces.
+# -q:v 1, -bf 0 and -g 10 for the same reasons as the H.264 clips above — hard
+# bar edges for visibleFrame(), no reordering, and a predictable group of
+# pictures.
+ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
+    -pix_fmt yuv420p -c:v mpeg4 -vtag mp4v -q:v 1 -bf 0 -g 10 clips/counter-mp4v.mp4
+
+echo "Wrote MPEG-4 Part 2 fixture:"
+ls clips/counter-mp4v.mp4
 
 # ==================================================================
 # Matroska codec fixtures (added when the Matroska scan gained a sample table,

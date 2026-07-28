@@ -3616,6 +3616,198 @@ function isobmffMotionJpegSampleEntry(codec) {
   return codec === 'jpeg';
 }
 
+// ------------------------------------------------------------------
+// MPEG-4 Part 2 (`mp4v`) — read the track, name the codec, decode nowhere.
+//
+// This is what OpenCV's VideoWriter writes by default (`VideoWriter_fourcc(*'mp4v')`),
+// so it is what a great many lab pipelines have on disk, and until now the engine
+// refused those files with "no video track in file" — which is both unhelpful and
+// untrue.
+//
+// The situation is exactly motionJpegTrack's: mp4box.js registers a sample entry
+// for avc1/avc3/hvc1/hev1/vp08/vp09/av01 and nothing else, so an `mp4v` entry is
+// parsed as an opaque box, the track is filed under `metadata` rather than
+// `video`, and info.videoTracks comes back empty. Nothing is missing from the
+// file — the sample table (byte ranges, sync flags, per-frame times) is parsed
+// exactly as it would be for H.264 — only the classification and the sample
+// entry's own fields are. So, as there, recognize the one case and supply the
+// `video` shape a video track would have carried.
+//
+// What this does NOT do is make the clip decodable. No Blink or Gecko build ships
+// an MPEG-4 Part 2 decoder in either WebCodecs or the <video> element, so on
+// Chrome and Firefox this turns "we could not read the container" into an honest
+// "the container is fine, the codec is undecodable here" — which is the error
+// message the host actually needs, and the reason to do this even where it cannot
+// end in playback. WebKit's <video> element decodes MPEG-4 Part 2 through
+// AVFoundation, so on Safari the clip plays, and this index is what makes it
+// frame-exact there.
+const MPEG4_VISUAL_OBJECT_TYPE_INDICATION = 0x20;
+const ELEMENTARY_STREAM_DESCRIPTOR_TAG = 0x03;
+const DECODER_CONFIG_DESCRIPTOR_TAG = 0x04;
+const DECODER_SPECIFIC_INFO_TAG = 0x05;
+// The start code that opens a VisualObjectSequence header, whose next byte is the
+// profile_and_level_indication an `mp4v.20.<n>` codec string names.
+const VISUAL_OBJECT_SEQUENCE_START_CODE = [0x00, 0x00, 0x01, 0xb0];
+
+// One MPEG-4 systems descriptor: a tag byte, then a length spread over one to
+// four bytes with a continuation bit set on all but the last.
+function readMpeg4Descriptor(bytes, offset) {
+  const tag = bytes[offset];
+  let cursor = offset + 1;
+  let length = 0;
+  for (let i = 0; i < 4 && cursor < bytes.length; i++) {
+    const byte = bytes[cursor];
+    cursor += 1;
+    length = (length << 7) | (byte & 0x7f);
+    if (!(byte & 0x80)) break;
+  }
+  return { tag, bodyOffset: cursor, end: cursor + length };
+}
+
+// The `esds` box body (past its version and flags) down to the two things a
+// decoder configuration wants: which codec this elementary stream carries, and
+// its out-of-band setup bytes. Returns null if the descriptor tree is not the
+// shape the specification requires, which is the same answer as "not ours".
+function readElementaryStreamDescriptor(esdsBody) {
+  if (esdsBody.length < 5) return null;
+  const bytes = esdsBody.subarray(4);   // past version + flags
+  const elementaryStream = readMpeg4Descriptor(bytes, 0);
+  if (elementaryStream.tag !== ELEMENTARY_STREAM_DESCRIPTOR_TAG) return null;
+
+  // ES_ID (2 bytes) then a flags byte, whose top three bits each add an optional
+  // field before the descriptors we are after. libavformat sets none of them, but
+  // reading them properly costs six lines and is the difference between working
+  // for every muxer and working for the one that wrote the file in front of us.
+  let cursor = elementaryStream.bodyOffset + 2;
+  const flags = bytes[cursor];
+  cursor += 1;
+  if (flags & 0x80) cursor += 2;                  // depends on another stream
+  if (flags & 0x40) cursor += 1 + bytes[cursor];  // a URL, length-prefixed
+  if (flags & 0x20) cursor += 2;                  // an object clock reference
+
+  while (cursor < elementaryStream.end && cursor < bytes.length) {
+    const descriptor = readMpeg4Descriptor(bytes, cursor);
+    if (descriptor.tag !== DECODER_CONFIG_DESCRIPTOR_TAG) {
+      cursor = descriptor.end;
+      continue;
+    }
+    const objectTypeIndication = bytes[descriptor.bodyOffset];
+    // Past the object type indication (1), the stream type and buffer size (4),
+    // and the maximum and average bit rates (8) lie the nested descriptors.
+    let inner = descriptor.bodyOffset + 13;
+    let decoderSpecificInfo = null;
+    while (inner < descriptor.end && inner < bytes.length) {
+      const nested = readMpeg4Descriptor(bytes, inner);
+      if (nested.tag === DECODER_SPECIFIC_INFO_TAG) {
+        decoderSpecificInfo = bytes.subarray(nested.bodyOffset,
+          Math.min(nested.end, bytes.length));
+      }
+      inner = nested.end;
+    }
+    return { objectTypeIndication, decoderSpecificInfo };
+  }
+  return null;
+}
+
+// Walk the child boxes appended to a sample entry, looking for one type.
+function findSampleEntryChildBox(sampleEntryBytes, startOffset, wantedType) {
+  const view = new DataView(sampleEntryBytes.buffer,
+    sampleEntryBytes.byteOffset, sampleEntryBytes.byteLength);
+  let offset = startOffset;
+  while (offset + 8 <= sampleEntryBytes.length) {
+    const size = view.getUint32(offset);
+    if (size < 8 || offset + size > sampleEntryBytes.length) return null;
+    const type = String.fromCharCode(
+      sampleEntryBytes[offset + 4], sampleEntryBytes[offset + 5],
+      sampleEntryBytes[offset + 6], sampleEntryBytes[offset + 7]);
+    if (type === wantedType) {
+      return sampleEntryBytes.subarray(offset + 8, offset + size);
+    }
+    offset += size;
+  }
+  return null;
+}
+
+// A VisualSampleEntry's fixed fields, given the box body mp4box hands back with
+// the eight-byte box header and the six reserved bytes plus data_reference_index
+// already consumed (its `hdr_size`). What remains starts with 16 bytes of
+// pre_defined and reserved, then the coded dimensions; the child boxes that carry
+// the real codec configuration begin 70 bytes in, past the resolutions, the frame
+// count, the 32-byte compressor name and the depth.
+const VISUAL_SAMPLE_ENTRY_CHILD_BOXES_OFFSET = 70;
+
+// Everything an `mp4v` sample entry states, or null if these bytes are not an
+// MPEG-4 Part 2 one. Exported for test/mp4v-sample-entry-test.mjs, which pins the
+// parsing against real muxer output without needing mp4box or a browser.
+function readMpeg4VisualSampleEntry(sampleEntryBytes) {
+  if (!sampleEntryBytes
+      || sampleEntryBytes.length < VISUAL_SAMPLE_ENTRY_CHILD_BOXES_OFFSET) return null;
+  const view = new DataView(sampleEntryBytes.buffer,
+    sampleEntryBytes.byteOffset, sampleEntryBytes.byteLength);
+  const esdsBody = findSampleEntryChildBox(sampleEntryBytes,
+    VISUAL_SAMPLE_ENTRY_CHILD_BOXES_OFFSET, 'esds');
+  if (!esdsBody) return null;
+  const descriptor = readElementaryStreamDescriptor(esdsBody);
+  // An `mp4v` sample entry is the generic MPEG-4 elementary stream box: the
+  // object type indication inside it, not the four-character code, is what says
+  // the stream is MPEG-4 Part 2 video rather than something else entirely.
+  if (!descriptor
+      || descriptor.objectTypeIndication !== MPEG4_VISUAL_OBJECT_TYPE_INDICATION) return null;
+
+  const decoderSpecificInfo = descriptor.decoderSpecificInfo;
+  // The profile and level, where the setup bytes open with the sequence header
+  // that declares them. A stream that keeps its headers in-band carries no
+  // DecoderSpecificInfo at all, and then the codec string honestly stops short
+  // rather than inventing a level.
+  const declaresSequenceHeader = decoderSpecificInfo
+    && decoderSpecificInfo.length > VISUAL_OBJECT_SEQUENCE_START_CODE.length
+    && VISUAL_OBJECT_SEQUENCE_START_CODE.every(
+      (byte, i) => decoderSpecificInfo[i] === byte);
+  const profileLevel = declaresSequenceHeader
+    ? decoderSpecificInfo[VISUAL_OBJECT_SEQUENCE_START_CODE.length] : null;
+
+  return {
+    width: view.getUint16(16),
+    height: view.getUint16(18),
+    // RFC 6381's form: the four-character code, the object type indication in
+    // hexadecimal, and the profile_and_level_indication in decimal. OpenCV's
+    // default output is Simple Profile Level 1, so `mp4v.20.1`.
+    codec: profileLevel === null ? 'mp4v.20' : `mp4v.20.${profileLevel}`,
+    decoderSpecificInfo: decoderSpecificInfo || undefined,
+  };
+}
+
+// The `video` track shape for an MPEG-4 Part 2 track mp4box filed as metadata,
+// or null for any file where that is not what is going on — which leaves the
+// caller's "no video track" refusal exactly as it was.
+function mpeg4VisualTrack(file, info) {
+  for (const track of (info.tracks || [])) {
+    const trak = file.getTrackById(track.id);
+    const entry = trak && trak.mdia && trak.mdia.minf.stbl.stsd.entries[0];
+    if (!entry || entry.type !== 'mp4v' || !entry.data) continue;
+    // The handler is the file's own statement that this track is visual, and it
+    // is right even where mp4box's classification is not.
+    if (trak.mdia.hdlr && trak.mdia.hdlr.handler !== 'vide') continue;
+    const sampleEntry = readMpeg4VisualSampleEntry(entry.data);
+    if (!sampleEntry) continue;
+    const width = sampleEntry.width || track.track_width;
+    const height = sampleEntry.height || track.track_height;
+    if (!width || !height) continue;
+    return {
+      ...track,
+      codec: sampleEntry.codec,
+      video: { width, height },
+      matrix: track.matrix || (trak.tkhd && trak.tkhd.matrix),
+      // Carried here rather than re-read in _codecDescription: the sample entry
+      // is one mp4box did not parse, so the bytes come from this walk or from a
+      // second identical one.
+      decoderSpecificInfo: sampleEntry.decoderSpecificInfo,
+    };
+  }
+  return null;
+}
+// ------------------------------------------------------------------
+
 function isobmffReorderDepth(codec, description) {
   if (/^avc[13]/.test(codec)) return declaredFrameReorderDepth('avcC', description);
   if (/^(hvc1|hev1)/.test(codec)) return declaredFrameReorderDepth('hvcC', description);
@@ -3935,7 +4127,8 @@ class ContainerIndex extends EventTarget {
     if (!info) { file.flush(); throw new Error('no moov found (not a valid MP4?)'); }
 
     const videoTrack = (info.videoTracks && info.videoTracks[0])
-      || motionJpegTrack(file, info);
+      || motionJpegTrack(file, info)
+      || mpeg4VisualTrack(file, info);
     if (!videoTrack) { file.flush(); throw new Error('no video track in file'); }
 
     // Is this a fragmented MP4 (fMP4/CMAF)? Its samples live in `moof` boxes
@@ -3958,7 +4151,11 @@ class ContainerIndex extends EventTarget {
         ? MOTION_JPEG_CODEC : videoTrack.codec,
       codedWidth: videoTrack.video.width,
       codedHeight: videoTrack.video.height,
-      description: this._codecDescription(file, videoTrack.id),
+      // A rescued MPEG-4 Part 2 track brings its own setup bytes (mp4box parsed
+      // no sample entry to read them back out of); everything else reads its
+      // avcC/hvcC/vpcC/av1C out of the stsd.
+      description: videoTrack.decoderSpecificInfo
+        || this._codecDescription(file, videoTrack.id),
       optimizeForLatency: true,   // emit frames promptly; less internal buffering
     };
 

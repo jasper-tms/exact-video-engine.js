@@ -38,6 +38,7 @@ node test/matroska-progress-test.mjs || node_status=1
 node test/matroska-table-test.mjs || node_status=1
 node test/decode-support-test.mjs || node_status=1
 node test/edit-list-test.mjs || node_status=1
+node test/mp4v-sample-entry-test.mjs || node_status=1
 node test/ogg-table-test.mjs || node_status=1
 node test/avi-table-test.mjs || node_status=1
 node test/progressive-index-test.mjs || node_status=1

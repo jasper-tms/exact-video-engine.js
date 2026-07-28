@@ -33,6 +33,13 @@
 // { unplayable: true } and the case is skipped (the parser itself is pinned
 // browser-independently by test/ogg-table-test.mjs).
 //
+// counter-mp4v.mp4: MPEG-4 Part 2, which mp4box registers no sample entry for,
+// so the engine reads the track's own bytes to find it at all. Only WebKit
+// decodes this codec, so the case proves two different things on two different
+// browsers: that the rescued index really is frame-exact where it can play, and
+// that it is refused cleanly — not hung, not played with guessed numbers —
+// where it cannot.
+//
 // counter-elst.mp4: the element's timeline does not always start at zero. This
 // clip's first frame reports mediaTime 0.133, so an engine that assumed the two
 // timelines coincided would report every frame number shifted. Passing here
@@ -230,6 +237,27 @@ const CASES = [
   { file: 'counter-mjpeg.mov', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
     tier: 'webcodecs' },
 
+  // MPEG-4 Part 2 in an MP4 (`mp4v`) — OpenCV's VideoWriter default, and the
+  // one fixture whose expectation is inverted: the reference browsers refuse it
+  // and only WebKit plays it. No browser's WebCodecs decodes MPEG-4 Part 2, and
+  // no Blink or Gecko build decodes it in a <video> element either (Chromium's
+  // demuxer rejects the stream outright), so both modes end in a refusal there.
+  // WebKit's element decodes it through AVFoundation, and the container index —
+  // which exists at all only because src/container-index.js reads the `mp4v`
+  // sample entry mp4box files as metadata — is what makes it frame-exact.
+  //
+  // The `webcodecs` case is not redundant with the `native-index` one: it pins
+  // that WebCodecs REJECTS this codec honestly and the ladder falls back, rather
+  // than accepting it and failing later. Its expected tier is `native` for that
+  // reason. Refusals are asserted, not skipped, because a refusal that hung
+  // instead of failing fast would be just as broken.
+  { file: 'counter-mp4v.mp4', mode: 'webcodecs', firstBar: 0,
+    refused: 'no Blink or Gecko build decodes MPEG-4 Part 2, in WebCodecs or in a <video> element',
+    webkit: { exact: true, indexExact: true, tier: 'native' } },
+  { file: 'counter-mp4v.mp4', mode: 'native-index', firstBar: 0,
+    refused: 'no Blink or Gecko build decodes MPEG-4 Part 2, in WebCodecs or in a <video> element',
+    webkit: { exact: true, indexExact: true, tier: 'native' } },
+
   // A WebM whose FIRST track entry is audio and whose second is the video (the
   // 30 counter frames). The Matroska cluster scan must skip the audio track and
   // index only the video blocks; an off-by-one that indexed the first track would
@@ -269,6 +297,13 @@ function expectationFor(testCase) {
     return null;
   }
   if (override.refused) return { refused: override.refused };
+  // A case may be refused in the BASE expectation too. Most clips play on the
+  // reference browser and a minority need an override; a clip only ONE engine
+  // can decode inverts that, so the base states the refusal and the browser that
+  // does play it overrides with a walk.
+  if (testCase.refused && override.exact === undefined) {
+    return { refused: testCase.refused };
+  }
   return {
     exact: override.exact !== undefined ? override.exact : testCase.exact,
     indexExact: override.indexExact !== undefined ? override.indexExact : testCase.indexExact,

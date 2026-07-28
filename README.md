@@ -403,6 +403,38 @@ codec string for Motion JPEG — there is no `VideoDecoder` to name — so that 
 this library's own marker, and it means exactly "each frame is a whole JPEG
 image".
 
+### MPEG-4 Part 2 (`mp4v`)
+
+MPEG-4 Part 2 is what OpenCV's `VideoWriter` writes by default
+(`VideoWriter_fourcc(*'mp4v')`), so it is what a great deal of scientific
+footage is stored as, whether or not anyone chose it.
+
+The container side is handled: `mp4v` is another sample entry mp4box does not
+recognize, so — exactly as with `jpeg` above — the track arrives filed under
+*metadata* with no dimensions, and the engine reads the entry's own bytes and
+its `esds` descriptor instead of accepting "no video track in file". You get a
+full index: exact per-frame times, byte ranges, keyframe flags, the coded
+dimensions, and `engine.codecString` of the form `mp4v.20.1` (the object type
+indication in hexadecimal, then the profile and level from the stream's own
+sequence header).
+
+**Decoding is another matter, and mostly the answer is no.** No browser's
+WebCodecs implements MPEG-4 Part 2 — it is not in the codec registry and there
+is no `VideoDecoder` to configure — and no Blink or Gecko build decodes it in a
+`<video>` element either (Chromium's demuxer rejects the stream outright). WebKit
+does, through AVFoundation, so **on Safari and iOS these clips play, and the
+index makes them frame-exact**; everywhere else they are refused.
+
+That refusal is the reason to read the container anyway. Knowing the clip is
+`mp4v.20.1` in a well-formed MP4 of *n* frames is what lets the failure say so,
+instead of the flat "not a format we can index" a host used to get for a file
+that indexes perfectly well. If you need these clips to play everywhere,
+re-encode rather than wait for browsers to change their minds:
+
+```
+ffmpeg -i in.mp4 -c:v libx264 -crf 18 out.mp4
+```
+
 ### The index cache
 
 A full-file indexing pass (WebM, fragmented MP4, Ogg) is paid once per clip per
@@ -789,6 +821,12 @@ exactness falsifiable:
   which decodes through the browser's JPEG decoder rather than a `VideoDecoder`
   (see "Motion JPEG" above). Two containers, because the path belongs to
   neither.
+- `counter-mp4v.mp4` is those frames as MPEG-4 Part 2, and the one case whose
+  expectation is inverted: only WebKit decodes this codec, so it asserts a
+  frame-exact walk there and a clean *refusal* on Chromium and Firefox. Both
+  halves matter — the walk proves the rescued `mp4v` sample entry produced a
+  real index, and the refusal proves an undecodable clip fails fast instead of
+  hanging or being played with guessed frame numbers.
 
 **Matroska table** (plain Node) checks the half of that index a browser walk
 cannot see: that every frame's recorded byte range lies inside the file, that no
@@ -800,6 +838,15 @@ pixel walk. It is also where HEVC-in-Matroska is covered at all: Playwright's
 Chromium ships no HEVC decoder and its WebKit fails 8-bit HEVC identically in MP4
 and MKV, so a browser case would pin a property of the test browsers rather than
 of this engine.
+
+**MPEG-4 Part 2 sample entry** (plain Node) pins the other parser a browser walk
+cannot reach past its result: the `mp4v` entry bytes and the `esds` descriptor
+tree inside them, checked against real output from two libavformat versions
+(including the OpenCV file that motivated the path) plus synthetic entries for
+what neither happens to contain — an `ES_Descriptor` carrying its three optional
+fields, a non-video object type that must be *refused* rather than passed on as
+video, and the malformed inputs an untrusted file can present, which must answer
+null rather than throw.
 
 The refusal side — a WebM given no indexing time must be refused with a clear
 error, not approximated — is pinned by **robustness**, and the **index cache**
