@@ -409,7 +409,21 @@ async function load(file) {
     // dead player on screen.
     player.classList.remove('loaded');
     document.body.classList.remove('loaded');
-    setStatus('Could not play this file: ' + error.message, true);
+    // A refusal arrives as an UnplayableClipError: the sentence the engine
+    // composed, plus fields to branch on. This demo shows the sentence, because
+    // it is written to be shown — but it branches on `reason` for the one case
+    // where a host can offer something better than an apology. That split is the
+    // point of the two halves: prose for the person, fields for the program.
+    if (error.reason === 'codec-not-decodable') {
+      setStatus(`Cannot play this ${error.codecName || 'clip'}: `
+        + `${error.message}`, true);
+      console.info('exact-video-engine demo: this clip indexed fine '
+        + `(${error.numFrames} frames, ${error.containerFormat}) and only the codec `
+        + 'is the problem, so a re-encode is the fix rather than a different file.',
+        { codec: error.codec, nativeErrorMessage: error.nativeErrorMessage });
+    } else {
+      setStatus('Could not play this file: ' + error.message, true);
+    }
     return;
   }
 

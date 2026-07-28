@@ -79,6 +79,13 @@ async function run() {
     // message is human-readable, which the driver checks. Record it rather than
     // letting it become an uncaught page error.
     result.error = String(err && err.message || err);
+    // The machine-readable half of the same refusal. A host branches on these
+    // rather than reading the sentence, so they are worth pinning alongside it:
+    // a refusal that arrived with no `reason` would look fine to a human and be
+    // useless to the code that has to decide what to do next.
+    result.errorName = err && err.name;
+    result.errorReason = err && err.reason;
+    result.errorCodec = err && err.codec;
   } finally {
     if (engine && engine.destroy) { try { engine.destroy(); } catch (e) {} }
   }

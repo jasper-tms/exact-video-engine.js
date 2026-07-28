@@ -107,6 +107,124 @@
 // ==================================================================
 
 // ==================================================================
+// unplayable-clip — why a clip could not be played, in a form a host can act on.
+//
+// Every runtime failure in this library already reports itself twice: an
+// 'errormessage' event carries detail.message for a human AND structured fields
+// (fatal, errorName, codec, frame) for the program deciding what to do about it.
+// Load-time failures did not. They threw plain Errors, so a host had the message
+// string and nothing else — and the string was sometimes 'native <video> load
+// failed', which tells nobody anything.
+//
+// That asymmetry mattered most in the case it served worst. When a clip's codec
+// is one this browser cannot decode, `createBestEngine` knows precisely that:
+// which codec, that the container indexed perfectly, how many frames it holds,
+// that WebCodecs rejected it, and that the <video> element then failed too. All
+// of it was thrown away and replaced with five words.
+//
+// So load failures now throw an UnplayableClipError: the same message a host
+// could always show, plus the fields it would otherwise have to parse back out
+// of English. The message is composed from what the ENGINE reasoned — the codec
+// off the index, which tiers were tried — never from the browser's own error
+// text, which is not comparable across engines and is sometimes empty. On the
+// same undecodable file Chromium says 'DEMUXER_ERROR_NO_SUPPORTED_STREAMS',
+// Firefox says nothing usable, and WebKit does not fail at all. What the browser
+// did say is attached as a diagnostic field, to be logged and not parsed.
+//
+// UnplayableClipError extends Error, so `catch (e) { show(e.message) }` keeps
+// working unchanged. The fields are additions, not a migration.
+// ==================================================================
+
+// Why a clip was refused. A closed set, because a host switching on it should be
+// able to know it has covered every case.
+//
+//   'container-not-indexable'   the bytes are not a container we can read a
+//                               per-frame timestamp table out of (or the file is
+//                               damaged, or an indexing budget ran out). No
+//                               engine can be returned; the codec is unknown.
+//   'codec-not-decodable'       the container is fine and the index is complete,
+//                               but no tier in this browser can decode what is
+//                               inside it. This is the one worth telling a user
+//                               about by name: re-encoding fixes it, and nothing
+//                               else will.
+//   'no-fallback-element'       the WebCodecs tier was unavailable or refused,
+//                               and no <video> element was supplied to fall back
+//                               to. A host bug rather than a bad clip.
+//   'no-presented-frame-clock'  the clip must play on the <video> element and
+//                               this browser has no requestVideoFrameCallback,
+//                               so which frame is on screen is unknowable.
+//   'timeline-unmappable'       the element's timeline cannot be mapped to the
+//                               index frame-for-frame on this browser (a trimming
+//                               edit list on Gecko or WebKit), so frame numbers
+//                               would be silently shifted.
+//   'decode-failed'             the container indexed, the codec is one this
+//                               browser can decode, and decoding failed anyway —
+//                               damaged or truncated frame data, most often.
+//                               Deliberately separate from 'codec-not-decodable':
+//                               the two want opposite advice, and guessing wrong
+//                               sends someone to re-encode a file whose codec was
+//                               never the problem.
+const UNPLAYABLE_REASONS = [
+  'container-not-indexable',
+  'codec-not-decodable',
+  'decode-failed',
+  'no-fallback-element',
+  'no-presented-frame-clock',
+  'timeline-unmappable',
+];
+
+class UnplayableClipError extends Error {
+  // `detail` carries whichever of these are known: reason, codec, codecName,
+  // containerFormat, numFrames, triedWebCodecs, webCodecsMessage,
+  // nativeErrorCode, nativeErrorMessage, suggestion. Unknown fields are left
+  // absent rather than set to null, so `'codec' in error` means what it says.
+  constructor(message, detail = {}) {
+    super(message);
+    this.name = 'UnplayableClipError';
+    Object.assign(this, detail);
+  }
+}
+
+// A codec string as a person would name it. Falls back to the string itself,
+// which is better than nothing and never wrong — a codec we have no friendly
+// name for is one whose registered string is the only name it has.
+//
+// Keyed on the four-character code, so `avc1.640028` and `avc1.42E01E` both come
+// back as H.264 without the table having to know every profile.
+const CODEC_NAMES = {
+  avc1: 'H.264', avc3: 'H.264', avc2: 'H.264', avc4: 'H.264',
+  hvc1: 'HEVC (H.265)', hev1: 'HEVC (H.265)',
+  dvh1: 'Dolby Vision', dvhe: 'Dolby Vision', dav1: 'Dolby Vision',
+  vvc1: 'VVC (H.266)', vvi1: 'VVC (H.266)',
+  vp08: 'VP8', vp8: 'VP8', vp09: 'VP9', vp9: 'VP9',
+  av01: 'AV1',
+  mp4v: 'MPEG-4 Part 2',
+  mjpeg: 'Motion JPEG',
+  theora: 'Theora',
+};
+
+function describeCodec(codecString) {
+  if (!codecString) return null;
+  const fourCharacterCode = String(codecString).split('.')[0].toLowerCase();
+  return CODEC_NAMES[fourCharacterCode] || String(codecString);
+}
+
+// Both names in one phrase, for a message a person reads: "MPEG-4 Part 2
+// (mp4v.20.1)". Collapses to one when there is no friendly name to add.
+function namePlusCodecString(codecString) {
+  const name = describeCodec(codecString);
+  if (!name) return 'an unknown codec';
+  return (name === codecString) ? codecString : `${name} (${codecString})`;
+}
+
+// What a host should tell someone holding a clip this browser cannot decode.
+// Re-encoding is the only fix — a browser will not grow a decoder — so the
+// message says so plainly and gives the command rather than gesturing at it.
+function reEncodeSuggestion() {
+  return 'Re-encoding to H.264 will play everywhere: '
+    + 'ffmpeg -i in.mp4 -c:v libx264 -crf 18 out.mp4';
+}
+// ==================================================================
 // decode-support — which (browser engine, codec) pairs WebCodecs lies about.
 //
 // WebCodecs decode support tracks the BROWSER ENGINE, not the device, and its
@@ -5085,13 +5203,23 @@ class VideoEngine extends EventTarget {
       // instead — so the question to ask is whether THAT is available.
       if (isImageFrameCodec(this._decoderConfig.codec)) {
         if (!canDecodeImageFrames()) {
-          throw new Error('this browser cannot decode image frames: '
-            + this._decoderConfig.codec);
+          throw new UnplayableClipError('this browser cannot decode image frames: '
+            + this._decoderConfig.codec,
+            { reason: 'codec-not-decodable', codec: this._decoderConfig.codec,
+              codecRefusedBySupportCheck: true });
         }
       } else {
         const support = await VideoDecoder.isConfigSupported(this._decoderConfig);
         if (!support.supported) {
-          throw new Error('codec not supported: ' + this._decoderConfig.codec);
+          // The decoder's own answer, asked before a byte is decoded: this is
+          // POSITIVE evidence that the codec is the problem, as distinct from a
+          // decode that failed for some other reason (damaged frame bytes, say).
+          // createBestEngine leans on that distinction when the <video> element
+          // then fails too — see describeExhaustedLadder.
+          throw new UnplayableClipError(
+            'codec not supported: ' + this._decoderConfig.codec,
+            { reason: 'codec-not-decodable', codec: this._decoderConfig.codec,
+              codecRefusedBySupportCheck: true });
         }
       }
 
@@ -6011,10 +6139,11 @@ class NativeVideoEngine extends EventTarget {
     // tell us which frame is on screen, and this engine no longer has any inexact
     // mapping to fall back to — so refuse rather than play inexactly.
     if (!this.hasPresentedFrameClock) {
-      throw new Error('NativeVideoEngine: this browser lacks requestVideoFrameCallback, '
+      throw new UnplayableClipError(
+        'NativeVideoEngine: this browser lacks requestVideoFrameCallback, '
         + 'so there is no exact presented-frame clock and no inexact mode to fall back '
         + 'to. Use a current browser (Safari 15.4+, Firefox 132+, or any recent '
-        + 'Chromium).');
+        + 'Chromium).', { reason: 'no-presented-frame-clock' });
     }
     try {
       this._index = options.index || await ContainerIndex.fromSource(source);
@@ -6043,11 +6172,12 @@ class NativeVideoEngine extends EventTarget {
       // decodes the trim itself and plays it frame-exact on Firefox, so the auto
       // ladder still plays these clips there; only the native fallback refuses.
       if (this._index.trimmedByEditList && detectBrowserEngine() === 'gecko') {
-        throw new Error('NativeVideoEngine: this browser (Gecko) presents a clip '
+        throw new UnplayableClipError('NativeVideoEngine: this browser (Gecko) presents a clip '
           + 'with a trimming edit list untrimmed, shifting every frame relative to '
           + 'the container\'s presentation window, so exact frame numbers are '
           + 'impossible on the native path. The clip is refused here rather than '
-          + 'mislabeled; the WebCodecs path plays the trim frame-exact.');
+          + 'mislabeled; the WebCodecs path plays the trim frame-exact.',
+          { reason: 'timeline-unmappable' });
       }
 
       await this._loadElement(source);
@@ -6057,12 +6187,12 @@ class NativeVideoEngine extends EventTarget {
       // shows, which would shift every reported index. Refuse if so — but only
       // after the element's duration has settled (see the race handling inside).
       if (!(await this._indexDescribesElement())) {
-        throw new Error('NativeVideoEngine: the container\'s frame table does not '
+        throw new UnplayableClipError('NativeVideoEngine: the container\'s frame table does not '
           + 'describe what this element presents — the element\'s duration is '
           + 'shorter, the signature of a trimming edit list that cuts frames the '
           + 'decoder still needs but never shows. Reporting frame numbers from the '
           + 'table would shift every index, so the clip is refused rather than '
-          + 'played with wrong frame numbers.');
+          + 'played with wrong frame numbers.', { reason: 'timeline-unmappable' });
       }
 
       await this._calibrateTimeOffset();
@@ -6074,11 +6204,11 @@ class NativeVideoEngine extends EventTarget {
       // (Chromium keeps currentTime and duration on the same timeline, so this
       // never fires there and its trimmed clips play fine.)
       if (!this._calibratedTimelineReachable()) {
-        throw new Error('NativeVideoEngine: the calibrated container timeline runs '
+        throw new UnplayableClipError('NativeVideoEngine: the calibrated container timeline runs '
           + 'past what this element will seek to (an edit-list clip whose currentTime '
           + 'and duration disagree, seen on WebKit), so its late frames are '
           + 'unreachable. The clip is refused rather than played with frame numbers '
-          + 'the element cannot reach.');
+          + 'the element cannot reach.', { reason: 'timeline-unmappable' });
       }
 
       this.ready = true;
@@ -6123,14 +6253,42 @@ class NativeVideoEngine extends EventTarget {
         this.video.loop = this._loop;
         resolve();
       };
-      const onError = () => { cleanup(); reject(new Error('native <video> load failed')); };
+      // The element's own error, kept rather than discarded. It is not worth
+      // showing a user — Chromium's is a pipeline status string, Gecko's is
+      // frequently empty, and neither is comparable with the other — but it is
+      // exactly what someone reading a bug report wants, so it rides along as a
+      // diagnostic field while createBestEngine composes the message a person
+      // actually reads out of what the ENGINE knows.
+      //
+      // The reason is the CONSERVATIVE one. An element error says the clip did
+      // not load; it does not say why, and the two candidates want opposite
+      // advice. An undecodable codec and a file with its frame bytes truncated
+      // away both land here, on the same MediaError code — so claiming the codec
+      // here would tell someone holding a damaged H.264 file to re-encode it to
+      // H.264. createBestEngine upgrades this to 'codec-not-decodable' only when
+      // it has positive evidence, which is a decoder support check saying no.
+      const onError = () => {
+        const mediaError = this.video.error;
+        cleanup();
+        reject(new UnplayableClipError('native <video> load failed', {
+          reason: 'decode-failed',
+          codec: this.codecString || undefined,
+          nativeErrorCode: mediaError ? mediaError.code : undefined,
+          nativeErrorMessage: (mediaError && mediaError.message) || undefined,
+        }));
+      };
       const onStalled = () => {
         const readyState = this.video.readyState;
         cleanup();
-        reject(new Error('NativeVideoEngine: this browser loaded the clip\'s metadata '
+        reject(new UnplayableClipError(
+          'NativeVideoEngine: this browser loaded the clip\'s metadata '
           + `but never presented a frame (readyState ${readyState}), and reported no `
           + 'error — the signature of a container it can demux carrying a codec it '
-          + 'cannot decode. The clip is refused rather than left loading forever.'));
+          + 'cannot decode. The clip is refused rather than left loading forever.', {
+            reason: 'codec-not-decodable',
+            codec: this.codecString || undefined,
+            nativeErrorCode: undefined,   // the element reported none; that is the tell
+          }));
       };
       const armStallTimer = () => {
         clearTimeout(timer);
@@ -6513,7 +6671,10 @@ async function createBestEngine(source, options = {}) {
     if (indexBuildError && indexBuildError.message) {
       message += ` (underlying error: ${indexBuildError.message})`;
     }
-    throw new Error(message);
+    throw new UnplayableClipError(message, {
+      reason: 'container-not-indexable',
+      indexBuildMessage: indexBuildError ? indexBuildError.message : undefined,
+    });
   }
 
   // Proactively route away from WebCodecs for combinations it is known to
@@ -6540,8 +6701,22 @@ async function createBestEngine(source, options = {}) {
   const decoderIsAvailable = isImageFrameCodec(codec)
     ? canDecodeImageFrames() : typeof VideoDecoder !== 'undefined';
 
+  // Why the WebCodecs tier did not take the clip, kept for the refusal below.
+  // If the <video> element then fails too, this is half the story of why the
+  // clip is unplayable, and it used to go only to the console — leaving the
+  // thrown error to report the element's failure as if WebCodecs had never been
+  // asked. A host cannot tell "this browser lacks a decoder for this codec" from
+  // "this file is broken" without both halves.
+  let webCodecsMessage;
+  let webCodecsWasTried = false;
+  // Whether that failure was the decoder's own support check saying no, as
+  // opposed to a decode that started and went wrong. Only the former is evidence
+  // about the CODEC; see describeExhaustedLadder.
+  let codecRefusedBySupportCheck = false;
+
   if (prefer !== 'native' && !webCodecsUnreliable
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
+    webCodecsWasTried = true;
     const engine = new VideoEngine(canvas, { windowAhead, imageSmoothingEnabled });
     try {
       await engine.load(source, { index });
@@ -6551,6 +6726,8 @@ async function createBestEngine(source, options = {}) {
       // profile, or a browser with a partial WebCodecs). The element may well
       // play it natively, and we keep the exact index either way.
       engine.destroy();
+      webCodecsMessage = err && err.message;
+      codecRefusedBySupportCheck = !!(err && err.codecRefusedBySupportCheck);
       console.warn('exact-video-engine: WebCodecs could not play this clip; '
         + 'falling back to the native <video> element.', err);
       // The <video> element plays the whole clip regardless of how far the index
@@ -6566,7 +6743,16 @@ async function createBestEngine(source, options = {}) {
   }
 
   if (!video) {
-    throw new Error('createBestEngine: no <video> element supplied to fall back to');
+    throw new UnplayableClipError(
+      'createBestEngine: no <video> element supplied to fall back to', {
+        reason: 'no-fallback-element',
+        codec: codec || undefined,
+        codecName: describeCodec(codec) || undefined,
+        containerFormat: index.containerFormat,
+        numFrames: index.numFrames,
+        triedWebCodecs: webCodecsWasTried,
+        webCodecsMessage,
+      });
   }
 
   // The native <video> path reads which frame is on screen out of
@@ -6580,13 +6766,115 @@ async function createBestEngine(source, options = {}) {
   // owns its own clock and needs no requestVideoFrameCallback, so it is never
   // gated on it.
   if (!('requestVideoFrameCallback' in video)) {
-    throw new Error('createBestEngine: this browser lacks requestVideoFrameCallback, '
+    throw new UnplayableClipError(
+      'createBestEngine: this browser lacks requestVideoFrameCallback, '
       + 'which the exact native <video> path requires to know which frame is on '
       + 'screen. Please use a current browser (Safari 15.4+, Firefox 132+, or any '
-      + 'recent Chromium).');
+      + 'recent Chromium).', {
+        reason: 'no-presented-frame-clock',
+        codec: codec || undefined,
+        codecName: describeCodec(codec) || undefined,
+        containerFormat: index.containerFormat,
+        numFrames: index.numFrames,
+      });
   }
 
   const engine = new NativeVideoEngine(video);
-  await engine.load(source, { index });
+  try {
+    await engine.load(source, { index });
+  } catch (nativeError) {
+    throw await describeExhaustedLadder(nativeError, {
+      index, codec, webCodecsWasTried, webCodecsMessage, codecRefusedBySupportCheck,
+    });
+  }
   return engine;
+}
+
+// Is this codec one WebCodecs will not decode here? Asked only on the failure
+// path, and only when the ladder has not already found out — the WebCodecs tier
+// answers this on its way past, but `prefer: 'native'` and a host with no canvas
+// both skip it, and a refusal should not be less informative for those callers.
+// A browser with no VideoDecoder at all cannot answer, which is honestly
+// "unknown" rather than "supported".
+async function webCodecsRejectsCodec(decoderConfig) {
+  if (!decoderConfig || typeof VideoDecoder === 'undefined') return false;
+  try {
+    const support = await VideoDecoder.isConfigSupported(decoderConfig);
+    return support.supported !== true;
+  } catch {
+    return false;   // a config it could not even evaluate proves nothing
+  }
+}
+
+// The last tier has failed, so the clip will not play here at all. This is the
+// only point that knows the WHOLE ladder — what the codec is, that the container
+// indexed cleanly, whether WebCodecs was asked and what it said, and what the
+// element then did — and it is the message a host shows, so it is worth
+// composing properly rather than passing the last failure through.
+//
+// The message is built from what we reasoned, not from the browser's error
+// text: that text is not comparable across engines and is often empty. What the
+// browser said travels as a field instead.
+async function describeExhaustedLadder(nativeError, context) {
+  const { index, codec, webCodecsWasTried, webCodecsMessage } = context;
+  const detail = {
+    reason: (nativeError && nativeError.reason) || 'decode-failed',
+    codec: codec || undefined,
+    codecName: describeCodec(codec) || undefined,
+    containerFormat: index.containerFormat,
+    numFrames: index.numFrames,
+    triedWebCodecs: webCodecsWasTried,
+    webCodecsMessage,
+    nativeErrorCode: nativeError ? nativeError.nativeErrorCode : undefined,
+    nativeErrorMessage: nativeError ? nativeError.nativeErrorMessage : undefined,
+  };
+
+  // A refusal about the TIMELINE keeps its own explanation: the browser decodes
+  // the clip perfectly well, and pointing at the codec would send someone
+  // somewhere useless.
+  if (detail.reason === 'timeline-unmappable'
+      || detail.reason === 'no-presented-frame-clock') {
+    return new UnplayableClipError(nativeError.message, detail);
+  }
+
+  // Is the CODEC the problem, or merely the clip? Both arrive here as "the
+  // element failed to load", and the two want opposite advice — re-encode, or
+  // go find an intact copy of the file. So blame the codec only on positive
+  // evidence: a decoder support check that said no. The WebCodecs tier
+  // establishes that on its way past when it ran; ask directly when it did not.
+  const codecIsTheProblem = context.codecRefusedBySupportCheck
+    || (nativeError && nativeError.reason === 'codec-not-decodable')
+    || await webCodecsRejectsCodec(index.decoderConfig);
+
+  if (!codecIsTheProblem) {
+    // The honest version of "we do not know why". Everything observed is named,
+    // nothing is diagnosed, and no re-encode is suggested for a file whose codec
+    // was never in question.
+    detail.reason = 'decode-failed';
+    let message = 'createBestEngine: this clip indexed cleanly as '
+      + `${index.containerFormat} with ${index.numFrames} frames`
+      + `${codec ? ` of ${namePlusCodecString(codec)}` : ''}, and then would not `
+      + 'play. The codec is one this browser can decode, so the frame data itself '
+      + 'is the suspect — a truncated or damaged file most often.';
+    if (detail.nativeErrorMessage) {
+      message += ` The <video> element reported: ${detail.nativeErrorMessage}`;
+    }
+    return new UnplayableClipError(message, detail);
+  }
+
+  // The codec case, which is the one worth spelling out. Naming the frame count
+  // is not decoration: it is the evidence that the container was read fine and
+  // the codec alone is the problem.
+  detail.reason = 'codec-not-decodable';
+  let message = 'createBestEngine: this clip cannot be played in this browser. '
+    + `Its codec, ${namePlusCodecString(codec)}, is not one this browser can decode`;
+  message += webCodecsWasTried
+    ? ' — WebCodecs rejected it and the <video> element could not play it either.'
+    : ' — a decoder support check rejects it, and the <video> element could not '
+      + 'play it either.';
+  message += ` The container itself is fine: it indexed cleanly as ${index.containerFormat}`
+    + ` with ${index.numFrames} frames, so nothing is wrong with the file. `
+    + reEncodeSuggestion();
+  detail.suggestion = reEncodeSuggestion();
+  return new UnplayableClipError(message, detail);
 }

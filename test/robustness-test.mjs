@@ -80,7 +80,14 @@ const CASES = [
   {
     name: 'WebM with no indexing time is refused, not approximated',
     file: 'counter-cfr.webm', mode: 'auto', indexTimeoutMilliseconds: 0,
-    expect: { refused: true, errorMatches: /index/i },
+    expect: {
+      refused: true, errorMatches: /index/i,
+      // The refusal must arrive machine-readable as well as readable. A host
+      // deciding whether to offer a re-encode, a retry, or nothing at all reads
+      // this rather than the sentence — and a sentence is free to be reworded,
+      // which is exactly why the pin belongs on the field.
+      reason: 'container-not-indexable', errorName: 'UnplayableClipError',
+    },
   },
 
   // --- Soft failure on malformed input -------------------------------------
@@ -101,7 +108,18 @@ const CASES = [
   { name: 'EBML magic then garbage', file: 'corrupt-ebml-magic-then-garbage.webm', mode: 'auto', expect: { soft: true } },
   // Intact front moov, truncated mdat: the index parses cleanly but the frame
   // bytes are past end-of-file, so decoding fails and the load rejects.
-  { name: 'MP4 with intact moov, truncated mdat', file: 'corrupt-mp4-truncated-mdat.mp4', mode: 'auto', expect: { soft: true } },
+  // The codec here (H.264) is one every browser decodes; only the frame bytes
+  // are missing. So the refusal must NOT diagnose the codec, and must not tell
+  // anyone to re-encode an H.264 file to H.264 — see the errorDoesNotMatch note
+  // in the checker.
+  {
+    name: 'MP4 with intact moov, truncated mdat', file: 'corrupt-mp4-truncated-mdat.mp4',
+    mode: 'auto',
+    expect: {
+      soft: true, errorName: 'UnplayableClipError', reason: 'decode-failed',
+      errorDoesNotMatch: /re-encod|not one this browser can decode/i,
+    },
+  },
   // Pure noise, no container magic: nothing to index and nothing the element can
   // play, so the load rejects with a human-readable message.
   { name: 'pure garbage, no magic', file: 'corrupt-pure-garbage.bin', mode: 'auto', expect: { soft: true } },
@@ -165,6 +183,24 @@ for (const { name, file, mode, indexTimeoutMilliseconds, expect } of CASES) {
   if (settled && !err && !result) problems.push('settled but produced no result');
 
   if (result) {
+    // The machine-readable half of a refusal, checked for any case that pins it.
+    // A host branches on these rather than reading the sentence, so a refusal
+    // that arrived without them is a refusal only a human can use.
+    if (expect.errorName && result.errorName !== expect.errorName) {
+      problems.push(`error name "${result.errorName}", wanted "${expect.errorName}"`);
+    }
+    if (expect.reason && result.errorReason !== expect.reason) {
+      problems.push(`error reason "${result.errorReason}", wanted "${expect.reason}"`);
+    }
+    // A message that must NOT say something. This exists because of a real bug:
+    // the first version of the composed refusal blamed the codec for every
+    // failed load, so a truncated H.264 file was reported as undecodable H.264
+    // and the advice was to re-encode it to H.264. Both halves were wrong and
+    // the sentence read perfectly well, which is exactly why it needs a pin.
+    if (expect.errorDoesNotMatch && typeof result.error === 'string'
+        && expect.errorDoesNotMatch.test(result.error)) {
+      problems.push(`error "${result.error}" must not match ${expect.errorDoesNotMatch}`);
+    }
     if (expect.refused) {
       // The engine must have rejected the load with a human-readable error —
       // never a hang, never a playable engine with guessed frame numbers.

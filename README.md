@@ -114,6 +114,46 @@ show — rather than play a clip it would have to guess about:
   scan never saw). Caught at load by comparing durations and calibrating the
   timeline, and refused rather than played with shifted numbers.
 
+Every one of those refusals throws an **`UnplayableClipError`**: an `Error` (so
+`catch (error) { show(error.message) }` keeps working unchanged) carrying the
+fields a host would otherwise have to parse back out of English.
+
+```js
+try {
+  engine = await createBestEngine(file, { canvas, video });
+} catch (error) {
+  if (error.reason === 'codec-not-decodable') {
+    offerReEncode(error.codecName, error.suggestion);   // "MPEG-4 Part 2", an ffmpeg line
+  } else {
+    show(error.message);
+  }
+}
+```
+
+`reason` is one of `UNPLAYABLE_REASONS`: `container-not-indexable`,
+`codec-not-decodable`, `no-fallback-element`, `no-presented-frame-clock`,
+`timeline-unmappable`. Alongside it, whichever are known: `codec`, `codecName`
+(`describeCodec()` is exported separately for a host writing its own wording),
+`containerFormat`, `numFrames`, `triedWebCodecs`, `webCodecsMessage`,
+`nativeErrorCode`, `nativeErrorMessage`, and `suggestion`. A field that is not
+known is absent rather than null, so `'codec' in error` means what it says.
+
+Two things about how the message is built. It is composed in `createBestEngine`,
+because that is the only place that knows the *whole* ladder — a clip whose
+codec WebCodecs rejected **and** whose `<video>` element then failed is a
+different thing from either half, and it used to be reported as only the second
+one. And it is composed from what the engine reasoned, never from the browser's
+own error text: on one undecodable file Chromium says
+`DEMUXER_ERROR_NO_SUPPORTED_STREAMS`, Firefox says something structurally
+different, and WebKit does not fail at all. What the browser said travels as
+`nativeErrorMessage`, to be logged rather than shown or parsed. So the same file
+produces the same sentence everywhere:
+
+> Its codec, MPEG-4 Part 2 (`mp4v.20.1`), is not one this browser can decode —
+> WebCodecs rejected it and the `<video>` element could not play it either. The
+> container itself is fine: it indexed cleanly as isobmff with 200 frames, so
+> nothing is wrong with the file.
+
 The same honesty applies after load: each frame the element presents during
 playback is checked against the table, and if they sustainedly disagree the
 engine latches `failed`, flips `frameIndexIsExact` to false, and emits a fatal
@@ -848,8 +888,18 @@ fields, a non-video object type that must be *refused* rather than passed on as
 video, and the malformed inputs an untrusted file can present, which must answer
 null rather than throw.
 
+**Unplayable clip** (plain Node) pins the refusal surface itself: that an
+`UnplayableClipError` is still an `Error` and still carries its message, so the
+fields are an addition and not a migration; that every `reason` string thrown
+anywhere in `src/` appears in the exported `UNPLAYABLE_REASONS` (it greps the
+sources rather than trusting the list to have been maintained); and that codec
+naming survives the profile suffixes real files carry, `avc1.42E01E` and
+`avc3.64001f` alike.
+
 The refusal side — a WebM given no indexing time must be refused with a clear
-error, not approximated — is pinned by **robustness**, and the **index cache**
+error, not approximated — is pinned by **robustness**, which now also asserts
+the refusal arrived machine-readable (`errorName`, `reason`) and not merely
+readable, and the **index cache**
 test pins that a cache hit returns identical tables while any doubtful identity
 (changed `lastModified`, an identity-less `Blob`, a wrong schema version) is a
 miss and a rebuild.

@@ -1,5 +1,6 @@
 import { ContainerIndex } from './container-index.js';
 import { detectBrowserEngine } from './decode-support.js';
+import { UnplayableClipError } from './unplayable-clip.js';
 
 // ==================================================================
 // NativeVideoEngine — a <video> element behind the same surface as VideoEngine.
@@ -264,10 +265,11 @@ export class NativeVideoEngine extends EventTarget {
     // tell us which frame is on screen, and this engine no longer has any inexact
     // mapping to fall back to — so refuse rather than play inexactly.
     if (!this.hasPresentedFrameClock) {
-      throw new Error('NativeVideoEngine: this browser lacks requestVideoFrameCallback, '
+      throw new UnplayableClipError(
+        'NativeVideoEngine: this browser lacks requestVideoFrameCallback, '
         + 'so there is no exact presented-frame clock and no inexact mode to fall back '
         + 'to. Use a current browser (Safari 15.4+, Firefox 132+, or any recent '
-        + 'Chromium).');
+        + 'Chromium).', { reason: 'no-presented-frame-clock' });
     }
     try {
       this._index = options.index || await ContainerIndex.fromSource(source);
@@ -296,11 +298,12 @@ export class NativeVideoEngine extends EventTarget {
       // decodes the trim itself and plays it frame-exact on Firefox, so the auto
       // ladder still plays these clips there; only the native fallback refuses.
       if (this._index.trimmedByEditList && detectBrowserEngine() === 'gecko') {
-        throw new Error('NativeVideoEngine: this browser (Gecko) presents a clip '
+        throw new UnplayableClipError('NativeVideoEngine: this browser (Gecko) presents a clip '
           + 'with a trimming edit list untrimmed, shifting every frame relative to '
           + 'the container\'s presentation window, so exact frame numbers are '
           + 'impossible on the native path. The clip is refused here rather than '
-          + 'mislabeled; the WebCodecs path plays the trim frame-exact.');
+          + 'mislabeled; the WebCodecs path plays the trim frame-exact.',
+          { reason: 'timeline-unmappable' });
       }
 
       await this._loadElement(source);
@@ -310,12 +313,12 @@ export class NativeVideoEngine extends EventTarget {
       // shows, which would shift every reported index. Refuse if so — but only
       // after the element's duration has settled (see the race handling inside).
       if (!(await this._indexDescribesElement())) {
-        throw new Error('NativeVideoEngine: the container\'s frame table does not '
+        throw new UnplayableClipError('NativeVideoEngine: the container\'s frame table does not '
           + 'describe what this element presents — the element\'s duration is '
           + 'shorter, the signature of a trimming edit list that cuts frames the '
           + 'decoder still needs but never shows. Reporting frame numbers from the '
           + 'table would shift every index, so the clip is refused rather than '
-          + 'played with wrong frame numbers.');
+          + 'played with wrong frame numbers.', { reason: 'timeline-unmappable' });
       }
 
       await this._calibrateTimeOffset();
@@ -327,11 +330,11 @@ export class NativeVideoEngine extends EventTarget {
       // (Chromium keeps currentTime and duration on the same timeline, so this
       // never fires there and its trimmed clips play fine.)
       if (!this._calibratedTimelineReachable()) {
-        throw new Error('NativeVideoEngine: the calibrated container timeline runs '
+        throw new UnplayableClipError('NativeVideoEngine: the calibrated container timeline runs '
           + 'past what this element will seek to (an edit-list clip whose currentTime '
           + 'and duration disagree, seen on WebKit), so its late frames are '
           + 'unreachable. The clip is refused rather than played with frame numbers '
-          + 'the element cannot reach.');
+          + 'the element cannot reach.', { reason: 'timeline-unmappable' });
       }
 
       this.ready = true;
@@ -376,14 +379,42 @@ export class NativeVideoEngine extends EventTarget {
         this.video.loop = this._loop;
         resolve();
       };
-      const onError = () => { cleanup(); reject(new Error('native <video> load failed')); };
+      // The element's own error, kept rather than discarded. It is not worth
+      // showing a user — Chromium's is a pipeline status string, Gecko's is
+      // frequently empty, and neither is comparable with the other — but it is
+      // exactly what someone reading a bug report wants, so it rides along as a
+      // diagnostic field while createBestEngine composes the message a person
+      // actually reads out of what the ENGINE knows.
+      //
+      // The reason is the CONSERVATIVE one. An element error says the clip did
+      // not load; it does not say why, and the two candidates want opposite
+      // advice. An undecodable codec and a file with its frame bytes truncated
+      // away both land here, on the same MediaError code — so claiming the codec
+      // here would tell someone holding a damaged H.264 file to re-encode it to
+      // H.264. createBestEngine upgrades this to 'codec-not-decodable' only when
+      // it has positive evidence, which is a decoder support check saying no.
+      const onError = () => {
+        const mediaError = this.video.error;
+        cleanup();
+        reject(new UnplayableClipError('native <video> load failed', {
+          reason: 'decode-failed',
+          codec: this.codecString || undefined,
+          nativeErrorCode: mediaError ? mediaError.code : undefined,
+          nativeErrorMessage: (mediaError && mediaError.message) || undefined,
+        }));
+      };
       const onStalled = () => {
         const readyState = this.video.readyState;
         cleanup();
-        reject(new Error('NativeVideoEngine: this browser loaded the clip\'s metadata '
+        reject(new UnplayableClipError(
+          'NativeVideoEngine: this browser loaded the clip\'s metadata '
           + `but never presented a frame (readyState ${readyState}), and reported no `
           + 'error — the signature of a container it can demux carrying a codec it '
-          + 'cannot decode. The clip is refused rather than left loading forever.'));
+          + 'cannot decode. The clip is refused rather than left loading forever.', {
+            reason: 'codec-not-decodable',
+            codec: this.codecString || undefined,
+            nativeErrorCode: undefined,   // the element reported none; that is the tell
+          }));
       };
       const armStallTimer = () => {
         clearTimeout(timer);

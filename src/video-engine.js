@@ -2,6 +2,7 @@ import { ContainerIndex } from './container-index.js';
 import { convertAnnexBToAvcc } from './avi.js';
 import { beginPriorityRead, endPriorityRead } from './read-priority-gate.js';
 import { ImageFrameDecoder, isImageFrameCodec, canDecodeImageFrames } from './image-frame-decoder.js';
+import { UnplayableClipError } from './unplayable-clip.js';
 
 // Frames the cache holds beyond the read-ahead window's far edge. Decoded
 // frames arrive a little past the target while the playhead is still catching
@@ -245,13 +246,23 @@ export class VideoEngine extends EventTarget {
       // instead — so the question to ask is whether THAT is available.
       if (isImageFrameCodec(this._decoderConfig.codec)) {
         if (!canDecodeImageFrames()) {
-          throw new Error('this browser cannot decode image frames: '
-            + this._decoderConfig.codec);
+          throw new UnplayableClipError('this browser cannot decode image frames: '
+            + this._decoderConfig.codec,
+            { reason: 'codec-not-decodable', codec: this._decoderConfig.codec,
+              codecRefusedBySupportCheck: true });
         }
       } else {
         const support = await VideoDecoder.isConfigSupported(this._decoderConfig);
         if (!support.supported) {
-          throw new Error('codec not supported: ' + this._decoderConfig.codec);
+          // The decoder's own answer, asked before a byte is decoded: this is
+          // POSITIVE evidence that the codec is the problem, as distinct from a
+          // decode that failed for some other reason (damaged frame bytes, say).
+          // createBestEngine leans on that distinction when the <video> element
+          // then fails too — see describeExhaustedLadder.
+          throw new UnplayableClipError(
+            'codec not supported: ' + this._decoderConfig.codec,
+            { reason: 'codec-not-decodable', codec: this._decoderConfig.codec,
+              codecRefusedBySupportCheck: true });
         }
       }
 

@@ -30,6 +30,7 @@ const repositoryRoot = dirname(fileURLToPath(import.meta.url));
 // before it), and header.js is the file-level design commentary.
 const MODULE_ORDER = [
   'src/header.js',
+  'src/unplayable-clip.js',
   'src/decode-support.js',
   'src/range-readers.js',
   'src/read-priority-gate.js',

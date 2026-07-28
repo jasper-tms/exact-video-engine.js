@@ -53,3 +53,10 @@ export {
 // What `engine.codecString` reads for a clip whose frames are whole JPEG images.
 // WebCodecs registers no codec string for Motion JPEG, so this marker is ours.
 export { MOTION_JPEG_CODEC } from './src/image-frame-decoder.js';
+
+// Why a clip could not be played, in a form a host can branch on rather than
+// regular-expression out of a sentence. `createBestEngine` throws an
+// UnplayableClipError for every load-time refusal; `reason` is one of
+// UNPLAYABLE_REASONS. describeCodec turns a codec string into a name a person
+// recognizes, for a host writing its own message instead of showing ours.
+export { UnplayableClipError, UNPLAYABLE_REASONS, describeCodec } from './src/unplayable-clip.js';
