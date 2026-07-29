@@ -31,7 +31,7 @@ git diff --cached --name-only | grep -qx VERSION || exit 0
 
 cd "$(git rev-parse --show-toplevel)"
 
-PINNED_FILES=(demo.html README.md package.json)
+PINNED_FILES=(demo.html README.md agent-skills/user-guide/SKILL.md package.json)
 
 # sync_version.sh reads VERSION off disk, but `git commit` is free to be
 # committing something other than what is on disk. Rather than derive the pins

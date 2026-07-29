@@ -17,7 +17,7 @@
 // WebCodecs). No crash, no flash, and the container index still makes the native
 // path frame-exact.
 //
-// The matrix here is empirical (real-device testing; see the decode-support-matrix
+// The matrix here is empirical (real-device testing; see the video-format-support-per-browser
 // agent skill). It is deliberately TIGHT — a false positive needlessly gives up
 // the WebCodecs owned-clock path — so it names only combinations confirmed to
 // crash, and the reactive net still backs up anything it misses.

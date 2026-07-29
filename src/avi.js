@@ -563,7 +563,7 @@ function isMotionJpegFourCc(fourCc) {
 // units with start codes, SPS/PPS carried in-band on each keyframe). We do NOT
 // feed WebCodecs that Annex B directly: WebKit's decoder answers isConfigSupported
 // = true for an Annex-B (no-description) config and then FAILS the actual decode —
-// a dishonest yes (see the decode-support-matrix skill). So we configure the
+// a dishonest yes (see the video-format-support-per-browser skill). So we configure the
 // decoder in length-prefixed AVCC mode instead — the format every engine decodes,
 // WebKit included — by building an `avcC` description from the first keyframe's
 // SPS and PPS, and the caller converts each frame's Annex B to AVCC before feeding

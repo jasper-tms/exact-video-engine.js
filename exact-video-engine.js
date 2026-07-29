@@ -243,7 +243,7 @@ function reEncodeSuggestion() {
 // WebCodecs). No crash, no flash, and the container index still makes the native
 // path frame-exact.
 //
-// The matrix here is empirical (real-device testing; see the decode-support-matrix
+// The matrix here is empirical (real-device testing; see the video-format-support-per-browser
 // agent skill). It is deliberately TIGHT — a false positive needlessly gives up
 // the WebCodecs owned-clock path — so it names only combinations confirmed to
 // crash, and the reactive net still backs up anything it misses.
@@ -3488,7 +3488,7 @@ function isMotionJpegFourCc(fourCc) {
 // units with start codes, SPS/PPS carried in-band on each keyframe). We do NOT
 // feed WebCodecs that Annex B directly: WebKit's decoder answers isConfigSupported
 // = true for an Annex-B (no-description) config and then FAILS the actual decode —
-// a dishonest yes (see the decode-support-matrix skill). So we configure the
+// a dishonest yes (see the video-format-support-per-browser skill). So we configure the
 // decoder in length-prefixed AVCC mode instead — the format every engine decodes,
 // WebKit included — by building an `avcC` description from the first keyframe's
 // SPS and PPS, and the caller converts each frame's Annex B to AVCC before feeding
@@ -4711,7 +4711,7 @@ class ContainerIndex extends EventTarget {
     // from the first keyframe's SPS/PPS, and the samples (Annex B in the file) are
     // converted to AVCC in the decode path. WebKit's WebCodecs claims to support
     // Annex-B-no-description and then fails the decode, so AVCC is the only path
-    // that works on every engine (see src/avi.js and the decode-support-matrix
+    // that works on every engine (see src/avi.js and the video-format-support-per-browser
     // skill).
     if (table.decoderConfig.description !== undefined) {
       this.decoderConfig.description = table.decoderConfig.description;

@@ -1,5 +1,5 @@
 ---
-name: decode-support-matrix
+name: video-format-support-per-browser
 description: MUST load before diagnosing any exact-video-engine.js playback or decode failure — especially a clip that plays on desktop but fails on iPhone with a mid-playback "Decoder failure" — or any question about which codecs each backend (WebCodecs vs native <video>) can decode. Answer from the tested matrix here, not from code inspection.
 ---
 

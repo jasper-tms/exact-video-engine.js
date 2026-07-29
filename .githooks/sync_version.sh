@@ -40,7 +40,7 @@ fi
 # threw out of load()", which is a statement about history and must not be
 # rewritten to name the current release.
 PIN='exact-video-engine\.js@v[0-9]+\.[0-9]+\.[0-9]+/'
-FILES=(demo.html README.md)
+FILES=(demo.html README.md agent-skills/user-guide/SKILL.md)
 
 stale_files=0
 for file in "${FILES[@]}"; do

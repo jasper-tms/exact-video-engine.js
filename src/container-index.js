@@ -1094,7 +1094,7 @@ export class ContainerIndex extends EventTarget {
     // from the first keyframe's SPS/PPS, and the samples (Annex B in the file) are
     // converted to AVCC in the decode path. WebKit's WebCodecs claims to support
     // Annex-B-no-description and then fails the decode, so AVCC is the only path
-    // that works on every engine (see src/avi.js and the decode-support-matrix
+    // that works on every engine (see src/avi.js and the video-format-support-per-browser
     // skill).
     if (table.decoderConfig.description !== undefined) {
       this.decoderConfig.description = table.decoderConfig.description;
