@@ -27,7 +27,7 @@ with a clear error.** There is no approximate mode.
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch (jsDelivr caches
      branch refs for hours, so @main changes behavior unpredictably). -->
-<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.4.0/exact-video-engine.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.5.0/exact-video-engine.js"></script>
 ```
 
 `exact-video-engine.js` is a classic script: it defines globals
