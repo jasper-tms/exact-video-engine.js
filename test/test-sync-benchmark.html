@@ -1,0 +1,230 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine multi-engine sync benchmark</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<!--
+  Measures whether several engines, all driven forward one frame per tick by a
+  single master clock in the host (never engine.play()), can present a
+  frame-exact composite in real time. This is the feasibility test for exact
+  synchronized multi-video playback in the annotator, where every follower is
+  seeked to match the primary and the canvas must only show a frame once EVERY
+  engine has that frame decoded.
+
+  Two measurements, plus an exactness check:
+
+    A. "as-fast-as-exact" — advance the composite frame only once every engine's
+       presentedFrame has reached its target. Reports the composite frame rate
+       the barrier sustains (capped by requestAnimationFrame at ~60/s) and how
+       many ticks each frame took. If this stays at or above the clip's native
+       rate, real-time playback is achievable with headroom.
+
+    B. "real-time" — advance the target by wall-clock time at the native rate,
+       the drop-frames-to-keep-real-time mode. Counts ticks where the composite
+       was NOT all-ready (a hold) and target frames that were never shown
+       all-ready before the clock moved on (a dropped frame).
+
+    Exactness — on the counter clips (a white bar names each frame), reads back
+    every engine's canvas at sampled composite frames and asserts the pixels
+    show exactly the target frame, proving the barrier composites the correct
+    frame from every engine at once.
+-->
+<div id="engines" style="display: flex; flex-wrap: wrap; gap: 4px"></div>
+<script>
+// The counter clips are 150px wide with a 5px white bar per frame (30 bars), so
+// the bar's horizontal centre names the frame. Same trick as test-display.html.
+const BARS_ACROSS = 30;
+function visibleFrame(context, width, height) {
+  const row = context.getImageData(0, Math.floor(height * 3 / 4), width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < width; x++) {
+    if (row[x * 4] > 128) { sum += x; count += 1; }
+  }
+  if (!count) return -1;
+  return Math.floor((sum / count) / (width / BARS_ACROSS));
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const file = params.get('file') || 'counter-cfr.mp4';
+  const engineCount = Number(params.get('engines') || 2);
+  // Each engine trails the previous by this many frames, so the engines sit at
+  // different points in their own GOPs rather than all decoding in lockstep —
+  // the realistic follower case, and a fairer stress on independent caches.
+  const stagger = Number(params.get('stagger') || 7);
+  const forwardStepsTarget = Number(params.get('steps') || 300);
+  const isCounterClip = file.startsWith('counter-');
+
+  const enginesContainer = document.getElementById('engines');
+  const engines = [];
+  for (let index = 0; index < engineCount; index++) {
+    const pane = document.createElement('div');
+    // The engine sizes its canvas backing store from the parent, so the parent
+    // must have a real size (as test-presented-frame.html's pane does) or the
+    // canvas is zero-sized: nothing presents and _syncCanvasSize redraws a
+    // detached bitmap. A fixed present size is fine — decode dominates the cost.
+    // The counter clips (150x90) get an exact integer 2x pane so the readback of
+    // their frame-marker bar is crisp; a non-integer scale blurs the bar and
+    // shifts the centroid by a frame. Native-size clips get a fixed present box.
+    pane.style.width = isCounterClip ? '300px' : '480px';
+    pane.style.height = isCounterClip ? '180px' : '270px';
+    const canvas = document.createElement('canvas');
+    const video = document.createElement('video');
+    video.muted = true; video.playsInline = true;
+    pane.appendChild(canvas); pane.appendChild(video);
+    enginesContainer.appendChild(pane);
+    // A separate byte source per engine, matching the annotator (each video is
+    // its own File/Blob with its own reader), rather than a shared reader.
+    const source = await fetch('clips/' + file).then((response) => response.blob());
+    // Nearest-neighbour present so the counter bar stays crisp for readback,
+    // matching how the annotator reads video pixels (integers at pixel corners).
+    const engine = await createBestEngine(source,
+      { canvas, video, prefer: 'webcodecs', imageSmoothingEnabled: false });
+    engines.push(engine);
+  }
+
+  const tier = engines[0].tier;
+  const numFrames = engines[0].numFrames;
+  const width = engines[0].videoWidth;
+  const height = engines[0].videoHeight;
+  const fps = Math.max(1, Math.round(numFrames / engines[0].duration));
+
+  // The composite frame ranges over [0, topFrame]; every engine's target is
+  // compositeFrame + its own offset, so the last engine must still fit.
+  const maxOffset = stagger * (engineCount - 1);
+  const topFrame = Math.max(0, numFrames - 1 - maxOffset);
+  const targetFor = (engine, compositeFrame) =>
+    Math.min(numFrames - 1, compositeFrame + stagger * engines.indexOf(engine));
+
+  function seekAll(compositeFrame) {
+    for (const engine of engines) engine.seekToFrame(targetFor(engine, compositeFrame));
+  }
+  function updateAll(now) {
+    for (const engine of engines) engine.update(now);
+  }
+  function allReady(compositeFrame) {
+    return engines.every((engine) => engine.presentedFrame === targetFor(engine, compositeFrame));
+  }
+
+  // Warm every engine up to frame 0 so the first measured step is not paying
+  // first-decode startup that steady playback would never see.
+  seekAll(0);
+  for (const engine of engines) await engine.ensureFrame(engine === engines[0] ? 0 : stagger * engines.indexOf(engine));
+  for (let tick = 0; tick < 3; tick++) { updateAll(performance.now()); await nextAnimationFrame(); }
+
+  // ---- Measurement A: as-fast-as-exact ------------------------------------
+  let compositeFrame = 0;
+  let forwardSteps = 0;
+  let wraps = 0;
+  const ticksPerFrame = [];
+  let ticksThisFrame = 0;
+  const startA = performance.now();
+  seekAll(compositeFrame);
+  while (forwardSteps < forwardStepsTarget) {
+    await nextAnimationFrame();
+    updateAll(performance.now());
+    ticksThisFrame += 1;
+    if (allReady(compositeFrame)) {
+      // A wrap is a backward jump (one keyframe restart); keep it out of the
+      // per-frame tick statistics so it does not masquerade as a slow forward
+      // step, but it still counts against wall-clock, as it would in playback.
+      const wrapped = compositeFrame >= topFrame;
+      if (wrapped) { wraps += 1; compositeFrame = 0; }
+      else { ticksPerFrame.push(ticksThisFrame); forwardSteps += 1; compositeFrame += 1; }
+      ticksThisFrame = 0;
+      seekAll(compositeFrame);
+    }
+  }
+  const wallSecondsA = (performance.now() - startA) / 1000;
+  const compositeFps = forwardSteps / wallSecondsA;
+  const meanTicksPerFrame = ticksPerFrame.reduce((a, b) => a + b, 0) / ticksPerFrame.length;
+  const maxTicksPerFrame = Math.max(...ticksPerFrame);
+
+  // ---- Measurement B: real-time (drop frames to keep the clock) ------------
+  let stallTicks = 0, totalTicks = 0;
+  let droppedFrames = 0, targetFramesSeen = 0;
+  let maxConsecutiveStall = 0, consecutiveStall = 0;
+  let lastTarget = -1, shownForLastTarget = false;
+  const range = topFrame + 1;
+  const startB = performance.now();
+  // Run the wall clock forward across the same number of frames as A.
+  while (true) {
+    await nextAnimationFrame();
+    const elapsed = (performance.now() - startB) / 1000;
+    const absoluteTarget = Math.round(elapsed * fps);
+    if (absoluteTarget >= forwardStepsTarget) break;
+    const compositeTarget = absoluteTarget % range;   // wrap the seek into the clip
+    if (absoluteTarget !== lastTarget) {
+      if (lastTarget !== -1) {
+        targetFramesSeen += 1;
+        if (!shownForLastTarget) droppedFrames += 1;
+      }
+      lastTarget = absoluteTarget;
+      shownForLastTarget = false;
+      seekAll(compositeTarget);
+    }
+    updateAll(performance.now());
+    totalTicks += 1;
+    if (allReady(compositeTarget)) {
+      shownForLastTarget = true;
+      consecutiveStall = 0;
+    } else {
+      stallTicks += 1;
+      consecutiveStall += 1;
+      maxConsecutiveStall = Math.max(maxConsecutiveStall, consecutiveStall);
+    }
+  }
+
+  // ---- Exactness: does the barrier really show the target on every engine? --
+  let exactness = null;
+  if (isCounterClip && tier === 'webcodecs') {
+    const mismatches = [];
+    let checked = 0;
+    const sampleFrames = [0, 3, 7, 11, 17, 23, Math.min(29, topFrame)].filter((f) => f <= topFrame);
+    for (const compositeSample of sampleFrames) {
+      seekAll(compositeSample);
+      // Drive to all-ready exactly as the barrier would before painting.
+      for (let tick = 0; tick < 30 && !allReady(compositeSample); tick++) {
+        updateAll(performance.now());
+        await nextAnimationFrame();
+      }
+      checked += 1;
+      for (const engine of engines) {
+        const canvas = engine.displayElement;
+        const context = canvas.getContext('2d');
+        const seen = visibleFrame(context, canvas.width, canvas.height);
+        const expected = targetFor(engine, compositeSample);
+        if (seen !== expected) {
+          mismatches.push({ engine: engines.indexOf(engine), compositeSample, expected, seen });
+        }
+      }
+    }
+    exactness = { checked, mismatches };
+  }
+
+  window.__result = {
+    tier, file, engineCount, stagger, width, height, fps, numFrames, topFrame,
+    forwardStepsTarget,
+    asFastAsExact: {
+      forwardSteps, wraps, wallSeconds: Number(wallSecondsA.toFixed(3)),
+      compositeFps: Number(compositeFps.toFixed(1)),
+      meanTicksPerFrame: Number(meanTicksPerFrame.toFixed(2)),
+      maxTicksPerFrame,
+      sustainsRealtime: compositeFps >= fps,
+    },
+    realTime: {
+      targetFps: fps, totalTicks, stallTicks,
+      stallFraction: Number((stallTicks / totalTicks).toFixed(3)),
+      targetFramesSeen, droppedFrames,
+      droppedFraction: Number((droppedFrames / Math.max(1, targetFramesSeen)).toFixed(3)),
+      maxConsecutiveStall,
+    },
+    exactness,
+  };
+}
+run().catch((error) => { window.__err = String(error && error.stack || error); });
+</script>

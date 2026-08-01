@@ -108,6 +108,17 @@ node test/progressive-test.mjs || status=1
 echo "=== chromium-only: robustness ==="
 node test/robustness-test.mjs || status=1
 
+# Chromium-only: the multi-engine sync benchmark. Several engines are driven
+# forward one frame per tick by a single host clock (never engine.play()) and
+# the composite is only "shown" once every engine has that frame — the model the
+# annotator uses for exact synchronized multi-video playback. It pins two things
+# a decode-path change could quietly break: forward-by-one seeks stay cheap
+# (~1 tick/frame, so real time is sustained), and the barrier composites the
+# exact target frame from every engine at once. It manages its own server, so it
+# runs after the shared one is set up but does not depend on it.
+echo "=== chromium-only: multi-engine sync benchmark ==="
+node test/sync-benchmark.mjs || status=1
+
 # Fold in the Node-only unit tests that ran before the server came up.
 [ "$node_status" -eq 0 ] || status=1
 exit "$status"
