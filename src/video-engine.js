@@ -210,6 +210,15 @@ export class VideoEngine extends EventTarget {
   get currentTime() { return this.playhead; }
   set currentTime(t) { this.playhead = Math.max(0, Math.min(this.duration, t)); }
 
+  // The composition time of display frame 0 — where playback begins and where a
+  // loop wraps back to. A leading empty edit puts this past zero: the void
+  // before the media is a real part of the timeline (a host can still seek into
+  // it), but it is not playable content, so playback neither starts in it nor
+  // loops back through it. An ordinary clip's first frame sits at zero.
+  get _firstPresentedTime() {
+    return this._index && this.numFrames > 0 ? this._index.presentationTimes[0] : 0;
+  }
+
   // Land the playhead exactly on the start of display frame n. Because we own
   // frameAtTime there is no browser seek-rounding to dodge, so we use the
   // frame's start directly (no midpoint trick, unlike NativeVideoEngine):
@@ -267,7 +276,7 @@ export class VideoEngine extends EventTarget {
       }
 
       this._configureDecoder();
-      this.playhead = 0;
+      this.playhead = this._firstPresentedTime;
       this._shownFrame = -1;
       // Decode and paint frame 0 before resolving (the loadeddata analogue).
       await this.ensureFrame(0);
@@ -762,8 +771,12 @@ export class VideoEngine extends EventTarget {
             this.playhead = Math.max(0, this.duration - 1e-6);
             this._waitingForIndex = true;
           } else if (this.loop) {
-            this.playhead -= this.duration;
-            if (!(this.playhead >= 0 && this.playhead < this.duration)) this.playhead = 0;
+            // Wrap over the presented span only, not the whole timeline: a clip
+            // with a leading empty edit loops back to its first frame's time,
+            // never through the empty lead ahead of it.
+            const origin = this._firstPresentedTime;
+            this.playhead -= (this.duration - origin);
+            if (!(this.playhead >= origin && this.playhead < this.duration)) this.playhead = origin;
           } else {
             this.playhead = Math.max(0, this.duration - 1e-6);
             this.playing = false;

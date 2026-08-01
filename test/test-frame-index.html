@@ -130,6 +130,12 @@ async function run() {
 
   const usingCanvas = engine.displayElement === canvas;
 
+  // Where load() left the playhead, captured before the priming seek below moves
+  // it. On the WebCodecs tier this must sit on display frame 0's presentation
+  // time -- 0 for an ordinary clip, the gap for one with a leading empty edit --
+  // so the clock starts on the first thing there is to see, never in the void.
+  const playheadAtLoad = engine.currentTime;
+
   // Prime the <video> path away from frame 0 before the loop below.
   //
   // WebKit fires no requestVideoFrameCallback for a seek that lands within the
@@ -182,6 +188,7 @@ async function run() {
     // empty edit this is the gap's duration, not 0 -- the whole point of the
     // edit-list origin shift, and the one thing a frame-number walk cannot see.
     firstFrameTime: engine._index ? engine._index.presentationTimes[0] : null,
+    playheadAtLoad,
     rows,
   };
 }

@@ -38,9 +38,11 @@ Three things are load-bearing, and all are tested (see testing.md):
   gap into the origin (`_appendDisplayFrames` subtracts the gap from the first
   presented sample's `cts`), so `presentationTimes[0]` is the gap — 3.00s, not
   0.00 — the same number QuickTime and a `<video>` element compute. Frame 0 is
-  still frame 0; only the time attached to it changes. The calibration offset for
-  such a clip is then ~0: the element's composition clock and the shifted table
-  already agree. Two consequences the native path handles: (1) `index.duration`
+  still frame 0; only the time attached to it changes. Because that time is the
+  timeline's true origin, WebCodecs playback starts there and a loop wraps back
+  to it, so the empty lead is never played (a host can still seek into it). The
+  calibration offset for such a clip is then ~0: the element's composition clock
+  and the shifted table already agree. Two consequences the native path handles: (1) `index.duration`
   now includes the leading gap, but
   browsers disagree on whether a `<video>` element's duration counts leading
   black — Chromium and any clip with an audio track spanning the gap include it,

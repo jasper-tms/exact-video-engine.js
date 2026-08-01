@@ -26,7 +26,11 @@ and a native `<video>` element and compares where an asymmetric marker lands.
 
 Walks every frame of the counter clips through each engine and checks that
 asking for frame `n` both puts frame `n` on screen and reports frame `n`
-back. Each case also pins which *tier* the ladder landed on, because a case
+back. On the WebCodecs tier every case also checks that `load()` leaves the
+playhead on display frame 0's presentation time — 0 for an ordinary clip, the
+gap for a leading empty edit — so playback begins on the first visible frame,
+never in the void ahead of the media. Each case also pins which *tier* the
+ladder landed on, because a case
 that checked only frames would pass just as happily on the fallback — which
 is exactly what the WebM cases once did. The clips are chosen to make the
 index's exactness falsifiable:
@@ -63,8 +67,10 @@ index's exactness falsifiable:
   (bar at x = 0) but is reported at 3.00s, not 0.00. Where counter-elst's small
   gap could pass for rounding, this one cannot: the frame-index test pins
   `firstFrameTime` across all three browsers — the reported-time shift a
-  frame-number walk cannot see. Its 4s audio track makes the element's duration
-  span the whole gap, so `index.duration` matches it directly on every browser.
+  frame-number walk cannot see. It is also the clip that anchors the
+  playhead-at-load check: the engine's clock must read 3.00s the instant it
+  loads, not 0.00. Its 4s audio track makes the element's duration span the whole
+  gap, so `index.duration` matches it directly on every browser.
 - `counter-idx1.avi` and `counter-opendml.avi` are the same frames as H.264
   in AVI, carrying the legacy `idx1` index and the OpenDML hierarchical index
   respectively — the only container with no native tier to fall back to.

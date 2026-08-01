@@ -431,7 +431,15 @@ for (const testCase of CASES) {
   // so 5ms is far below one frame yet well above the movie-vs-media rounding.
   const timeOk = testCase.firstFrameTime === undefined
     || Math.abs(result.firstFrameTime - testCase.firstFrameTime) < 5e-3;
-  const pass = exactOk && indexOk && tierOk && timeOk;
+  // On the WebCodecs tier, load() must leave the playhead on display frame 0's
+  // presentation time (presentationTimes[0], reported here as firstFrameTime): a
+  // clip begins on the first frame there is to see -- 0 for an ordinary clip, the
+  // gap for one with a leading empty edit -- never in the void ahead of it. The
+  // native tier runs on the element's own clock and is not asserted here.
+  const playheadOk = !result.tier.startsWith('webcodecs')
+    || result.playheadAtLoad == null || result.firstFrameTime == null
+    || Math.abs(result.playheadAtLoad - result.firstFrameTime) < 5e-3;
+  const pass = exactOk && indexOk && tierOk && timeOk && playheadOk;
   if (!pass) failures += 1;
 
   const count = result.rows.length;
@@ -443,7 +451,10 @@ for (const testCase of CASES) {
     : ` — frameIndexIsExact=${result.frameIndexIsExact}, expected ${expectation.indexExact}`)
     + (tierOk ? '' : ` — tier '${result.tier}', expected the ${expectation.tier} tier`)
     + (timeOk ? ''
-      : ` — frame 0 reported at ${result.firstFrameTime}s, expected ${testCase.firstFrameTime}s`);
+      : ` — frame 0 reported at ${result.firstFrameTime}s, expected ${testCase.firstFrameTime}s`)
+    + (playheadOk ? ''
+      : ` — playhead at load ${result.playheadAtLoad}s, expected frame 0's time `
+        + `${result.firstFrameTime}s`);
   console.log(`${pass ? 'PASS' : 'FAIL'} ${file} ${mode}: ${detail}`
     + ` [${result.tier}, frameIndexIsExact=${result.frameIndexIsExact}]${mismatch}`);
 
