@@ -439,7 +439,12 @@ for (const testCase of CASES) {
   const playheadOk = !result.tier.startsWith('webcodecs')
     || result.playheadAtLoad == null || result.firstFrameTime == null
     || Math.abs(result.playheadAtLoad - result.firstFrameTime) < 5e-3;
-  const pass = exactOk && indexOk && tierOk && timeOk && playheadOk;
+  // Seeking into a leading empty edit's void must report no frame (-1) and leave
+  // the canvas empty (0 opaque pixels), not hold frame 0. Only present when the
+  // harness probed it (WebCodecs tier, clip with a void); null otherwise.
+  const voidOk = !result.voidProbe
+    || (result.voidProbe.currentFrame === -1 && result.voidProbe.opaque === 0);
+  const pass = exactOk && indexOk && tierOk && timeOk && playheadOk && voidOk;
   if (!pass) failures += 1;
 
   const count = result.rows.length;
@@ -454,7 +459,10 @@ for (const testCase of CASES) {
       : ` — frame 0 reported at ${result.firstFrameTime}s, expected ${testCase.firstFrameTime}s`)
     + (playheadOk ? ''
       : ` — playhead at load ${result.playheadAtLoad}s, expected frame 0's time `
-        + `${result.firstFrameTime}s`);
+        + `${result.firstFrameTime}s`)
+    + (voidOk ? ''
+      : ` — void seek reported frame ${result.voidProbe.currentFrame} with `
+        + `${result.voidProbe.opaque} opaque px, expected -1 and 0`);
   console.log(`${pass ? 'PASS' : 'FAIL'} ${file} ${mode}: ${detail}`
     + ` [${result.tier}, frameIndexIsExact=${result.frameIndexIsExact}]${mismatch}`);
 

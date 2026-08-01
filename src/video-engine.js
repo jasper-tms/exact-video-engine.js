@@ -190,7 +190,7 @@ export class VideoEngine extends EventTarget {
 
   frameAtTime(t) { return this._index ? this._index.frameAtTime(t) : 0; }
 
-  get currentFrame() { return this.frameAtTime(this.playhead); }
+  get currentFrame() { return this._inVoid ? -1 : this.frameAtTime(this.playhead); }
 
   // The frame actually painted onto the canvas right now, as opposed to
   // `currentFrame` (the playhead's target, which lands the instant a host
@@ -204,6 +204,7 @@ export class VideoEngine extends EventTarget {
   // display it renders in sync with the video (interpolated overlays etc.)
   // from, in place of the drift-prone `currentTime * frameRate`.
   get currentFrameFloat() {
+    if (this._inVoid) return -1;
     return this._index ? this._index.frameFloatAtTime(this.playhead) : 0;
   }
 
@@ -218,6 +219,14 @@ export class VideoEngine extends EventTarget {
   get _firstPresentedTime() {
     return this._index && this.numFrames > 0 ? this._index.presentationTimes[0] : 0;
   }
+
+  // Playhead in the leading void ahead of the media — the empty edit's gap, where
+  // there is no frame to show. Distinct from being on frame 0 (which sits exactly
+  // at _firstPresentedTime) and from a target still decoding (a real frame whose
+  // pixels have not arrived yet). Here currentFrame reports -1 and the canvas is
+  // cleared to an empty, transparent image — nothing, the way QuickTime and a
+  // <video> element render an empty edit.
+  get _inVoid() { return this.playhead < this._firstPresentedTime; }
 
   // Land the playhead exactly on the start of display frame n. Because we own
   // frameAtTime there is no browser seek-rounding to dodge, so we use the
@@ -790,7 +799,11 @@ export class VideoEngine extends EventTarget {
 
     const frame = this.frameAtTime(this.playhead);
     this._request(frame);   // streams/prefetches the window around `frame`
-    if (frame !== this._shownFrame) {
+    if (this._inVoid) {
+      // No frame at this time — show an empty image, not frame 0 held. Frame 0's
+      // window is still warmed above, so leaving the void paints instantly.
+      if (this._shownFrame !== -1) this._presentEmpty();
+    } else if (frame !== this._shownFrame) {
       const bitmap = this._cache.get(frame);
       if (bitmap) this._present(frame, bitmap);   // else hold last frame (stall)
     }
@@ -802,6 +815,17 @@ export class VideoEngine extends EventTarget {
     this._lastBitmap = bitmap;
     this._shownFrame = frameIndex;
     this._drawBitmap(bitmap);
+  }
+
+  // Clear the canvas to an empty (transparent) image and report no frame on
+  // screen. Used when the playhead sits in a leading empty edit's void, where
+  // there is no frame to present (see _inVoid) — the RGBA canvas makes "nothing"
+  // a real value, distinct from a frame still decoding.
+  _presentEmpty() {
+    this._shownFrame = -1;
+    this._lastBitmap = null;   // so a later resize does not repaint a stale frame
+    const cw = this.canvas.width, ch = this.canvas.height;
+    if (cw && ch) this.context.clearRect(0, 0, cw, ch);
   }
 
   // Size the canvas backing store to the pane (device pixels) and repaint the

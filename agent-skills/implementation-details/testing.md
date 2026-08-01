@@ -69,8 +69,11 @@ index's exactness falsifiable:
   `firstFrameTime` across all three browsers — the reported-time shift a
   frame-number walk cannot see. It is also the clip that anchors the
   playhead-at-load check: the engine's clock must read 3.00s the instant it
-  loads, not 0.00. Its 4s audio track makes the element's duration span the whole
-  gap, so `index.duration` matches it directly on every browser.
+  loads, not 0.00. On the WebCodecs tier the frame walk is followed by a *void
+  probe* — a seek into the gap must report no frame (`currentFrame` -1) and leave
+  the canvas empty (zero opaque pixels), never frame 0 held over the void. Its 4s
+  audio track makes the element's duration span the whole gap, so `index.duration`
+  matches it directly on every browser.
 - `counter-idx1.avi` and `counter-opendml.avi` are the same frames as H.264
   in AVI, carrying the legacy `idx1` index and the OpenDML hierarchical index
   respectively — the only container with no native tier to fall back to.

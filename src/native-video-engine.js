@@ -140,6 +140,21 @@ export class NativeVideoEngine extends EventTarget {
     this.video.currentTime = clamped + this._timeOffset;
   }
 
+  // Composition time of display frame 0 — nonzero when a leading empty edit puts
+  // a void ahead of the media (see VideoEngine._firstPresentedTime).
+  get _firstPresentedTime() {
+    return this._index && this._index.numFrames > 0 ? this._index.presentationTimes[0] : 0;
+  }
+
+  // The element's clock is before the first frame's presentation time: the
+  // leading void of an empty edit, where there is no frame. currentFrame reports
+  // -1 here, distinct from frame 0. Unlike VideoEngine this tier cannot clear the
+  // picture — the <video> element renders the void black on its own and fires no
+  // requestVideoFrameCallback in it, so this is read from the element clock, not
+  // from a presented frame. seekToFrame(0) lands on frame 0's midpoint, safely
+  // past _firstPresentedTime, so frame 0 is never mistaken for the void.
+  get _inVoid() { return this.currentTime < this._firstPresentedTime; }
+
   // What this engine got, for dev labels and host-side diagnostics. Always the
   // exact pairing now — the only native tier that exists.
   get tier() {
@@ -205,6 +220,9 @@ export class NativeVideoEngine extends EventTarget {
   }
 
   get currentFrameFloat() {
+    // No frame in the leading void — report -1, the same sentinel VideoEngine
+    // uses, rather than clamping up to frame 0 as the arithmetic below would.
+    if (this._inVoid) return -1;
     // While paused, currentTime is exact and authoritative — a sub-frame seek
     // must land where it aimed. While playing, extrapolate from the last
     // presented frame instead (see the class comment).

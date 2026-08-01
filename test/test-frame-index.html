@@ -180,10 +180,34 @@ async function run() {
     });
   }
 
+  // Void probe (WebCodecs only): a clip with a leading empty edit has a void
+  // ahead of frame 0 where there is no frame. Seeking into it must report no
+  // frame (-1) and clear the canvas to a transparent (empty) image, not hold
+  // frame 0. Runs only on the canvas tier, where the engine owns the pixels and
+  // the check is synchronous and exact; the <video> element paints the void
+  // black itself and cannot be cleared.
+  let voidProbe = null;
+  const origin = engine._index ? engine._index.presentationTimes[0] : 0;
+  if (usingCanvas && origin > 1e-3) {
+    engine.currentTime = origin / 2;     // half-way into the gap
+    engine.update(performance.now());
+    const vp = document.createElement('canvas');
+    vp.width = canvas.width; vp.height = canvas.height;
+    const vpx = vp.getContext('2d');
+    vpx.drawImage(canvas, 0, 0);
+    const pixels = vpx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let opaque = 0;
+    for (let i = 3; i < pixels.length; i += 4) if (pixels[i] > 0) opaque++;
+    voidProbe = { currentFrame: engine.currentFrame, opaque };
+  }
+
   window.__result = {
     tier: engine.tier,
     frameIndexIsExact: engine.frameIndexIsExact,
     numFrames: engine.numFrames,
+    // { currentFrame, opaque } from a seek into a leading empty edit's void, or
+    // null when the clip has no void or ran on the <video> tier. See above.
+    voidProbe,
     // Display frame 0's reported presentation time. For a clip with a leading
     // empty edit this is the gap's duration, not 0 -- the whole point of the
     // edit-list origin shift, and the one thing a frame-number walk cannot see.

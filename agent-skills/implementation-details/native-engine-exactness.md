@@ -40,9 +40,15 @@ Three things are load-bearing, and all are tested (see testing.md):
   0.00 — the same number QuickTime and a `<video>` element compute. Frame 0 is
   still frame 0; only the time attached to it changes. Because that time is the
   timeline's true origin, WebCodecs playback starts there and a loop wraps back
-  to it, so the empty lead is never played (a host can still seek into it). The
-  calibration offset for such a clip is then ~0: the element's composition clock
-  and the shifted table already agree. Two consequences the native path handles: (1) `index.duration`
+  to it, so the empty lead is never played. A host can still seek into it — a
+  compositor placing this clip behind others reaches that time — and there
+  `currentFrame` reports -1 (no frame, distinct from frame 0 and from a target
+  still decoding) and the WebCodecs canvas clears to an empty, transparent image;
+  the RGBA canvas makes "nothing" a real value, and a single-clip host paints its
+  own black backdrop to match QuickTime. The native `<video>` tier reports the
+  same -1 from its clock but renders the void black itself — an observational
+  tier cannot clear the element. The calibration offset for such a clip is then
+  ~0: the element's composition clock and the shifted table already agree. Two consequences the native path handles: (1) `index.duration`
   now includes the leading gap, but
   browsers disagree on whether a `<video>` element's duration counts leading
   black — Chromium and any clip with an audio track spanning the gap include it,
