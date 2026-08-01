@@ -903,13 +903,24 @@ export class ContainerIndex extends EventTarget {
   // and _buildTables uses this window to number frames over only the presented
   // ones, so display frame 0 is the first frame the viewer sees on either engine.
   //
+  // The returned object also carries leadingGapMediaUnits: the duration of any
+  // empty edit(s) ahead of the real media (media_time -1, their own
+  // segment_duration). An empty edit presents no media, so it does not move the
+  // window — the same samples are shown either way — but it shifts the whole
+  // track's presentation timeline later on the composition clock, so frame 0 is
+  // reported not at t = 0 but at the gap's duration into the timeline (the value
+  // QuickTime and a <video> element both honor). _appendDisplayFrames subtracts
+  // it from the composition-time origin. Nearly every AAC-muxed MP4 carries a
+  // tiny (~10-20ms) empty edit for the audio codec's encoder priming delay;
+  // reporting the true composition time handles that the same way, with no
+  // magnitude threshold to draw.
+  //
   // Scope is deliberately the common real-world shape: a phone-style trim, which
-  // is one normal-rate edit (optionally preceded by an empty edit — a leading
-  // gap, media_time -1, which shifts the presentation clock but presents no media
-  // and is handled by the timeline calibration, not here). Anything more elaborate
-  // — several edits, a rate change — returns null, leaving every frame presented
-  // (the pre-existing behaviour): the WebCodecs path shows them all and the native
-  // path's duration check still refuses an index it cannot trust.
+  // is one normal-rate edit (optionally preceded by a leading empty edit). Anything
+  // more elaborate — several presented edits, a rate change — returns null, leaving
+  // every frame presented (the pre-existing behaviour): the WebCodecs path shows
+  // them all and the native path's duration check still refuses an index it cannot
+  // trust.
   _editListWindow(videoTrack) {
     const edits = videoTrack.edits;
     if (!edits || !edits.length) return null;
@@ -921,11 +932,22 @@ export class ContainerIndex extends EventTarget {
     }
     const mediaTimescale = videoTrack.timescale;
     const movieTimescale = videoTrack.movie_timescale || mediaTimescale;
-    // media_time is already in media units; segment_duration is in MOVIE units,
-    // so convert it across before adding.
+    // Every edit before the first presented one is an empty edit (media_time < 0);
+    // sum their durations for the leading gap. media_time is already in media
+    // units; segment_duration is in MOVIE units, so convert it across before adding.
+    const firstPresentedIndex = edits.indexOf(edit);
+    let leadingGapMovieUnits = 0;
+    for (let i = 0; i < firstPresentedIndex; i++) {
+      leadingGapMovieUnits += edits[i].segment_duration;
+    }
+    const toMediaUnits = (movieUnits) => movieUnits * mediaTimescale / movieTimescale;
     const start = edit.media_time;
-    const spanMediaUnits = edit.segment_duration * mediaTimescale / movieTimescale;
-    return { start, end: start + spanMediaUnits };
+    const spanMediaUnits = toMediaUnits(edit.segment_duration);
+    return {
+      start,
+      end: start + spanMediaUnits,
+      leadingGapMediaUnits: toMediaUnits(leadingGapMovieUnits),
+    };
   }
 
   // WebM/Matroska: a full decode-order sample table, and a decoderConfig
@@ -1219,11 +1241,17 @@ export class ContainerIndex extends EventTarget {
     if (!decodeIndices.length) return;
     const first = this.samples[decodeIndices[0]];
     if (this._displayCount === 0) {
-      // Display frame 0 sits at t = 0. With a trim the first presented frame's
-      // cts is a nonzero offset, and (independently) with B-frames the first
-      // composition time is too; both engines want a timeline whose origin is the
-      // first frame the viewer sees. Frozen here, for good.
-      this._compositionTimeOrigin = first.cts;
+      // Where display frame 0 lands on the composition clock. With a trim the
+      // first presented frame's cts is a nonzero offset, and (independently) with
+      // B-frames the first composition time is too; subtracting the first frame's
+      // cts alone would put frame 0 at t = 0. But a leading empty edit means the
+      // track deliberately shows nothing for its duration before that first frame,
+      // so frame 0's true presentation time is the gap, not zero — the number
+      // QuickTime and a <video> element both report. Subtract the gap from the
+      // origin so it surfaces in presentationTimes. Frozen here, for good.
+      const leadingGapMediaUnits = this._editWindow
+        ? (this._editWindow.leadingGapMediaUnits || 0) : 0;
+      this._compositionTimeOrigin = first.cts - leadingGapMediaUnits;
     } else {
       const lastPublished = this.samples[this._displayToDecodeBuffer[this._displayCount - 1]];
       if (first.cts < lastPublished.cts) {

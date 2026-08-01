@@ -50,9 +50,21 @@ index's exactness falsifiable:
 - `counter-cfr.ogv` exercises the Ogg page scan, in browsers that still
   decode Theora (`ogg-table-test.mjs` pins the parser itself,
   browser-independently).
-- `counter-elst.mp4` carries an edit list, so its first frame presents at
-  `mediaTime` 0.133 rather than 0. It passes only if the timeline calibration
-  is genuinely finding that offset instead of getting away with a zero one.
+- `counter-elst.mp4` carries a leading empty edit (a 0.133s gap, `media_time
+  -1`) and a head cut, so its first frame is source frame 10 (bar at x = 50),
+  reported 0.133s into the composition timeline rather than at 0. It passes only
+  if the container-to-element mapping honors the gap. It also has no audio track,
+  so on Firefox the `<video>` element's duration omits the leading black while
+  `index.duration` includes it — the case that pins `_indexDescribesElement`'s
+  two-sided span check (see native-engine-exactness.md), without which the clip is
+  wrongly refused there.
+- `counter-leading-gap-elst.mp4` is `counter-cfr` copied frame for frame behind a
+  deliberate 3-second empty edit (no head cut), so its frame 0 IS source frame 0
+  (bar at x = 0) but is reported at 3.00s, not 0.00. Where counter-elst's small
+  gap could pass for rounding, this one cannot: the frame-index test pins
+  `firstFrameTime` across all three browsers — the reported-time shift a
+  frame-number walk cannot see. Its 4s audio track makes the element's duration
+  span the whole gap, so `index.duration` matches it directly on every browser.
 - `counter-idx1.avi` and `counter-opendml.avi` are the same frames as H.264
   in AVI, carrying the legacy `idx1` index and the OpenDML hierarchical index
   respectively — the only container with no native tier to fall back to.

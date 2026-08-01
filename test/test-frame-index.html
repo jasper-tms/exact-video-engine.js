@@ -178,6 +178,10 @@ async function run() {
     tier: engine.tier,
     frameIndexIsExact: engine.frameIndexIsExact,
     numFrames: engine.numFrames,
+    // Display frame 0's reported presentation time. For a clip with a leading
+    // empty edit this is the gap's duration, not 0 -- the whole point of the
+    // edit-list origin shift, and the one thing a frame-number walk cannot see.
+    firstFrameTime: engine._index ? engine._index.presentationTimes[0] : null,
     rows,
   };
 }

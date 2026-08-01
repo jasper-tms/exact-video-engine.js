@@ -113,6 +113,29 @@ const CASES = [
     webkit: { skip: 'WebKit fires no requestVideoFrameCallback for the edit-list '
       + "clip's calibrated in-frame seek; calibration covered by the webcodecs case" } },
 
+  // A LEADING EMPTY EDIT of real size. counter-elst above carries one too (a
+  // 0.133s gap), but its head was also cut, so its frame 0 is source frame 10 and
+  // the small gap could pass for rounding. This clip is counter-cfr copied frame
+  // for frame behind a deliberate 3-second empty edit (media_time -1), so its
+  // frame 0 IS source frame 0 (firstBar 0) and the gap is unmistakable. The
+  // element and both engines honor it: display frame 0 is reported not at t = 0
+  // but at 3.0s into the composition timeline — the number QuickTime and a <video>
+  // element compute — which firstFrameTime pins on the real file, the behaviour a
+  // frame-number walk cannot see. (The clip's own audio track picked up a tiny
+  // ~23ms encoder-priming empty edit for free; the video track this indexes does
+  // not, but the fix would report that honestly too rather than misfire on it.)
+  { file: 'counter-leading-gap-elst.mp4', mode: 'webcodecs', firstBar: 0, exact: true,
+    indexExact: true, tier: 'webcodecs', firstFrameTime: 3 },
+  { file: 'counter-leading-gap-elst.mp4', mode: 'native-index', firstBar: 0, exact: true,
+    indexExact: true, tier: 'native', firstFrameTime: 3,
+    // Skipped on WebKit for the same reason as counter-elst: the calibrated first
+    // seek lands inside the frame the element already presents and WebKit fires no
+    // requestVideoFrameCallback for it. The reported-time shift is covered on
+    // WebKit by the webcodecs case above (same clip, same firstFrameTime 3).
+    webkit: { skip: 'WebKit fires no requestVideoFrameCallback for the edit-list '
+      + "clip's calibrated in-frame seek; the gap's reported time is covered by the "
+      + 'webcodecs case' } },
+
   // A TRIMMING edit list. Unlike counter-elst above (a shifting list that still
   // presents every frame in the file), this clip's container holds all 30 source
   // frames but the edit list presents only 20 of them, starting at source frame 5
@@ -403,7 +426,12 @@ for (const testCase of CASES) {
   // engine.tier reads 'webcodecs' or 'native (container index, presented clock)',
   // so match on the leading word.
   const tierOk = !expectation.tier || result.tier.startsWith(expectation.tier);
-  const pass = exactOk && indexOk && tierOk;
+  // Reported presentation time of display frame 0, when a case pins it (edit-list
+  // clips whose leading empty edit shifts the origin off zero). A frame is ~33ms,
+  // so 5ms is far below one frame yet well above the movie-vs-media rounding.
+  const timeOk = testCase.firstFrameTime === undefined
+    || Math.abs(result.firstFrameTime - testCase.firstFrameTime) < 5e-3;
+  const pass = exactOk && indexOk && tierOk && timeOk;
   if (!pass) failures += 1;
 
   const count = result.rows.length;
@@ -413,7 +441,9 @@ for (const testCase of CASES) {
       + `${wrongReports.length}/${count} misreported`;
   const mismatch = (indexOk ? ''
     : ` — frameIndexIsExact=${result.frameIndexIsExact}, expected ${expectation.indexExact}`)
-    + (tierOk ? '' : ` — tier '${result.tier}', expected the ${expectation.tier} tier`);
+    + (tierOk ? '' : ` — tier '${result.tier}', expected the ${expectation.tier} tier`)
+    + (timeOk ? ''
+      : ` — frame 0 reported at ${result.firstFrameTime}s, expected ${testCase.firstFrameTime}s`);
   console.log(`${pass ? 'PASS' : 'FAIL'} ${file} ${mode}: ${detail}`
     + ` [${result.tier}, frameIndexIsExact=${result.frameIndexIsExact}]${mismatch}`);
 

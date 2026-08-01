@@ -48,14 +48,17 @@ check('identity edit -> window covers all frames',
 
 // counter-elst: a leading EMPTY edit (a 0.133s gap, media_time -1) then a normal
 // edit. The empty one is a presentation offset, not a trim, so the window still
-// starts at 0 and covers every frame in the file.
+// starts at 0 and covers every frame in the file; the gap is carried out of band
+// as leadingGapMediaUnits, which shifts frame 0's reported time (asserted below in
+// the _buildTables block) rather than moving the window.
 const withEmptyLead = index._editListWindow(track([
   { segment_duration: 133, media_time: -1, media_rate_integer: 1 },
   { segment_duration: 667, media_time: 0, media_rate_integer: 1 },
 ]));
-check('empty-lead + normal edit -> window from 0 (calibration handles the gap)',
+check('empty-lead + normal edit -> window from 0, gap held as leadingGapMediaUnits',
   withEmptyLead && withEmptyLead.start === 0
-    && Math.abs(withEmptyLead.end - 667 * MEDIA_TS / MOVIE_TS) < 1,
+    && Math.abs(withEmptyLead.end - 667 * MEDIA_TS / MOVIE_TS) < 1
+    && Math.abs(withEmptyLead.leadingGapMediaUnits - 133 * MEDIA_TS / MOVIE_TS) < 1,
   JSON.stringify(withEmptyLead));
 
 // counter-trimming-elst: start 5 frames in (media_time 2560), present 20 frames
@@ -87,6 +90,21 @@ check('no window: display 0 at t=0, display 0 -> decode 0',
 check('no window: keyframes at 0,10,20',
   JSON.stringify(index.keyframeDecodeIndices) === JSON.stringify([0, 10, 20]),
   JSON.stringify(index.keyframeDecodeIndices));
+
+// --- _buildTables with the empty-lead window: frame 0's reported TIME shifts ----
+// The empty edit presents nothing for 0.133s before the real media, so display
+// frame 0 -- still source frame 0, an origin change and not a numbering one -- is
+// reported 0.133s into the composition timeline, the time QuickTime and a <video>
+// element both honor, rather than at t = 0. This is the one number the leading-gap
+// fix changes; the "no window" and "trim" cases above (neither carrying an empty
+// edit) still report frame 0 at t = 0, exactly as before.
+index._buildTables(makeSamples(), withEmptyLead);
+const EXPECTED_GAP_SECONDS = 133 / MOVIE_TS;   // 0.133s: the empty edit's duration
+check('empty-lead: display 0 is still source frame 0 (origin change, not numbering)',
+  index.displayToDecode[0] === 0, `display 0 -> decode ${index.displayToDecode[0]}`);
+check('empty-lead: frame 0 is reported at the gap (0.133s), not at 0',
+  Math.abs(index.presentationTimes[0] - EXPECTED_GAP_SECONDS) < 1e-9,
+  `pt0=${index.presentationTimes[0]}, expected ${EXPECTED_GAP_SECONDS}`);
 
 // --- _buildTables with the trimming window: 20 presented of 30 decoded ---------
 index._buildTables(makeSamples(), trim);

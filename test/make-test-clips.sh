@@ -110,6 +110,32 @@ ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
 ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 -ss 0.2 \
     -c copy clips/counter-elst.mp4
 
+# A clip carrying a real leading empty edit — media_time -1, several seconds, not
+# the ~10-20ms an AAC track's encoder priming delay writes into nearly every
+# audio-bearing MP4 (counter-leading-gap-elst.mp4's own audio track below ends up
+# with exactly that kind of tiny edit, for free, as a contrast case in the same
+# file). Real-world source: an MP4 built by independently trimming and remuxing
+# two HLS streams came out with the video track's real media starting ~3s after
+# the audio's; ffmpeg recorded that honestly as an empty edit ahead of the real
+# samples in the video track's elst, rather than as a media_time offset the way
+# counter-elst.mp4 above has one. See "3." in what-should-we-work-on-next.md for
+# why the engine currently reports this clip's frame 0 at time 0.00 and should
+# report 3.00 instead.
+#
+# ffmpeg will not write an empty edit for a single lone track -- there is nothing
+# to desynchronize it from, so it just starts wherever it starts. -itsoffset on
+# the video input against a second (audio) track reproduces the real mechanism:
+# the muxer sees a video track whose first sample is 3s later than the other
+# track's and writes a real empty edit to hold the gap, exactly as the original
+# incident did. -c:v copy keeps counter-cfr.mp4's frames byte-identical, so its
+# bar-position identity still holds: this clip's frame 0 is source frame 0, bar
+# at x = 0, just reported 3s into the composition timeline instead of at 0.
+ffmpeg -y -loglevel error \
+    -itsoffset 3 -i clips/counter-cfr.mp4 \
+    -f lavfi -i "anullsrc=r=44100:cl=mono:d=4" \
+    -c:v copy -c:a aac -map 0:v -map 1:a \
+    clips/counter-leading-gap-elst.mp4
+
 # A clip with a real mdat, for the startup-cost test: how many bytes must arrive
 # before the engine can show a frame? That question is meaningless against the
 # clips above -- they are a few KB, so any block size fetches the whole file and

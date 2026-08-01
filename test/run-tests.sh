@@ -9,6 +9,7 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-vfr.webm ] || [ ! -f test/clips/startup.mp4 ] \
         || [ ! -f test/clips/midsize.mp4 ] || [ ! -f test/clips/hd.mp4 ] \
         || [ ! -f test/clips/counter-trimming-elst.mp4 ] \
+        || [ ! -f test/clips/counter-leading-gap-elst.mp4 ] \
         || [ ! -f test/clips/counter-hevc10.mp4 ] \
         || [ ! -f test/clips/counter-vfr-fragmented.mp4 ] \
         || [ ! -f test/clips/counter-idx1.avi ] \

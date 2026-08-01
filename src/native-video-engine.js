@@ -152,21 +152,32 @@ export class NativeVideoEngine extends EventTarget {
     return (this._index && this._index.decoderConfig)
       ? this._index.decoderConfig.codec : null;
   }
+  // The span the frames actually occupy, in seconds. index.duration is the whole
+  // composition timeline, which a leading empty edit stretches by its gap (a value
+  // frame 0's presentation time carries); the frames sit only in the part after
+  // it. Rate and per-frame-scale derivations divide by this, not the full
+  // duration, so three seconds of leading black ahead of one second of 30 fps
+  // video still reads as 30 fps rather than 7.5. Zero for no frames.
+  _presentedSpan() {
+    if (!this._index || !this._index.numFrames) return 0;
+    return this._index.duration - this._index.presentationTimes[0];
+  }
+
   // Informational only, never a mapping input: the clip's average frame rate,
-  // derived from the index (numFrames / duration). A host may show it; frame
-  // indices come from the index's real per-frame timestamps, not from this.
-  // Zero when the index is unavailable or reports no duration.
+  // derived from the index (frames over the span they occupy). A host may show it;
+  // frame indices come from the index's real per-frame timestamps, not from this.
+  // Zero when the index is unavailable or reports no span.
   get framesPerSecond() {
-    if (!this._index || !this._index.duration) return 0;
-    return this._index.numFrames / this._index.duration;
+    const span = this._presentedSpan();
+    return span > 0 ? this._index.numFrames / span : 0;
   }
 
   // Average frame duration in seconds, for slack/tolerance computations that need
-  // a per-frame scale. Derived straight from the index and guarded against a zero
-  // frame count so tolerances never blow up to Infinity.
+  // a per-frame scale. Derived from the index and guarded against a zero frame
+  // count so tolerances never blow up to Infinity.
   _averageFrameDuration() {
-    if (!this._index || !this._index.numFrames) return 0;
-    return this._index.duration / this._index.numFrames;
+    const span = this._presentedSpan();
+    return span > 0 ? span / this._index.numFrames : 0;
   }
 
   // The permanent invariant guard. True for every engine createBestEngine hands
@@ -447,6 +458,17 @@ export class NativeVideoEngine extends EventTarget {
   // duration shorter by everything it cut, which is at least a GOP. Anything
   // beyond a couple of frames of container rounding, we do not trust the table.
   //
+  // A LEADING EMPTY EDIT is the exception the two-sided comparison below exists
+  // for. It shifts every presentation time (and so index.duration) later by the
+  // gap, which frame 0's time now carries (presentationTimes[0]). Browsers
+  // disagree on whether a <video> element's duration counts that leading black:
+  // Chromium does, and so does any clip with another track (audio) spanning the
+  // gap, but Firefox on a video-only clip reports just the media, gap excluded.
+  // Both are the same 30 frames correctly numbered, so accept the element
+  // matching EITHER the full table span or the span minus the leading gap. A
+  // trimming list makes the element shorter than even the gap-less span, so it
+  // still fails — which is the whole-frame shift this guard exists to catch.
+  //
   // Async, and it rides out a known Chromium race before believing a
   // disagreement: right after 'loadeddata', video.duration for an edit-list clip
   // is transiently the (shorter) MEDIA duration and only later updates to the
@@ -462,7 +484,11 @@ export class NativeVideoEngine extends EventTarget {
       const elementDuration = this.video.duration;
       if (!isFinite(elementDuration) || elementDuration <= 0) return true;
       const slack = 2 * this._averageFrameDuration();
-      return Math.abs(this._index.duration - elementDuration) <= slack;
+      // The leading gap frame 0's time carries: 0 for a clip without an empty
+      // edit, so the two comparisons collapse to one and nothing changes there.
+      const leadingGap = this._index.numFrames ? this._index.presentationTimes[0] : 0;
+      return Math.abs(this._index.duration - elementDuration) <= slack
+        || Math.abs((this._index.duration - leadingGap) - elementDuration) <= slack;
     };
     if (agrees()) return true;
     await this._waitForDurationToSettle(700);
