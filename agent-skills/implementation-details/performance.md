@@ -50,3 +50,27 @@ side, so a 4K clip costs the same per frame as a 1080p one
 (`bitmapForFrame()` hands back that bitmap, in coded orientation). Lowering
 `cacheBytes` shrinks read-ahead first and history second; it never changes
 which frames are *available*, only how many are held in memory at once.
+
+## What the cache holds: a window on the playhead, not a log of everything seen
+
+The resident frames track *where playback is now*, not everywhere it has been.
+`_evict` keeps a "keep window" around each active centre — the playhead, plus
+any frame `ensureFrame` is separately steering toward — running from that
+frame's GOP keyframe (or `_windowBack`, whichever reaches further back) forward
+through the read-ahead, and drops everything else. Crucially this runs on every
+`_request`, not only when a newly decoded frame breaches the byte budget: a
+seek relocates the window immediately, so the frames around the *previous*
+location are dropped at once rather than lingering until enough new frames were
+decoded to force eviction. (They used to linger indefinitely on a paused seek,
+where the new region plus read-ahead often stayed just under budget and no
+eviction ever ran — an emergent effect of budget-only eviction, visible as
+stray cached segments left behind the old playhead in `demo.html`.)
+
+The keyframe back-edge is deliberate. Reaching a frame mid-GOP means decoding
+its whole run from the keyframe forward anyway, so those frames pass through the
+decoder whether or not they are kept; holding them (as far as the byte budget
+allows) makes short backward steps after a seek free, up until the step crosses
+the previous keyframe into a GOP that would have to be decoded afresh. When
+read-ahead is full the budget spends itself there and little of the run
+survives; when it is not — a seek near the clip's end, say — the slack holds
+more of the run instead.

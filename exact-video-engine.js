@@ -5475,10 +5475,40 @@ class VideoEngine extends EventTarget {
     return (this._target === current) ? [current] : [current, this._target];
   }
 
-  _insideWindow(displayIndex) {
-    return this._windowCenters().some((center) =>
-      displayIndex >= center - this._windowBack
-      && displayIndex <= center + this._windowAhead + this._windowSlack);
+  // Display index of the keyframe that begins displayIndex's GOP: the frame a
+  // backward step can retreat to without crossing into the previous GOP, and so
+  // without forcing a re-decode. The keyframe is known in DECODE order
+  // (_keyframeForDecode); its display index is recovered through the same
+  // timestamp→display map the decoder output uses (microsToDisplay is keyed by
+  // round(cts * 1e6 / timescale), matching the chunk timestamps we feed).
+  _keyframeDisplayFor(displayIndex) {
+    const decodeIndex = this._displayToDecode[displayIndex];
+    if (decodeIndex === undefined) return displayIndex;
+    const keyframeSample = this._samples[this._keyframeForDecode(decodeIndex)];
+    const keyframeDisplay = this._microsToDisplay.get(
+      Math.round(keyframeSample.cts * 1e6 / this._timescale));
+    return keyframeDisplay === undefined ? displayIndex : keyframeDisplay;
+  }
+
+  // The frame ranges worth keeping, around each window centre: from that frame's
+  // GOP keyframe — or _windowBack, whichever reaches further back — forward
+  // through the read-ahead window. The keyframe back-edge is what makes short
+  // backward steps after a seek free: the run from the keyframe to the target is
+  // decoded on the way to the target anyway, so holding it costs no extra decode
+  // (the byte budget still caps how much survives — see _evict). Everything
+  // outside every range is stale: a previous seek's island, or history before
+  // the current GOP that a backward scrub would re-decode from an earlier
+  // keyframe regardless.
+  _keepRanges() {
+    return this._windowCenters().map((center) => {
+      const back = Math.min(center - this._windowBack,
+        this._keyframeDisplayFor(Math.max(0, center)));
+      return [back, center + this._windowAhead + this._windowSlack];
+    });
+  }
+
+  _insideKeepWindow(displayIndex, ranges = this._keepRanges()) {
+    return ranges.some(([lo, hi]) => displayIndex >= lo && displayIndex <= hi);
   }
 
   // A decoded frame arrived. Cache it (as an ImageBitmap, freeing the decoder's
@@ -5486,7 +5516,7 @@ class VideoEngine extends EventTarget {
   _absorb(frame) {
     const displayIndex = this._microsToDisplay.get(frame.timestamp);
     if (displayIndex === undefined
-        || !this._insideWindow(displayIndex)
+        || !this._insideKeepWindow(displayIndex)
         || this._cache.has(displayIndex)) {
       frame.close();
       return;
@@ -5515,6 +5545,21 @@ class VideoEngine extends EventTarget {
   }
 
   _evict() {
+    // First shed anything outside the keep window, whatever the budget says. A
+    // seek that leaves the cache under budget still drops the pre-seek island
+    // (and any history before the current GOP) this way, so the resident frames
+    // are the ones around where playback actually is now. Without this pass,
+    // budget-only eviction left a disconnected island sitting in the cache until
+    // enough new frames were decoded to breach the budget — which on a paused
+    // seek often never happened, so stale frames lingered indefinitely.
+    const keep = this._keepRanges();
+    for (const key of [...this._cache.keys()]) {
+      if (this._insideKeepWindow(key, keep)) continue;
+      const bitmap = this._cache.get(key);
+      if (bitmap) bitmap.close();
+      this._cache.delete(key);
+    }
+
     if (this._cache.size <= this._cacheBudget) return;
     // Forward-biased: drop frames BEHIND the playhead first (forward playback
     // won't revisit them), farthest-behind first; only then frames far AHEAD.
@@ -5546,6 +5591,11 @@ class VideoEngine extends EventTarget {
   _request(frameIndex) {
     if (frameIndex === this._stalledFrame) return;   // known-undecodable; don't spin
     this._target = frameIndex;
+    // Prune to the window centred on the new target now, not only when the next
+    // frame is absorbed: a seek onto already-cached frames (or one whose decode
+    // has not produced anything yet) would otherwise leave the previous
+    // location's frames resident until some later absorb happened to run _evict.
+    this._evict();
     if (!this._driving) { this._driving = true; this._drive(); }
   }
 
