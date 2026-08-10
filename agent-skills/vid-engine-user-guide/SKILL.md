@@ -1,5 +1,5 @@
 ---
-name: user-guide
+name: vid-engine-user-guide
 description: Load when helping someone install, integrate, or use exact-video-engine.js in an app — setting up playback with createBestEngine, calling any engine API member, handling UnplayableClipError, showing indexing progress, or tuning indexing/memory options. Covers usage from the outside, not the engine's internals.
 ---
 
@@ -313,8 +313,8 @@ engine.addEventListener('errormessage', ({ detail }) => {
 The best-known such combination (10-bit HEVC on WebKit) is headed off before
 it happens — `createBestEngine` routes it straight to the `<video>` element —
 so this event is the net for combinations not yet in that table. For which
-codecs decode where, load the **video-format-support-per-browser** skill next to this
-one.
+codecs decode where, load the **vid-engine-format-support-per-browser** skill next
+to this one.
 
 ## Building an index without an engine
 

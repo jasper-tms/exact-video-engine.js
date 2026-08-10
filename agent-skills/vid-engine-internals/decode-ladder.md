@@ -16,7 +16,8 @@ battery-friendly hardware overlay path — none of which have to settle for
 guessing at frame numbers.
 
 There is no tier 3. `prefer: 'native'` lets a host skip tier 1 (used when
-recovering from a mid-playback decoder death — see the user-guide skill).
+recovering from a mid-playback decoder death — see the vid-engine-user-guide
+skill).
 
 ## Index or refuse
 
@@ -109,7 +110,7 @@ server-side transcoding, say): `detectBrowserEngine()`,
 browserEngine)`.
 
 For the tested per-browser support matrix behind these decisions, load the
-sibling **video-format-support-per-browser** skill.
+sibling **vid-engine-format-support-per-browser** skill.
 
 ## Honesty after load
 

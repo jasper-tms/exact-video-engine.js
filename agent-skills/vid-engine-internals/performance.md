@@ -2,7 +2,7 @@
 
 Three currencies are managed separately, because a test (or an optimization)
 that watches only one will happily regress another: bytes off the network,
-round trips, and bytes held in memory. See testing.md for how each is pinned.
+round trips, and bytes held in memory. See vid-engine-test-coverage.md for how each is pinned.
 
 ## Opening a clip: round trips first
 

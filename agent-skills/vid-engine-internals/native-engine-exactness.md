@@ -25,7 +25,7 @@ the disagreement watcher below — the echo says nothing about the table.
 
 ## Timeline calibration and edit lists
 
-Three things are load-bearing, and all are tested (see testing.md):
+Three things are load-bearing, and all are tested (see vid-engine-test-coverage.md):
 
 - **The element's timeline is not always the container's.** A clip carrying an
   edit list can present its first frame at a nonzero `mediaTime`. The engine

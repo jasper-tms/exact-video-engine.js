@@ -1,5 +1,5 @@
 ---
-name: implementation-details
+name: vid-engine-internals
 description: Load before reading, explaining, or modifying any of exact-video-engine.js's internals — container indexing, engine selection and refusals, progressive indexing, native-tier frame exactness, performance strategy, or the test suite's design. Answer "how does the engine do X" from here, not from code inspection alone. Routes to one topic file per subject.
 ---
 
@@ -44,9 +44,9 @@ Open the topic file for the subject you are working on:
 - **[performance.md](performance.md)** — the startup read strategy (round
   trips, speculative first read), the decode read-ahead window, and the
   bytes-not-frames memory ceiling.
-- **[testing.md](testing.md)** — what each test pins, why the fixture clips
+- **[vid-engine-test-coverage.md](vid-engine-test-coverage.md)** — what each test pins, why the fixture clips
   are shaped the way they are, and what would silently pass without each case.
 
 For which codecs each backend can actually decode per browser (tested, not
-inferred), load the sibling **video-format-support-per-browser** skill instead of
-answering from code.
+inferred), load the sibling **vid-engine-format-support-per-browser** skill instead
+of answering from code.

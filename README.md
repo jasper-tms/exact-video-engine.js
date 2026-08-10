@@ -94,14 +94,14 @@ pattern.
 
 ## Learning more
 
-- **[agent-skills/user-guide/SKILL.md](agent-skills/user-guide/SKILL.md)** —
+- **[agent-skills/vid-engine-user-guide/SKILL.md](agent-skills/vid-engine-user-guide/SKILL.md)** —
   integrating the engine into an app: installation from a bundler, the full
   API reference, `UnplayableClipError` handling, indexing budgets and progress
   reporting, playing while the index is still being built, and memory tuning.
-- **[agent-skills/video-format-support-per-browser/SKILL.md](agent-skills/video-format-support-per-browser/SKILL.md)**
+- **[agent-skills/vid-engine-format-support-per-browser/SKILL.md](agent-skills/vid-engine-format-support-per-browser/SKILL.md)**
   — which codecs each backend (WebCodecs vs native `<video>`) can actually
   decode, per browser engine, from testing rather than from documentation.
-- **[agent-skills/implementation-details/SKILL.md](agent-skills/implementation-details/SKILL.md)**
+- **[agent-skills/vid-engine-internals/SKILL.md](agent-skills/vid-engine-internals/SKILL.md)**
   — how the engine works inside: the per-container indexers, the
   engine-selection ladder and refusal taxonomy, the certified-prefix rules
   behind progressive indexing, the native tier's exactness machinery, the

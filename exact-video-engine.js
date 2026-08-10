@@ -243,8 +243,8 @@ function reEncodeSuggestion() {
 // WebCodecs). No crash, no flash, and the container index still makes the native
 // path frame-exact.
 //
-// The matrix here is empirical (real-device testing; see the video-format-support-per-browser
-// agent skill). It is deliberately TIGHT — a false positive needlessly gives up
+// The matrix here is empirical (real-device testing; see the
+// vid-engine-format-support-per-browser agent skill). It is deliberately TIGHT — a false positive needlessly gives up
 // the WebCodecs owned-clock path — so it names only combinations confirmed to
 // crash, and the reactive net still backs up anything it misses.
 // ==================================================================
@@ -3488,7 +3488,7 @@ function isMotionJpegFourCc(fourCc) {
 // units with start codes, SPS/PPS carried in-band on each keyframe). We do NOT
 // feed WebCodecs that Annex B directly: WebKit's decoder answers isConfigSupported
 // = true for an Annex-B (no-description) config and then FAILS the actual decode —
-// a dishonest yes (see the video-format-support-per-browser skill). So we configure the
+// a dishonest yes (see the vid-engine-format-support-per-browser skill). So we configure the
 // decoder in length-prefixed AVCC mode instead — the format every engine decodes,
 // WebKit included — by building an `avcC` description from the first keyframe's
 // SPS and PPS, and the caller converts each frame's Annex B to AVCC before feeding
@@ -4733,8 +4733,8 @@ class ContainerIndex extends EventTarget {
     // from the first keyframe's SPS/PPS, and the samples (Annex B in the file) are
     // converted to AVCC in the decode path. WebKit's WebCodecs claims to support
     // Annex-B-no-description and then fails the decode, so AVCC is the only path
-    // that works on every engine (see src/avi.js and the video-format-support-per-browser
-    // skill).
+    // that works on every engine (see src/avi.js and the
+    // vid-engine-format-support-per-browser skill).
     if (table.decoderConfig.description !== undefined) {
       this.decoderConfig.description = table.decoderConfig.description;
     }
@@ -5014,9 +5014,16 @@ class VideoEngine extends EventTarget {
   // tool, a thumbnail picker — is buying bandwidth and decode work it will not
   // use, and can turn this down. It does not affect which frames are available,
   // only how eagerly they are fetched: the frame you ask for is always decoded.
+  // Infinity means "read as far ahead as cacheBytes allows": the window then
+  // fills the whole byte budget instead of stopping at a frame count.
+  //
+  // options.windowBack: how many decoded frames to KEEP behind the playhead, so
+  // a backward scrub finds them resident rather than re-decoding from a keyframe.
+  // Default 18. Like windowAhead it is only a target the byte budget can cut, and
+  // Infinity likewise means "hold as much history as cacheBytes allows".
   //
   // options.cacheBytes: the memory ceiling for decoded frames (default 96 MB).
-  // This, not windowAhead, is what bounds the engine's memory — the window is
+  // This, not the windows, is what bounds the engine's memory — each window is
   // cut to fit it, so a 4K clip caches few frames and a 360p clip caches many.
   //
   // options.imageSmoothingEnabled: true by default, matching every prior
@@ -5084,7 +5091,7 @@ class VideoEngine extends EventTarget {
     // decoder). These are wishes, not the budget — _sizeWindows() cuts them to
     // what the clip's resolution can afford once the index says how big a frame
     // is. windowAhead: 0 means "no read-ahead at all", and stays 0.
-    this._wantedWindowBack = 18;
+    this._wantedWindowBack = Math.max(0, options.windowBack ?? 18);
     this._wantedWindowAhead = Math.max(0, options.windowAhead ?? 56);   // ≈2 s
     // A decoded frame's memory is width x height x 4, so a frame-counted cache
     // costs whatever the clip decides: 82 frames of 360p is 75 MB and 82 frames
@@ -5225,6 +5232,23 @@ class VideoEngine extends EventTarget {
 
   play() { if (this.ready && !this.playing) { this.playing = true; this._lastNow = 0; } }
   pause() { this.playing = false; }
+
+  // Change the decoded-frame memory ceiling at runtime — the same quantity the
+  // cacheBytes constructor option sets, clamped the same way. The frame window
+  // is re-derived from the new budget and the clip's frame size (_sizeWindows),
+  // the cache is trimmed to it at once so a decrease frees memory immediately,
+  // and the driver is kicked so an increase starts filling the newly affordable
+  // read-ahead without waiting for the next seek. A host can turn this down on a
+  // low-memory warning and back up when it has room again.
+  setCacheBytes(bytes) {
+    this._cacheBytes = Math.max(8 << 20, Math.floor(bytes) || (8 << 20));
+    // Before an index is adopted there is no frame size to size the window
+    // against; _adoptIndex runs _sizeWindows once it has one, off this value.
+    if (!this._index) return;
+    this._sizeWindows();
+    this._evict();
+    if (this.ready) this._request(this._target);
+  }
 
   // options.index: a ContainerIndex already built for this source (createBestEngine
   // builds one up front and hands the same one to whichever engine plays, so the
@@ -6656,6 +6680,7 @@ class NativeVideoEngine extends EventTarget {
 
   update() {}          // the <video> element advances its own clock
   resizeCanvas() {}    // CSS object-fit handles letterboxing
+  setCacheBytes() {}   // no decoded-frame cache here; the browser buffers itself
 
   // Drop the element's decoded media and stop the presented-frame clock, rather
   // than wait for garbage collection. Like VideoEngine, the engine stays usable:
@@ -6718,6 +6743,8 @@ async function createBestEngine(source, options = {}) {
     // Passed through to VideoEngine; ignored by the <video> element, which does
     // its own buffering. See the VideoEngine constructor.
     windowAhead,
+    windowBack,
+    cacheBytes,
     // Passed through to VideoEngine; the <video> element has no comparable
     // control (the browser resamples its own decoded frames, not us), so this
     // is a no-op on that tier. See the VideoEngine constructor.
@@ -6876,7 +6903,8 @@ async function createBestEngine(source, options = {}) {
   if (prefer !== 'native' && !webCodecsUnreliable
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
     webCodecsWasTried = true;
-    const engine = new VideoEngine(canvas, { windowAhead, imageSmoothingEnabled });
+    const engine = new VideoEngine(canvas,
+      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled });
     try {
       await engine.load(source, { index });
       return engine;

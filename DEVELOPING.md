@@ -32,7 +32,7 @@ bash test/run-tests.sh
 
 What each test pins, why the fixture clips are shaped the way they are, and
 what would silently pass without each case is documented in
-[agent-skills/implementation-details/testing.md](agent-skills/implementation-details/testing.md)
+[agent-skills/vid-engine-internals/vid-engine-test-coverage.md](agent-skills/vid-engine-internals/vid-engine-test-coverage.md)
 — read it before adding or modifying tests.
 
 ## Releasing
@@ -41,7 +41,8 @@ what would silently pass without each case is documented in
 release: a [workflow](.github/workflows/release.yml) tags that commit `vX.Y.Z`
 and cuts a GitHub release from it.
 
-The pinned jsDelivr URLs in `demo.html`, the README, the user-guide skill, and
+The pinned jsDelivr URLs in `demo.html`, the README, the vid-engine-user-guide
+skill, and
 the `version` field in `package.json` are *derived* from `VERSION` by
 `.githooks/sync_version.sh`, which `.githooks/pre-commit` runs for you, so they
 land in the same commit that changes `VERSION`. A release is then:
