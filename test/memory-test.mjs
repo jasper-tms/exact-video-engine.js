@@ -187,5 +187,29 @@ try {
   report('no read-ahead still paints frames', false, String(error.message || error));
 }
 
+// The ceiling can move at runtime (setCacheBytes), and moving it down and back
+// up while paused must give the window back WHOLE. The driver feeds samples by
+// a high-water mark and never looks back, so frames the shrink evicted from
+// behind that mark were unreachable: widening the ceiling resumed the stream
+// from the mark and the cache came back with a hole in it ([0-3, 6-112] on a
+// real clip) that nothing ever healed. Needs the big-framed clip for a second
+// reason here: the default window must NOT stream a clip this size to the end,
+// or the mark sits past every goal and the case being guarded never arises.
+try {
+  const name = 'regrown cache has no holes';
+  const result = await measure(LARGE_FILE, { mode: 'resize' });
+  const whole = result.grown.ranges.length === 1
+    && result.grown.ranges[0].startsWith('0-')
+    && result.grown.size > result.shrunk.size;
+  const ok = whole && result.driverErrors.length === 0;
+  report(name, ok,
+    `${result.shrunk.size} frames at 8 MB regrew to ${result.grown.size} `
+    + `[${result.grown.ranges.join(', ')}]`
+    + (whole ? '' : ' — the shrink-evicted frames behind the stream never came back')
+    + (result.driverErrors.length ? ` — DECODE DRIVER DIED: ${result.driverErrors[0]}` : ''));
+} catch (error) {
+  report('regrown cache has no holes', false, String(error.message || error));
+}
+
 await browser.close();
 process.exit(failures ? 1 : 0);

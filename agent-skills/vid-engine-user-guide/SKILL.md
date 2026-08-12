@@ -27,7 +27,7 @@ with a clear error.** There is no approximate mode.
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch (jsDelivr caches
      branch refs for hours, so @main changes behavior unpredictably). -->
-<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.5.1/exact-video-engine.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.6.0/exact-video-engine.js"></script>
 ```
 
 `exact-video-engine.js` is a classic script: it defines globals
@@ -281,7 +281,13 @@ and the window fills behind them.
   that shows one frame — can turn read-ahead off: `windowAhead: 0` (as a
   `createBestEngine` option or a `VideoEngine` constructor option). The frame
   you ask for is still decoded; the engine just stops there. The default (56
-  frames, about two seconds) is what you want for anything that plays.
+  frames, about two seconds) is what you want for anything that plays. At the
+  other extreme, `windowAhead: Infinity` reads as far ahead as `cacheBytes`
+  allows, so the byte ceiling becomes the only limit.
+- **History behind the playhead** is `windowBack` (default 18 frames), the
+  mirror of `windowAhead`: frames kept resident so a backward scrub finds them
+  decoded instead of re-decoding from a keyframe. `Infinity` likewise means
+  "hold as much history as `cacheBytes` allows".
 - **The memory ceiling is bytes, not frames**: `cacheBytes` (default 96 MB).
   At the default, a 360p clip keeps the full 56-frame read-ahead while a 1080p
   clip holds about a dozen frames — enough to play without stalling, and far
@@ -289,6 +295,9 @@ and the window fills behind them.
   decode session outright if decoded frames exhaust its surface pool).
   Lowering it shrinks read-ahead first and history second; it never changes
   which frames are *available*, only how many are held in memory at once.
+  `engine.setCacheBytes(bytes)` changes the ceiling at runtime (a no-op on the
+  native tier, which has no addressable frame cache) — turn it down on a
+  low-memory warning and back up when there is room.
 
 ```js
 const engine = await createBestEngine(source, { canvas, video, windowAhead: 0 });

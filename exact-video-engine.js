@@ -5247,7 +5247,33 @@ class VideoEngine extends EventTarget {
     if (!this._index) return;
     this._sizeWindows();
     this._evict();
-    if (this.ready) this._request(this._target);
+    if (!this.ready) return;
+    // Growing the window can call for frames the driver already STREAMED PAST and
+    // eviction has since dropped — a paused viewer who shrank the cache and then
+    // widened it again. The forward drive won't reproduce them: it feeds by a
+    // high-water mark (_fedThrough) and those frames sit behind it, so it judges
+    // them already delivered and streams onward, leaving a hole the read-ahead
+    // never heals. Only a run restart from the keyframe re-decodes them. So walk
+    // the wanted forward window and invalidate the run if any frame in it is
+    // neither resident nor still on its way AND the stream is already past it.
+    // (Not "high-water mark past the whole goal": after a partial fill the mark
+    // sits BETWEEN the surviving island and the new goal, and resuming from
+    // there strands the evicted frames behind it — cache [0-3, 6-112].) Growing
+    // mid-playback stays free: wanted frames are ahead of the mark, no restart.
+    if (this._cache.size < this._cacheBudget) {
+      const aheadFrame = Math.min(this.numFrames - 1, this._target + this._windowAhead);
+      for (let frame = this._target; frame <= aheadFrame; frame++) {
+        if (this._cache.has(frame) || this._pending.has(frame)) continue;
+        if (this._displayToDecode[frame] <= this._fedThrough) {
+          this._runKeyframe = -1;
+          break;
+        }
+        // A missing frame the stream has NOT reached yet doesn't settle it:
+        // with B-frame reordering a later display frame can still have an
+        // earlier decode index, so keep scanning rather than stopping here.
+      }
+    }
+    this._request(this._target);
   }
 
   // options.index: a ContainerIndex already built for this source (createBestEngine
@@ -5579,6 +5605,14 @@ class VideoEngine extends EventTarget {
     const keep = this._keepRanges();
     for (const key of [...this._cache.keys()]) {
       if (this._insideKeepWindow(key, keep)) continue;
+      // Never close the frame currently on screen. _lastBitmap aliases this same
+      // ImageBitmap, and _syncCanvasSize repaints it on the next canvas resize —
+      // closing it here leaves that repaint drawing a detached bitmap, which
+      // throws. A loop wrap (or any seek that lands the playhead far from where
+      // the picture still shows the previous frame) is exactly when the on-screen
+      // frame falls outside the keep window, so guard it until a new frame
+      // replaces it. It becomes evictable again the moment _shownFrame moves on.
+      if (key === this._shownFrame) continue;
       const bitmap = this._cache.get(key);
       if (bitmap) bitmap.close();
       this._cache.delete(key);
@@ -5602,6 +5636,7 @@ class VideoEngine extends EventTarget {
     while (this._cache.size > this._cacheBudget) {
       const key = keys.shift();
       if (key === undefined) break;
+      if (key === this._shownFrame) continue;   // pinned: see the keep-pass note
       const bitmap = this._cache.get(key);
       if (bitmap) bitmap.close();
       this._cache.delete(key);

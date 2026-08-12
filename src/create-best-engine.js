@@ -32,6 +32,8 @@ export async function createBestEngine(source, options = {}) {
     // Passed through to VideoEngine; ignored by the <video> element, which does
     // its own buffering. See the VideoEngine constructor.
     windowAhead,
+    windowBack,
+    cacheBytes,
     // Passed through to VideoEngine; the <video> element has no comparable
     // control (the browser resamples its own decoded frames, not us), so this
     // is a no-op on that tier. See the VideoEngine constructor.
@@ -190,7 +192,8 @@ export async function createBestEngine(source, options = {}) {
   if (prefer !== 'native' && !webCodecsUnreliable
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
     webCodecsWasTried = true;
-    const engine = new VideoEngine(canvas, { windowAhead, imageSmoothingEnabled });
+    const engine = new VideoEngine(canvas,
+      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled });
     try {
       await engine.load(source, { index });
       return engine;

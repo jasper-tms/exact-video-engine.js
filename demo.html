@@ -9,9 +9,43 @@
      mp4box.js first, so the MP4Box/DataStream globals exist, then the engine
      from a PINNED release tag. Never reference @main — jsDelivr caches branch
      refs for hours, so the page would change behavior at unpredictable times
-     with no commit anywhere. -->
+     with no commit anywhere.
+
+     The engine <script> is written by the bootstrap below rather than hard-coded,
+     so a local dev context can switch between the pinned CDN release and the
+     ./exact-video-engine.js in this working tree (the engine-source dropdown,
+     top-right). A DEPLOYED page has no such context and always loads the pinned
+     CDN build, so it still mirrors a real consumer precisely. -->
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.5.1/exact-video-engine.js"></script>
+<script>
+// Choose the engine build and write its <script> synchronously, so it loads in
+// the same ordered, render-blocking way the static tag it replaces did (after
+// mp4box, before the demo script). Switching builds needs a reload, not a live
+// swap: the engine is one classic script declaring top-level `class`es, and
+// injecting a second one in the same global scope is a redeclaration error — a
+// fresh page is the only clean way to swap it. The choice persists in
+// localStorage under 'engineSource'; the dropdown flips it and reloads.
+(function () {
+  // The CDN URL stays a literal @vX.Y.Z here so .githooks/sync_version.sh still
+  // finds and rewrites it in step with VERSION.
+  const ENGINE_SOURCES = {
+    cdn: 'https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.6.0/exact-video-engine.js',
+    local: 'exact-video-engine.js',
+  };
+  const isLocalContext = location.protocol === 'file:'
+    || /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  const stored = localStorage.getItem('engineSource');
+  // A stored choice wins. Otherwise a local dev context defaults to the build you
+  // just made; a deployed page always takes the pinned CDN release.
+  const engineSource = (stored === 'local' || stored === 'cdn')
+    ? stored : (isLocalContext ? 'local' : 'cdn');
+  // Handed to the demo script so the dropdown can reflect the active build and
+  // label the CDN option with its pinned version.
+  window.__engineSource = engineSource;
+  window.__engineSources = ENGINE_SOURCES;
+  document.write('<script src="' + ENGINE_SOURCES[engineSource] + '"><\/script>');
+})();
+</script>
 
 <style>
   :root {
@@ -31,6 +65,37 @@
     --miss: #e0a13a;
   }
   * { box-sizing: border-box; }
+
+  /* Local-dev-only control (see the bootstrap): pick which engine build the page
+     runs. Hidden until the demo script confirms a local context and reveals it,
+     so a deployed page never shows it. Fixed to the top-right corner, above the
+     centred column. */
+  #engine-source-switch {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    z-index: 10;
+    display: none;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 10px;
+  }
+  #engine-source-switch.visible { display: flex; }
+  #engine-source-switch select {
+    font: inherit;
+    font-size: 12px;
+    color: var(--text);
+    background: var(--background);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 6px;
+    cursor: pointer;
+  }
   body {
     margin: 0;
     min-height: 100vh;
@@ -250,6 +315,37 @@
   .meter-fill.low { background: var(--approximate); }
   .meter-fill.crit { background: #e05a5a; }
 
+  /* The decoded-frame memory ceiling, live-adjustable. Dragging it calls
+     engine.setCacheBytes, which re-sizes the frame window: turn it down and the
+     cache strip above shrinks as frames are evicted, turn it up and read-ahead
+     fills further. accent-color themes the native range's thumb and fill to
+     match the rest of the controls without the fully custom track the scrubber
+     needs. */
+  .cache-control {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+  }
+  #cache-size {
+    flex: 1;
+    min-width: 160px;
+    max-width: 380px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  #cache-size:disabled { opacity: 0.4; cursor: default; }
+  /* Reserve the widest reading ("1016 MB") so the slider to its right holds still
+     as the value's digit count changes while you drag. Monospace and tabular
+     figures already come from .readout; this just fixes the box width. The native
+     state's longer "(native engine)" text overflows this min-width freely — the
+     slider is disabled there, so nothing is bobbing to notice. */
+  #cache-size-label strong {
+    display: inline-block;
+    min-width: 8ch;
+    text-align: right;
+  }
+
   .badges { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
   .badge {
     font-size: 12px;
@@ -311,6 +407,15 @@
 </style>
 </head>
 <body>
+<div id="engine-source-switch"
+     title="Which exact-video-engine.js build this page is running. Local dev only; switching reloads the page.">
+  <label for="engine-source">engine:</label>
+  <select id="engine-source">
+    <option value="local">Local build</option>
+    <option value="cdn">CDN</option>
+  </select>
+</div>
+
 <main>
   <h1>exact-video-engine.js</h1>
   <p class="subtitle">
@@ -364,6 +469,17 @@
       <span class="readout" id="seek-readout">last seek: <strong>—</strong></span>
     </div>
 
+    <!-- The decoded-frame cache ceiling, live. The engine sizes its frame
+         window in BYTES (a window of frames costs whatever the clip's resolution
+         decides), so this is the real memory bound — not a frame count. Dragging
+         it calls engine.setCacheBytes: turn it down to watch the cache strip
+         above evict, up to watch read-ahead reach further. -->
+    <div class="cache-control">
+      <label class="readout" id="cache-size-label" for="cache-size">cache size: <strong>—</strong></label>
+      <input id="cache-size" type="range" min="8" max="2048" step="8" value="96"
+             title="Memory ceiling for decoded frames. The engine cuts its frame window to fit this, so a low ceiling on a high-resolution clip holds only a few frames.">
+    </div>
+
     <!-- Read-ahead headroom. How many seconds of video are decoded and resident
          CONTINUOUSLY ahead of the playhead (a gap ahead stalls playback at the
          gap, so only the unbroken run counts), against the seconds the engine
@@ -406,6 +522,99 @@ const cacheReadout = document.getElementById('cache-readout');
 const seekReadout = document.getElementById('seek-readout');
 const headroomLabel = document.getElementById('headroom-label');
 const headroomFill = document.getElementById('headroom-fill');
+const cacheSizeInput = document.getElementById('cache-size');
+const cacheSizeLabel = document.getElementById('cache-size-label');
+const BYTES_PER_MEGABYTE = 1024 * 1024;
+
+// The engine-source dropdown (top-right). The bootstrap in <head> already chose
+// and loaded a build from this same localStorage key; here we only reveal the
+// control in a local dev context, reflect the active build, label the CDN option
+// with its pinned version (parsed from the URL so it never goes stale), and
+// reload on a change — a reload is the only clean way to swap the engine, see
+// the bootstrap comment. A deployed page returns early and never shows it.
+(function setupEngineSourceSwitch() {
+  const isLocalContext = location.protocol === 'file:'
+    || /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  if (!isLocalContext) return;
+  const wrap = document.getElementById('engine-source-switch');
+  const select = document.getElementById('engine-source');
+  const cdnUrl = (window.__engineSources && window.__engineSources.cdn) || '';
+  const version = cdnUrl.match(/@v(\d+\.\d+\.\d+)\//);
+  select.querySelector('option[value="cdn"]').textContent =
+    version ? `CDN (v${version[1]})` : 'CDN';
+  select.value = window.__engineSource || 'cdn';
+  select.addEventListener('change', async () => {
+    localStorage.setItem('engineSource', select.value);
+    // Carry the loaded clip and its settings across the reload the swap needs, so
+    // switching engine builds doesn't drop what you were looking at. Best-effort:
+    // if persisting fails (quota, private mode) we still switch, just to a clean
+    // page. See restoreSessionAfterSwitch() for the other half.
+    if (currentFile) {
+      try {
+        await saveSession({
+          file: currentFile,
+          cacheSizeMegabytes: cacheSizeInput.value,
+          prefer,
+          frame: engine ? Math.max(0, engine.currentFrame) : 0,
+          playing: engine ? !engine.paused : false,
+        });
+        sessionStorage.setItem(RESTORE_FLAG, '1');
+      } catch (persistError) {
+        console.warn('demo: could not persist session across the switch', persistError);
+      }
+    }
+    location.reload();
+  });
+  wrap.classList.add('visible');
+})();
+
+// ---- session persistence across an engine-version switch --------------------
+// The switch reloads the page (the engine is one classic script of top-level
+// classes; a live swap can't re-declare them). A reload wipes JS state including
+// the dropped File — but a File is a Blob, which localStorage cannot hold and
+// IndexedDB can, so the clip and its settings are stashed there just before the
+// reload and read back after. Only a switch restores (guarded by a sessionStorage
+// flag); a plain refresh still opens a clean page.
+const SESSION_DB = 'exact-video-engine-demo';
+const SESSION_STORE = 'session';
+const SESSION_KEY = 'current';
+const RESTORE_FLAG = 'restoreLoadedClip';
+
+function openSessionDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(SESSION_DB, 1);
+    request.onupgradeneeded = () => request.result.createObjectStore(SESSION_STORE);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveSession(record) {
+  const db = await openSessionDb();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(SESSION_STORE, 'readwrite');
+      tx.objectStore(SESSION_STORE).put(record, SESSION_KEY);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } finally { db.close(); }
+}
+
+// Read the stored session and delete it in the same transaction: a restored clip
+// is consumed once, so a later manual refresh is clean.
+async function takeSession() {
+  const db = await openSessionDb();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(SESSION_STORE, 'readwrite');
+      const store = tx.objectStore(SESSION_STORE);
+      const getRequest = store.get(SESSION_KEY);
+      getRequest.onsuccess = () => { store.delete(SESSION_KEY); resolve(getRequest.result || null); };
+      getRequest.onerror = () => reject(getRequest.error);
+    });
+  } finally { db.close(); }
+}
 
 let engine = null;
 let scrubbing = false;
@@ -635,6 +844,32 @@ function updateHeadroom() {
     + `</strong> ahead / ${targetSeconds.toFixed(2)} s (${percent}%)`;
 }
 
+// Push the cache-size slider onto the label and onto the engine. The value is a
+// user preference that persists across clips: load() calls this after building
+// each engine (which starts at the library default), so a ceiling chosen for one
+// clip carries to the next. The native <video> tier has no addressable frame
+// cache — setCacheBytes is a no-op there — so the control is disabled and says
+// so, matching the cache readout's "(native engine)".
+// The range runs to 2 GB, so read the top of it in gigabytes rather than a
+// four-digit MB figure. Below 1024 it stays in MB; the .0 on a whole GB is
+// trimmed so 2048 reads "2 GB", not "2.0 GB".
+function formatCacheSize(megabytes) {
+  if (megabytes < 1024) return `${megabytes} MB`;
+  const gigabytes = (megabytes / 1024).toFixed(1).replace(/\.0$/, '');
+  return `${gigabytes} GB`;
+}
+
+function applyCacheSize() {
+  const megabytes = parseInt(cacheSizeInput.value, 10);
+  const reachable = hasFrameCache();
+  cacheSizeInput.disabled = !!engine && !reachable;
+  cacheSizeLabel.innerHTML = (engine && !reachable)
+    ? 'cache size: <strong>— (native engine)</strong>'
+    : `cache size: <strong>${formatCacheSize(megabytes)}</strong>`;
+  if (reachable) engine.setCacheBytes(megabytes * BYTES_PER_MEGABYTE);
+}
+cacheSizeInput.addEventListener('input', applyCacheSize);
+
 // ?engine=native forces the <video> fallback, ?engine=webcodecs forces WebCodecs.
 // Without it the library picks, which on a modern desktop browser always means
 // WebCodecs — so this, and the engine pill below the video, are the only ways to
@@ -696,7 +931,16 @@ async function load(file) {
   showFormatBadge(file, containerIndex);
 
   try {
-    engine = await createBestEngine(file, { canvas, video, prefer, index: containerIndex });
+    // windowAhead/windowBack: Infinity make the cache-size slider the SOLE
+    // governor of how many frames are resident. A real host leaves these at the
+    // modest defaults (≈2 s ahead, 18 back) and lets cacheBytes only cap them —
+    // but then, on a clip whose whole default window already fits under the byte
+    // ceiling, turning the cache up changes nothing to see. Asking for an
+    // unbounded window makes the byte budget always the binding constraint, so
+    // dragging the slider visibly grows and shrinks both read-ahead and the
+    // frames held behind the playhead across the entire range.
+    engine = await createBestEngine(file, { canvas, video, prefer, index: containerIndex,
+      windowAhead: Infinity, windowBack: Infinity });
   } catch (error) {
     // Nothing is playing now, so bring the drop panel back rather than leave a
     // dead player on screen.
@@ -747,6 +991,9 @@ async function load(file) {
   durationReadout.textContent = formatTime(engine.duration);
 
   showEngineBadge();
+  // The new engine started at the library-default ceiling; re-apply the slider's
+  // current value so a cache size chosen for a previous clip carries over.
+  applyCacheSize();
 
   document.getElementById('clip-name').textContent = file.name;
   document.getElementById('clip-size').textContent =
@@ -901,6 +1148,32 @@ document.addEventListener('drop', (event) => {
 });
 
 window.addEventListener('resize', () => { if (engine) engine.resizeCanvas(); });
+
+// The other half of the engine-switch persistence: if this load follows a switch,
+// pull the stashed clip and settings back and pick up where we left off. Runs
+// after the engine globals are in scope (the demo script is written after the
+// engine <script>), so load() and the engine API are ready.
+(async function restoreSessionAfterSwitch() {
+  if (sessionStorage.getItem(RESTORE_FLAG) !== '1') return;   // a plain refresh: stay clean
+  sessionStorage.removeItem(RESTORE_FLAG);
+  let record = null;
+  try {
+    record = await takeSession();
+  } catch (restoreError) {
+    console.warn('demo: could not restore the session after the switch', restoreError);
+    return;
+  }
+  if (!record || !record.file) return;
+  // Apply the settings load() reads while it builds the engine, BEFORE loading:
+  // the cache-size slider (applyCacheSize() reads its value on load) and the
+  // engine-tier preference.
+  if (record.cacheSizeMegabytes) cacheSizeInput.value = record.cacheSizeMegabytes;
+  if (record.prefer) prefer = record.prefer;
+  await load(record.file);
+  if (!engine) return;                        // the clip was refused on this build
+  if (record.frame) seekToFrame(record.frame);
+  if (record.playing) engine.play();
+})();
 </script>
 </body>
 </html>

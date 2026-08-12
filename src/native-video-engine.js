@@ -667,6 +667,7 @@ export class NativeVideoEngine extends EventTarget {
 
   update() {}          // the <video> element advances its own clock
   resizeCanvas() {}    // CSS object-fit handles letterboxing
+  setCacheBytes() {}   // no decoded-frame cache here; the browser buffers itself
 
   // Drop the element's decoded media and stop the presented-frame clock, rather
   // than wait for garbage collection. Like VideoEngine, the engine stays usable:

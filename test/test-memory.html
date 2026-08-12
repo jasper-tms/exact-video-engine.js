@@ -23,8 +23,11 @@
 // either way -- and the byte-counting startup test measures bytes off the
 // NETWORK, not bytes held in memory. Only this one can see it.
 //
-//   mode=peak  play the clip through and report the high-water mark of resident
-//              decoded-frame bytes, plus the window the engine sized itself to.
+//   mode=peak    play the clip through and report the high-water mark of
+//                resident decoded-frame bytes, plus the window the engine sized
+//                itself to.
+//   mode=resize  paused at frame 0, turn the ceiling down and back up and
+//                report what is resident after each step -- see runResize.
 const TICK_MILLISECONDS = 16;    // a stand-in for the host's rAF loop
 const PLAY_SECONDS = 4;
 
@@ -40,10 +43,65 @@ function residentBytes(engine) {
   return bytes;
 }
 
+// setCacheBytes down and back up, paused at frame 0, and report what is
+// resident after each step. The bug this guards: the decode driver feeds
+// samples by a high-water mark (_fedThrough) and never looks back, so frames
+// the shrink evicted from BEHIND that mark were simply gone -- widening the
+// ceiling resumed the stream from the mark and left a hole in the cache
+// ([0-3, 6-112] on a real clip) that no amount of waiting healed. Only a clip
+// the initial window does NOT stream to the end can see this: stream it all
+// and the mark is past every goal, where the restart already fired.
+async function runResize(canvas, url) {
+  const engine = new VideoEngine(canvas, {
+    windowAhead: Infinity,
+    windowBack: Infinity,
+  });
+  await engine.load(url);
+  engine.seekToFrame(0);
+  await engine.ensureFrame(0);
+
+  const settled = async () => {
+    let previous = -1;
+    while (engine._cache.size !== previous || engine._driving) {
+      previous = engine._cache.size;
+      await sleep(100);
+    }
+  };
+  // Contiguous runs of resident frame numbers, e.g. ['0-3', '6-112'].
+  const ranges = () => {
+    const runs = [];
+    for (const key of [...engine._cache.keys()].sort((a, b) => a - b)) {
+      const last = runs[runs.length - 1];
+      if (last && key === last[1] + 1) last[1] = key;
+      else runs.push([key, key]);
+    }
+    return runs.map(([lo, hi]) => `${lo}-${hi}`);
+  };
+  const stage = () => ({ size: engine._cache.size, ranges: ranges() });
+
+  await settled();
+  const initial = stage();
+  engine.setCacheBytes(8 << 20);
+  await settled();
+  const shrunk = stage();
+  engine.setCacheBytes(1200 << 20);
+  await settled();
+  const grown = stage();
+
+  window.__result = {
+    initial, shrunk, grown,
+    videoWidth: engine.videoWidth,
+    videoHeight: engine.videoHeight,
+    numFrames: engine.numFrames,
+  };
+  engine.destroy();
+}
+
 async function run() {
   const params = new URLSearchParams(location.search);
   const canvas = document.querySelector('canvas');
   const url = 'clips/' + params.get('file');
+  if (params.get('mode') === 'resize') return runResize(canvas, url);
   const options = {};
   if (params.get('cacheBytes')) options.cacheBytes = Number(params.get('cacheBytes'));
   if (params.get('windowAhead')) options.windowAhead = Number(params.get('windowAhead'));

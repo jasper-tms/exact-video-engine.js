@@ -29,9 +29,16 @@ export class VideoEngine extends EventTarget {
   // tool, a thumbnail picker — is buying bandwidth and decode work it will not
   // use, and can turn this down. It does not affect which frames are available,
   // only how eagerly they are fetched: the frame you ask for is always decoded.
+  // Infinity means "read as far ahead as cacheBytes allows": the window then
+  // fills the whole byte budget instead of stopping at a frame count.
+  //
+  // options.windowBack: how many decoded frames to KEEP behind the playhead, so
+  // a backward scrub finds them resident rather than re-decoding from a keyframe.
+  // Default 18. Like windowAhead it is only a target the byte budget can cut, and
+  // Infinity likewise means "hold as much history as cacheBytes allows".
   //
   // options.cacheBytes: the memory ceiling for decoded frames (default 96 MB).
-  // This, not windowAhead, is what bounds the engine's memory — the window is
+  // This, not the windows, is what bounds the engine's memory — each window is
   // cut to fit it, so a 4K clip caches few frames and a 360p clip caches many.
   //
   // options.imageSmoothingEnabled: true by default, matching every prior
@@ -99,7 +106,7 @@ export class VideoEngine extends EventTarget {
     // decoder). These are wishes, not the budget — _sizeWindows() cuts them to
     // what the clip's resolution can afford once the index says how big a frame
     // is. windowAhead: 0 means "no read-ahead at all", and stays 0.
-    this._wantedWindowBack = 18;
+    this._wantedWindowBack = Math.max(0, options.windowBack ?? 18);
     this._wantedWindowAhead = Math.max(0, options.windowAhead ?? 56);   // ≈2 s
     // A decoded frame's memory is width x height x 4, so a frame-counted cache
     // costs whatever the clip decides: 82 frames of 360p is 75 MB and 82 frames
@@ -240,6 +247,49 @@ export class VideoEngine extends EventTarget {
 
   play() { if (this.ready && !this.playing) { this.playing = true; this._lastNow = 0; } }
   pause() { this.playing = false; }
+
+  // Change the decoded-frame memory ceiling at runtime — the same quantity the
+  // cacheBytes constructor option sets, clamped the same way. The frame window
+  // is re-derived from the new budget and the clip's frame size (_sizeWindows),
+  // the cache is trimmed to it at once so a decrease frees memory immediately,
+  // and the driver is kicked so an increase starts filling the newly affordable
+  // read-ahead without waiting for the next seek. A host can turn this down on a
+  // low-memory warning and back up when it has room again.
+  setCacheBytes(bytes) {
+    this._cacheBytes = Math.max(8 << 20, Math.floor(bytes) || (8 << 20));
+    // Before an index is adopted there is no frame size to size the window
+    // against; _adoptIndex runs _sizeWindows once it has one, off this value.
+    if (!this._index) return;
+    this._sizeWindows();
+    this._evict();
+    if (!this.ready) return;
+    // Growing the window can call for frames the driver already STREAMED PAST and
+    // eviction has since dropped — a paused viewer who shrank the cache and then
+    // widened it again. The forward drive won't reproduce them: it feeds by a
+    // high-water mark (_fedThrough) and those frames sit behind it, so it judges
+    // them already delivered and streams onward, leaving a hole the read-ahead
+    // never heals. Only a run restart from the keyframe re-decodes them. So walk
+    // the wanted forward window and invalidate the run if any frame in it is
+    // neither resident nor still on its way AND the stream is already past it.
+    // (Not "high-water mark past the whole goal": after a partial fill the mark
+    // sits BETWEEN the surviving island and the new goal, and resuming from
+    // there strands the evicted frames behind it — cache [0-3, 6-112].) Growing
+    // mid-playback stays free: wanted frames are ahead of the mark, no restart.
+    if (this._cache.size < this._cacheBudget) {
+      const aheadFrame = Math.min(this.numFrames - 1, this._target + this._windowAhead);
+      for (let frame = this._target; frame <= aheadFrame; frame++) {
+        if (this._cache.has(frame) || this._pending.has(frame)) continue;
+        if (this._displayToDecode[frame] <= this._fedThrough) {
+          this._runKeyframe = -1;
+          break;
+        }
+        // A missing frame the stream has NOT reached yet doesn't settle it:
+        // with B-frame reordering a later display frame can still have an
+        // earlier decode index, so keep scanning rather than stopping here.
+      }
+    }
+    this._request(this._target);
+  }
 
   // options.index: a ContainerIndex already built for this source (createBestEngine
   // builds one up front and hands the same one to whichever engine plays, so the
@@ -570,6 +620,14 @@ export class VideoEngine extends EventTarget {
     const keep = this._keepRanges();
     for (const key of [...this._cache.keys()]) {
       if (this._insideKeepWindow(key, keep)) continue;
+      // Never close the frame currently on screen. _lastBitmap aliases this same
+      // ImageBitmap, and _syncCanvasSize repaints it on the next canvas resize —
+      // closing it here leaves that repaint drawing a detached bitmap, which
+      // throws. A loop wrap (or any seek that lands the playhead far from where
+      // the picture still shows the previous frame) is exactly when the on-screen
+      // frame falls outside the keep window, so guard it until a new frame
+      // replaces it. It becomes evictable again the moment _shownFrame moves on.
+      if (key === this._shownFrame) continue;
       const bitmap = this._cache.get(key);
       if (bitmap) bitmap.close();
       this._cache.delete(key);
@@ -593,6 +651,7 @@ export class VideoEngine extends EventTarget {
     while (this._cache.size > this._cacheBudget) {
       const key = keys.shift();
       if (key === undefined) break;
+      if (key === this._shownFrame) continue;   // pinned: see the keep-pass note
       const bitmap = this._cache.get(key);
       if (bitmap) bitmap.close();
       this._cache.delete(key);
