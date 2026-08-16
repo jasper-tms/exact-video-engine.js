@@ -1,0 +1,213 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine loop region test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<!-- Both display elements are supplied so createBestEngine can walk its full
+     ladder: WebCodecs onto the canvas, or a fallback onto the <video> element. -->
+<div id="pane" style="width: 300px; height: 180px"><canvas id="engine-canvas"></canvas></div>
+<video id="native-video" muted playsinline style="width: 300px; height: 180px"></video>
+<script>
+// The loop region — `loopStartFrame`/`loopEndFrame`, an inclusive span that
+// looping playback repeats in place of the whole clip.
+//
+// This page only RECORDS what playback did; loop-region-test.mjs owns the
+// expectations, the way the other drivers here are split.
+//
+// The two tiers are recorded through different instruments, because they keep
+// time differently and a shared one would only measure the weaker of them:
+//
+//   WebCodecs. VideoEngine's playhead is advanced by the host's own clock, so
+//     the walk feeds update() a SYNTHETIC timestamp — a quarter of a frame per
+//     tick — and reads `currentFrame` back. Nothing here depends on how fast
+//     the machine decodes, so the frame sequence is exactly reproducible and a
+//     one-frame overrun past the region is a real failure rather than jitter.
+//
+//   Native. A <video> element runs on its own clock and cannot be stepped, so
+//     that case plays in real time and samples through a SECOND
+//     requestVideoFrameCallback on the same element — every presented frame,
+//     not every animation frame, so a wrap cannot slip past the sampler
+//     unseen. Ours is registered after the engine's, so on the tick that fires
+//     a wrap we still read the frame that went on screen, not the seek the
+//     engine just issued in response to it.
+const REGION_START = 10;   // loopStartFrame: the frame every wrap lands on
+const REGION_END = 14;     // loopEndFrame: the last frame played before wrapping
+const TICKS_PER_FRAME = 4; // sub-frame steps, so a wrap landing a hair either
+                           // side of a frame boundary cannot change the sequence
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+// The sequences below are recorded with consecutive repeats collapsed: what is
+// being pinned is the ORDER frames were played in, and the number of ticks a
+// frame happened to stay on screen is a property of the sampling rate.
+function pushDistinct(sequence, frame) {
+  if (sequence[sequence.length - 1] !== frame) sequence.push(frame);
+}
+
+// Play VideoEngine forward on a synthetic clock, one quarter-frame per tick,
+// and record the frames it ran through. Real animation frames are awaited
+// between ticks (so decoding gets to proceed and `presentedFrame` means
+// something) but never consulted for time.
+async function walkOwnClock(engine, startFrame, ticks) {
+  engine.seekToFrame(startFrame);
+  await engine.ensureFrame(startFrame);
+  const stepMilliseconds = (engine.duration / engine.numFrames)
+    / TICKS_PER_FRAME * 1000;
+
+  engine.play();
+  let now = performance.now();
+  engine.update(now);                 // the first tick only arms the clock
+  const currentFrames = [engine.currentFrame];
+  const presentedFrames = [engine.presentedFrame];
+  for (let tick = 0; tick < ticks; tick++) {
+    await nextAnimationFrame();
+    now += stepMilliseconds;
+    engine.update(now);
+    pushDistinct(currentFrames, engine.currentFrame);
+    pushDistinct(presentedFrames, engine.presentedFrame);
+  }
+  const pausedAtEnd = engine.paused;  // read before we stop it ourselves
+  engine.pause();
+  return { currentFrames, presentedFrames, pausedAtEnd };
+}
+
+// Play the <video> tier in real time and record every frame it presents.
+async function watchPresentedFrames(engine, milliseconds) {
+  const video = engine.displayElement;
+  const frames = [];
+  let sampling = true;
+  const sample = () => {
+    if (!sampling) return;
+    pushDistinct(frames, engine.presentedFrame);
+    video.requestVideoFrameCallback(sample);
+  };
+  video.requestVideoFrameCallback(sample);
+  engine.play();
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
+  sampling = false;
+  const pausedAtEnd = engine.paused;
+  engine.pause();
+  return { frames, pausedAtEnd };
+}
+
+const CASES = {
+  // 1. Playing forward from inside the region wraps at its end, back to its
+  //    start, and never runs past REGION_END.
+  async 'wrap'(engine) {
+    engine.loop = true;
+    engine.loopStartFrame = REGION_START;
+    engine.loopEndFrame = REGION_END;
+    return walkOwnClock(engine, REGION_START + 1, 25 * TICKS_PER_FRAME);
+  },
+
+  // 2. The region bounds looping, not seeking: frames on both sides of it are
+  //    still reachable with seekToFrame while it is in force.
+  async 'seek-outside'(engine) {
+    engine.loop = true;
+    engine.loopStartFrame = REGION_START;
+    engine.loopEndFrame = REGION_END;
+    const seeks = [];
+    for (const target of [2, 25, engine.numFrames - 1, REGION_START]) {
+      engine.seekToFrame(target);
+      await engine.ensureFrame(target);
+      engine.update(performance.now());
+      seeks.push({ target, currentFrame: engine.currentFrame });
+    }
+    return { seeks };
+  },
+
+  // 3. A playhead the host seeked PAST the region's end is not yanked back to
+  //    it: it plays on to the clip's end, and the wrap from there lands on the
+  //    region's start.
+  async 'seek-past-end'(engine) {
+    engine.loop = true;
+    engine.loopStartFrame = REGION_START;
+    engine.loopEndFrame = REGION_END;
+    return walkOwnClock(engine, REGION_END + 6, 30 * TICKS_PER_FRAME);
+  },
+
+  // 4. With looping off the region is inert — playback runs past REGION_END to
+  //    the end of the clip and stops there.
+  async 'no-loop'(engine) {
+    engine.loop = false;
+    engine.loopStartFrame = REGION_START;
+    engine.loopEndFrame = REGION_END;
+    return walkOwnClock(engine, REGION_END - 2, 30 * TICKS_PER_FRAME);
+  },
+
+  // 5. Regression: with no region set (the default, and an explicit null, which
+  //    is what a host clearing one writes) looping is exactly what it was —
+  //    over the whole clip, wrapping from the last frame to frame 0.
+  async 'no-region'(engine) {
+    engine.loop = true;
+    engine.loopStartFrame = null;
+    engine.loopEndFrame = null;
+    const result = await walkOwnClock(engine, engine.numFrames - 3, 8 * TICKS_PER_FRAME);
+    result.readBack = {
+      loopStartFrame: engine.loopStartFrame,
+      loopEndFrame: engine.loopEndFrame,
+    };
+    return result;
+  },
+
+  // The same contract on the <video> tier, in real time.
+  async 'native-wrap'(engine) {
+    engine.loop = true;
+    engine.loopStartFrame = REGION_START;
+    engine.loopEndFrame = REGION_END;
+    await engine.ensureFrame(REGION_START + 1);
+    return watchPresentedFrames(engine, 1500);
+  },
+
+  async 'native-seek-outside'(engine) {
+    engine.loop = true;
+    engine.loopStartFrame = REGION_START;
+    engine.loopEndFrame = REGION_END;
+    const seeks = [];
+    for (const target of [2, 25, engine.numFrames - 1, REGION_START]) {
+      await engine.ensureFrame(target);
+      seeks.push({ target, currentFrame: engine.currentFrame });
+    }
+    return { seeks };
+  },
+
+  async 'native-seek-past-end'(engine) {
+    engine.loop = true;
+    engine.loopStartFrame = REGION_START;
+    engine.loopEndFrame = REGION_END;
+    await engine.ensureFrame(REGION_END + 6);
+    return watchPresentedFrames(engine, 2000);
+  },
+
+  async 'native-no-loop'(engine) {
+    engine.loop = false;
+    engine.loopStartFrame = REGION_START;
+    engine.loopEndFrame = REGION_END;
+    await engine.ensureFrame(REGION_END - 2);
+    return watchPresentedFrames(engine, 1500);
+  },
+};
+
+async function run() {
+  const params = new URLSearchParams(location.search);
+  const which = params.get('case');
+  const mode = params.get('mode') || 'webcodecs';   // 'webcodecs' or 'native'
+  const canvas = document.getElementById('engine-canvas');
+  const video = document.getElementById('native-video');
+  if (!CASES[which]) throw new Error(`unknown case '${which}'`);
+
+  const source = await fetch('clips/' + params.get('file')).then((r) => r.blob());
+  const engine = await createBestEngine(source, { canvas, video, prefer: mode });
+
+  const recorded = await CASES[which](engine);
+  window.__result = Object.assign({
+    tier: engine.tier,
+    numFrames: engine.numFrames,
+    regionStart: REGION_START,
+    regionEnd: REGION_END,
+  }, recorded);
+}
+run().catch((e) => { window.__err = String(e && e.stack || e); });
+</script>

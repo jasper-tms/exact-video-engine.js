@@ -142,6 +142,7 @@ Both engines expose the following.
 | `play()` / `pause()` / `paused` | Transport. |
 | `update(now)` | Call once per animation frame with the rAF timestamp. Advances the playhead and paints (`VideoEngine`); a no-op on `NativeVideoEngine`. |
 | `loop` | Whether playback wraps at the end. |
+| `loopStartFrame` / `loopEndFrame` | Optional inclusive frame bounds of a **loop region** — the span looping playback repeats instead of the whole clip. `loopEndFrame` is the last frame played before wrapping; the wrap lands on `loopStartFrame`. `null` (the default) means the clip's own first/last frame. See "Looping a sub-range" below. |
 | `playbackRate` | Playback speed multiplier. |
 | `duration` | Clip duration in seconds. While `frameIndexState` is `growing` this is the length indexed *so far*, rising with `numFrames`. |
 | `expectedDuration` | The whole clip's length in seconds as the container *declares* it; `0` when the container declares none. What to size a scrubber against while the index grows. A claim, never a mapping input — it names no frame. |
@@ -167,6 +168,42 @@ Both engines expose the following.
 | `resizeCanvas()` | Re-size the canvas backing store to its parent and repaint (`VideoEngine`); a no-op on `NativeVideoEngine`, where CSS `object-fit` handles it. `update()` already does this every tick, so you rarely need to call it — a pane that gains its size *after* the clip loads is handled without you having to get the timing right. |
 | event `loaded` | Fired when `load()` completes. |
 | event `errormessage` | `detail.message`: human-readable error string, or null to clear. See "When the decoder dies mid-playback" below for the `fatal: true` case. |
+
+### Looping a sub-range: `loopStartFrame` / `loopEndFrame`
+
+To loop part of a clip rather than all of it, name the region's bounds:
+
+```js
+engine.loopStartFrame = 1457;   // wraps land here
+engine.loopEndFrame   = 2004;   // last frame played before wrapping
+engine.loop = true;
+engine.seekToFrame(1457);       // the engine does not seek for you
+```
+
+Frames, not seconds: a frame index names exactly one frame and a timestamp does
+not. A host holding a time converts with `frameAtTime(t)`.
+
+Three rules make the region behave the way a viewer expects:
+
+- **Only while `loop` is true.** With looping off the bounds are inert and
+  playback runs to the end of the clip, so a loop toggle keeps working as a
+  plain loop toggle.
+- **Seeking is never bounded by it.** `seekToFrame` outside the region is
+  honored — the region says where playback *repeats*, not where it is allowed.
+- **A seek past `loopEndFrame` plays on to the end of the clip**, and the wrap
+  from there lands on `loopStartFrame`. Only a playhead that reaches the
+  region's end by playing forward wraps early, so clicking into the tail of a
+  clip does not yank you back the instant you land.
+
+Setting neither (the default) is ordinary whole-clip looping.
+
+**The wrap is frame-exact on `VideoEngine` only.** On `NativeVideoEngine` the
+frame it lands on can be one late on Chromium and Firefox — those browsers
+resume a mid-interval seek on the frame *after* the target, which the library
+cannot override from outside the element. WebKit lands exactly, which is the
+tier that matters most in practice: the native engine is the fallback for
+browsers with no `VideoDecoder` (pre-16.4 iOS Safari). A host that needs the
+region's bounds honored to the frame should check `tier`.
 
 ### Named-frame pixels: `bitmapForFrame(n)`
 

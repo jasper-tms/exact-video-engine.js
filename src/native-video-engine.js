@@ -59,6 +59,11 @@ export class NativeVideoEngine extends EventTarget {
     this._indexStrikes = 0;        // consecutive presented frames that missed the table
 
     this._loop = true;
+    // The optional loop region (see the loopStartFrame/loopEndFrame accessors).
+    // While one is set the element's own loop is off and both wraps — the
+    // region's end and the clip's end — are ours to fire.
+    this._loopStartFrame = null;
+    this._loopEndFrame = null;
     this._rate = 1;                // reapplied after each load (src reset clears it)
     this._objectUrl = null;
 
@@ -79,6 +84,16 @@ export class NativeVideoEngine extends EventTarget {
     // _checkPresentedFrame). Registered once on the element so it cannot pile up
     // across load()s.
     videoElement.addEventListener('seeking', () => { this._indexStrikes = 0; });
+
+    // With a loop region set the element's native loop is off (_syncNativeLoop),
+    // so reaching the clip's end is ours to handle. This is the seeked-past-the-
+    // region case: wrap to the region's start, the one place every wrap goes.
+    videoElement.addEventListener('ended', () => {
+      if (!this._loop || !this._hasLoopRegion) return;
+      this.seekToFrame(this._loopStartFrame ?? 0);
+      const promise = this.video.play();
+      if (promise) promise.catch(() => {});
+    });
 
     this.hasPresentedFrameClock = 'requestVideoFrameCallback' in videoElement;
     this._clockStopped = false;
@@ -105,7 +120,42 @@ export class NativeVideoEngine extends EventTarget {
   get playbackRate() { return this.video.playbackRate; }
   set playbackRate(rate) { this._rate = rate; this.video.playbackRate = rate; }
   get loop() { return this._loop; }
-  set loop(value) { this._loop = value; this.video.loop = value; }
+  set loop(value) { this._loop = value; this._syncNativeLoop(); }
+
+  // The loop region — same contract as VideoEngine.loopStartFrame/loopEndFrame:
+  // inclusive frame bounds that looping playback repeats in place of the whole
+  // clip, inert while `loop` is false, and no constraint on seeking.
+  get loopStartFrame() { return this._loopStartFrame; }
+  set loopStartFrame(n) {
+    this._loopStartFrame = n == null ? null : Math.max(0, n | 0);
+    this._syncNativeLoop();
+  }
+  get loopEndFrame() { return this._loopEndFrame; }
+  set loopEndFrame(n) {
+    this._loopEndFrame = n == null ? null : Math.max(0, n | 0);
+    this._syncNativeLoop();
+  }
+
+  get _hasLoopRegion() {
+    return this._loopStartFrame != null || this._loopEndFrame != null;
+  }
+
+  // The element can only loop the whole clip, so a loop region means taking its
+  // native loop away and firing both wraps ourselves — the region's end from the
+  // presented-frame clock, the clip's end from the 'ended' listener.
+  _syncNativeLoop() { this.video.loop = this._loop && !this._hasLoopRegion; }
+
+  // The composition time a wrap fires at: the start of the frame after the
+  // region's last, or the clip's end when the region runs to it. Mirrors
+  // VideoEngine._loopWrapTime.
+  get _loopWrapTime() {
+    const frameCount = this._index ? this._index.numFrames : 0;
+    if (this._loopEndFrame != null && this._index
+        && this._loopEndFrame < frameCount - 1) {
+      return this._index.presentationTimes[this._loopEndFrame + 1];
+    }
+    return this.duration;
+  }
 
   // Upright display dimensions. The element applies the track's rotation
   // itself, so these already account for it — the same meaning VideoEngine's
@@ -405,7 +455,7 @@ export class NativeVideoEngine extends EventTarget {
         cleanup();
         // Reassigning src resets playbackRate/loop to defaults; reapply.
         this.video.playbackRate = this._rate;
-        this.video.loop = this._loop;
+        this._syncNativeLoop();
         resolve();
       };
       // The element's own error, kept rather than discarded. It is not worth
@@ -612,16 +662,39 @@ export class NativeVideoEngine extends EventTarget {
 
   _onPresentedFrame(now, metadata) {
     if (this._clockStopped) return;   // destroyed; stop the self-perpetuating loop
+    const previousMediaTime = this._presentedMediaTime;
     this._presentedMediaTime = metadata.mediaTime;
     this._presentedAt = now;
 
     this._checkPresentedFrame();
+    this._applyLoopRegion(previousMediaTime);
 
     const waiters = this._presentWaiters;
     this._presentWaiters = [];
     for (const resolve of waiters) resolve(metadata.mediaTime);
 
     this.video.requestVideoFrameCallback(this._onPresentedFrame);
+  }
+
+  // Fire the loop region's wrap off the presented-frame clock, which reports the
+  // exact PTS of each frame as it goes on screen — so the wrap lands on a real
+  // presented frame rather than on a polled, rounded element clock.
+  //
+  // Only a playhead that reached the region's end by playing forward wraps (the
+  // previous presented frame was still inside it). One that is already past the
+  // region — a host seeked out of it — plays on to the clip's end, where the
+  // 'ended' listener wraps it back to the region's start. Same rule as
+  // VideoEngine's clock; the two engines stay swappable.
+  _applyLoopRegion(previousMediaTime) {
+    if (!this._loop || this._loopEndFrame == null || !this._index) return;
+    if (this.video.paused || this.video.seeking) return;
+    const wrapAt = this._loopWrapTime;
+    if (wrapAt >= this.duration) return;      // ends at the clip's end; 'ended' has it
+    if (previousMediaTime == null) return;
+    const presented = this._presentedMediaTime - this._timeOffset;
+    const previous = previousMediaTime - this._timeOffset;
+    if (previous >= wrapAt || presented < wrapAt) return;
+    this.seekToFrame(this._loopStartFrame ?? 0);
   }
 
   // A presented frame's mediaTime IS some frame's exact PTS, so once calibrated

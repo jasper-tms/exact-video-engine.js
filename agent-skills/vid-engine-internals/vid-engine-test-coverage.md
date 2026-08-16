@@ -87,6 +87,35 @@ index's exactness falsifiable:
   real index, and the refusal proves an undecodable clip fails fast instead
   of hanging or being played with guessed frame numbers.
 
+## Loop region
+
+Pins `loopStartFrame`/`loopEndFrame`, the inclusive span looping playback
+repeats in place of the whole clip, on both tiers against `counter-cfr.mp4`.
+Five things, each of which something plausible gets wrong: that a forward run
+off the region's end wraps to its start with `loopEndFrame` genuinely the last
+frame played (an off-by-one still loops, and shows the wrong frames); that the
+region bounds looping and **not** seeking (clamping seeks into it is the obvious
+implementation, and takes the scrubber away from the host); that a playhead the
+host seeked PAST the region is not yanked back but plays to the clip's end and
+wraps into the region from there (the reason the implementation tests for a
+forward *crossing* rather than for "playhead is past the end" — a version that
+tested only the latter passes every other case); that `loop === false` leaves
+the region inert; and that with no region set, looping is what it was before the
+feature existed.
+
+The tiers are asserted at different exactness, and the gap is the element's, not
+the engine's. VideoEngine is stepped by a **synthetic host clock** — a quarter
+of a frame per `update()`, so nothing depends on decode speed — and its frame
+sequence is exact: `loopEndFrame + 1` never appears and every wrap lands on
+`loopStartFrame`. The native tier is sampled in real time through a second
+`requestVideoFrameCallback` on the same element (every *presented* frame, so a
+wrap cannot slip past unseen) and gets one frame of tolerance at each edge:
+the wrap can only fire off a frame already on screen, and Chromium then resumes
+a mid-playback seek on the frame *after* its target, so `loopStartFrame` itself
+is never reported presented there. Neither is fixable from this side — pausing
+across the wrap seek, and aiming at the frame's start rather than its midpoint,
+were both tried and only fix Firefox — and WebKit lands exactly on both counts.
+
 ## Matroska table (plain Node)
 
 Checks the half of the index a browser walk cannot see: that every frame's
