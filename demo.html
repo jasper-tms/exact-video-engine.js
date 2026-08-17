@@ -32,9 +32,42 @@
     cdn: 'https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.6.0/exact-video-engine.js',
     local: 'exact-video-engine.js',
   };
+  // A dev context is anywhere this page is served from a machine you control,
+  // which includes a phone on the same wifi reaching the laptop by its private
+  // address — the setup for testing a local build against a throttled serve.py.
+  // Recognising only localhost would hand that phone the CDN release while you
+  // believed you were testing your edits.
+  const PRIVATE_ADDRESS = [
+    /^(localhost|127\.0\.0\.1|\[::1\])$/,
+    /\.local$/,                              // Bonjour, e.g. laptop.local
+    /^192\.168\.\d+\.\d+$/,
+    /^10\.\d+\.\d+\.\d+$/,
+    /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/,
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/,   // Tailscale/CGNAT
+  ];
   const isLocalContext = location.protocol === 'file:'
-    || /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
-  const stored = localStorage.getItem('engineSource');
+    || PRIVATE_ADDRESS.some((pattern) => pattern.test(location.hostname));
+  window.__isLocalContext = isLocalContext;
+
+  // ?engineBuild=v1.7.0 runs the page on any past release, for comparing one
+  // against another by eye; ?engineBuild=local forces the working tree's build.
+  // The CDN URL is built from a template rather than written out as a literal,
+  // because sync_version.sh rewrites every @vX.Y.Z it finds in this file to
+  // match VERSION and would quietly turn the comparison into two runs of the
+  // same build.
+  const requestedBuild = new URLSearchParams(location.search).get('engineBuild');
+  if (/^v\d+\.\d+\.\d+$/.test(requestedBuild || '')) {
+    window.__engineSource = requestedBuild;
+    window.__engineSources = ENGINE_SOURCES;
+    // Tells the dropdown that a release was pinned by URL, and which one.
+    window.__pinnedBuild = requestedBuild;
+    document.write('<script src="https://cdn.jsdelivr.net/gh/jasper-tms/'
+      + 'exact-video-engine.js@' + requestedBuild + '/exact-video-engine.js"><\/script>');
+    return;
+  }
+
+  const stored = requestedBuild === 'local' ? 'local'
+    : localStorage.getItem('engineSource');
   // A stored choice wins. Otherwise a local dev context defaults to the build you
   // just made; a deployed page always takes the pinned CDN release.
   const engineSource = (stored === 'local' || stored === 'cdn')
@@ -533,18 +566,33 @@ const BYTES_PER_MEGABYTE = 1024 * 1024;
 // reload on a change — a reload is the only clean way to swap the engine, see
 // the bootstrap comment. A deployed page returns early and never shows it.
 (function setupEngineSourceSwitch() {
-  const isLocalContext = location.protocol === 'file:'
-    || /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
-  if (!isLocalContext) return;
+  // Decided once by the bootstrap at the top of the file, which had to make the
+  // same call to choose the build this page is already running.
+  if (!window.__isLocalContext) return;
   const wrap = document.getElementById('engine-source-switch');
   const select = document.getElementById('engine-source');
   const cdnUrl = (window.__engineSources && window.__engineSources.cdn) || '';
   const version = cdnUrl.match(/@v(\d+\.\d+\.\d+)\//);
   select.querySelector('option[value="cdn"]').textContent =
     version ? `CDN (v${version[1]})` : 'CDN';
+  // ?engineBuild=vX.Y.Z pinned a past release. Give it an option of its own so
+  // the dropdown says what is running, and drop the parameter on a change so
+  // picking something else is not overruled by the URL.
+  const pinnedBuild = window.__pinnedBuild || null;
+  if (pinnedBuild) {
+    const option = document.createElement('option');
+    option.value = pinnedBuild;
+    option.textContent = `CDN (${pinnedBuild})`;
+    select.append(option);
+  }
   select.value = window.__engineSource || 'cdn';
   select.addEventListener('change', async () => {
     localStorage.setItem('engineSource', select.value);
+    if (pinnedBuild && select.value !== pinnedBuild) {
+      const url = new URL(location.href);
+      url.searchParams.delete('engineBuild');
+      history.replaceState(null, '', url);
+    }
     // Carry the loaded clip and its settings across the reload the swap needs, so
     // switching engine builds doesn't drop what you were looking at. Best-effort:
     // if persisting fails (quota, private mode) we still switch, just to a clean
