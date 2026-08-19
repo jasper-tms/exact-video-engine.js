@@ -21,7 +21,7 @@ anyway. Opening a typical few-MB clip costs **two** requests; a large one,
 two or three. (`src/read-priority-gate.js` keeps read-ahead traffic from
 starving the read the host is actually waiting on.)
 
-## Read-ahead
+## Read-ahead: decoded frames, and encoded bytes
 
 `VideoEngine` decodes a window around the playhead so that playback and short
 seeks come out of memory. The frame actually asked for is never held up by
@@ -30,6 +30,40 @@ resolve, and the window fills behind them. The default window is 56 frames
 (about two seconds); `windowAhead: 0` turns read-ahead off for hosts that
 only ever hold still (a thumbnail grab, a single-frame page) while still
 decoding the requested frame.
+
+The encoded bytes are read ahead separately, on their own budget. A decoded
+frame costs about a thousand times what its encoded bytes do, so how far ahead
+the bytes are fetched must not fall out of how many frames fit under
+`cacheBytes` — at 1080p that is a dozen frames, a fraction of a second, which
+does not cover a round trip to a distant bucket. `_ensureBytes` reads in 4 MB
+blocks (`MAX_BLOCK`), and during playback the next block is always in flight
+(`_prefetchNextBlock`), so the decode driver crosses a block boundary by
+adopting bytes already in hand rather than stopping to wait for them. The block
+just left behind stays resident until the next seek: a decode run restarts
+from its GOP's keyframe when the target crosses into a new GOP, and that
+keyframe can sit at the tail of the previous block.
+
+How many blocks are banked ahead adapts to the link (`_prefetchDepth`): one,
+until a boundary is crossed out of a full block with the prefetch still in
+flight — a whole block's consumption time was not enough head start, so the
+link has jitter one block of cover cannot absorb — after which two are kept.
+(A boundary out of a *partial* buffer, the landing read moments after play
+begins, says nothing about the link and does not escalate.) A new prefetch is
+only issued once every queued one has resolved, so a struggling link never
+has speculative requests stacked on it. The depth describes the link, not the
+clip, so it survives seeks and loads within the engine's lifetime. At most
+four blocks are resident — previous, current, and up to two prefetched —
+16 MB, outside `cacheBytes`.
+
+A read shrinks below the block size (to what the target frame depends on,
+floored at 256 KB) only while the viewer is *landing* on a frame: the first
+frame of the clip, any paused seek or step, and the first read after a seek
+during playback. Once playback is flowing, an uncached target means the
+decoder has fallen behind the wall clock, and a small read there — one round
+trip per quarter megabyte, with the clock running on through every one — turns
+a slow link into a collapse. So playback reads full blocks, and lands only once
+per move of the playhead (`_landing`, set by `update()` when the playhead is
+not where the last tick left it). `test/stall-test.mjs` pins all of this.
 
 ## Memory: the ceiling is bytes, not frames
 
@@ -43,9 +77,9 @@ which point WebKit kills the decode session outright (`VideoDecoder` reports
 
 So the ceiling is bytes — `cacheBytes`, default 96 MB — and the window is
 whatever fits under it. At the default, a 360p clip keeps the full 56-frame
-read-ahead, while a 1080p clip holds about a dozen frames: enough to play
-without stalling, and far enough under the ceiling to leave the decoder its
-surfaces. Frames cached for display are also downscaled to 1920 on the long
+read-ahead, while a 1080p clip holds about a dozen frames: far enough under
+the ceiling to leave the decoder its surfaces, and enough to absorb decode
+jitter — network latency is the encoded-byte prefetch's job, above. Frames cached for display are also downscaled to 1920 on the long
 side, so a 4K clip costs the same per frame as a 1080p one
 (`bitmapForFrame()` hands back that bitmap, in coded orientation). Lowering
 `cacheBytes` shrinks read-ahead first and history second; it never changes

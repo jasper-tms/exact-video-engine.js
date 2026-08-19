@@ -169,6 +169,21 @@ ffmpeg -y -loglevel error -f lavfi -i "testsrc2=s=1920x1080:d=5:r=30" \
     -pix_fmt yuv420p -c:v libx264 -preset ultrafast -qp 30 -g 30 \
     -movflags +faststart clips/hd.mp4
 
+# 1080p again, but long and at a real bitrate, for the stall test. Its subject
+# is playback over a slow link, where what matters is how many encoded bytes are
+# in hand when the next 4 MB block is needed: 1080p so the decoded read-ahead is
+# only a handful of frames and covers nothing; 30 seconds so playback crosses
+# several block boundaries; 8 Mbit/s and a one-second GOP because the freeze
+# period is block size divided by bitrate and a re-decode costs a GOP. Faststart,
+# like a real cloud clip. ~30 MB on disk and a few seconds to encode, so it is
+# skipped when already present.
+if [ ! -f clips/hd-long.mp4 ]; then
+    ffmpeg -y -loglevel error -f lavfi -i "testsrc2=s=1920x1080:d=30:r=30" \
+        -pix_fmt yuv420p -c:v libx264 -preset veryfast \
+        -b:v 8M -maxrate 8M -bufsize 16M -g 30 -keyint_min 30 -sc_threshold 0 \
+        -movflags +faststart clips/hd-long.mp4
+fi
+
 echo "Wrote test clips:"
 ls clips
 

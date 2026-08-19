@@ -1,0 +1,255 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine stall test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, monospace; background: #12141a;
+         color: #e8eaf0; margin: 16px; }
+  #pane { width: 480px; height: 270px; background: #000; }
+  #pane canvas { width: 100%; height: 100%; display: block; }
+  pre { white-space: pre-wrap; }
+</style>
+<div id="pane"><canvas></canvas></div>
+<pre id="report">loading…</pre>
+<script>
+// Does playback hold still over a slow link?
+//
+// The playhead runs on the wall clock, so any delay in the decode path shows
+// as the picture holding still and then skipping forward. This page plays a
+// clip on real animation frames, records which frame was on screen at every
+// tick alongside every range read and decode-run restart, and reports each
+// freeze with what the engine was doing during it:
+//
+//   a range read was in flight   the decode driver is blocked on bytes
+//   samples were being fed       the decoder is behind, or a run restarted and
+//                                is re-decoding a GOP from its keyframe
+//   neither                      the main thread, or something outside the engine
+//
+// Query parameters, all optional:
+//   file=hd-long.mp4            clip under test/clips
+//   playSeconds=15              how long to play
+//   warmupSeconds=3             opening seconds left out of the summary
+//   latencyMilliseconds=150     round trip serve.py charges on every clip read
+//   bytesPerSecond=4000000      rate cap serve.py writes clip bodies at
+const params = new URLSearchParams(location.search);
+const CLIP = params.get('file') || 'hd-long.mp4';
+const PLAY_SECONDS = Number(params.get('playSeconds') || 15);
+// Playback starts with an empty cache and an empty byte buffer, so its first
+// moments say nothing about the steady state.
+const WARMUP_SECONDS = Number(params.get('warmupSeconds') || 3);
+// A freeze is the picture holding still for longer than this many frame
+// intervals: one is a frame doing its job, and the fraction keeps a tick that
+// lands a hair late off the list.
+const FREEZE_FRAME_INTERVALS = 2.5;
+
+const median = (values) => {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+};
+const round = (value, places = 1) => Number(value.toFixed(places));
+
+// The throttling parameters ride on the clip URL, so one running serve.py can
+// answer several conditions at once.
+function clipUrl() {
+  const url = new URL('clips/' + CLIP, location.href);
+  for (const name of ['latencyMilliseconds', 'bytesPerSecond']) {
+    if (params.get(name)) url.searchParams.set(name, params.get(name));
+  }
+  return url.href;
+}
+
+// Record every range read and every decode-run restart. Both are wrapped on the
+// instance after load, so the index build (which uses the same reader) is not
+// counted and only playback's own reads land in the trace.
+function instrument(engine, reads, restarts) {
+  const reader = engine._reader;
+  const innerRead = reader.read.bind(reader);
+  reader.read = async (start, end) => {
+    const record = { start, byteCount: end - start + 1,
+                     startedAt: performance.now(), endedAt: 0 };
+    reads.push(record);
+    try {
+      return await innerRead(start, end);
+    } finally {
+      record.endedAt = performance.now();
+    }
+  };
+  const innerRestart = engine._restartRun.bind(engine);
+  engine._restartRun = (keyframe) => {
+    restarts.push({ at: performance.now(), keyframe });
+    return innerRestart(keyframe);
+  };
+}
+
+// Intervals where the picture held still for longer than a frame is due, with
+// what the engine was doing during each. `_fedThrough` is the highest sample
+// handed to the decoder, so its rise across a freeze counts the samples decoded
+// while nothing reached the screen.
+function findFreezes(ticks, frameIntervalMilliseconds, reads, restarts) {
+  const threshold = frameIntervalMilliseconds * FREEZE_FRAME_INTERVALS;
+  const origin = ticks[0].now;
+  const freezes = [];
+  let runStart = 0;
+  for (let i = 1; i < ticks.length; i++) {
+    if (ticks[i].presentedFrame === ticks[runStart].presentedFrame
+        && i < ticks.length - 1) continue;
+    const first = ticks[runStart];
+    const ended = ticks[i];
+    const durationMilliseconds = ended.now - first.now;
+    if (durationMilliseconds > threshold && first.presentedFrame >= 0) {
+      freezes.push({
+        startedAt: round(first.now - origin),
+        durationMilliseconds: round(durationMilliseconds),
+        heldFrame: first.presentedFrame,
+        // How far the picture jumped when it came back. One is a frame doing
+        // its job; more than one is frames that were never shown.
+        skippedFrames: ended.presentedFrame - first.presentedFrame,
+        samplesFed: ended.fedThrough - first.fedThrough,
+        readBytes: reads
+          .filter((read) => read.startedAt < ended.now
+            && (read.endedAt || Infinity) > first.now)
+          .reduce((total, read) => total + read.byteCount, 0),
+        restarted: restarts.some((restart) => restart.at >= first.now
+          && restart.at <= ended.now),
+      });
+    }
+    runStart = i;
+  }
+  return freezes;
+}
+
+function summarize(engine, allTicks, reads, restarts) {
+  const warmupEnd = allTicks[0].now + WARMUP_SECONDS * 1000;
+  const ticks = allTicks.filter((tick) => tick.now >= warmupEnd);
+  if (ticks.length < 2) throw new Error('nothing played past the warm-up window');
+  const playedSeconds = (ticks[ticks.length - 1].now - ticks[0].now) / 1000;
+  const frameIntervalMilliseconds = 1000 * engine.duration / engine.numFrames;
+  const freezes = findFreezes(ticks, frameIntervalMilliseconds, reads, restarts);
+  const presented = new Set(ticks.map((tick) => tick.presentedFrame));
+  presented.delete(-1);
+  const readDurations = reads.filter((read) => read.endedAt)
+    .map((read) => read.endedAt - read.startedAt);
+  const origin = allTicks[0].now;
+
+  return {
+    clip: CLIP,
+    videoWidth: engine.videoWidth,
+    videoHeight: engine.videoHeight,
+    numFrames: engine.numFrames,
+    windowAhead: engine._windowAhead,
+    // 1 unless a block boundary ever blocked, which escalates it to 2.
+    prefetchDepth: engine._prefetchDepth,
+    warmupSeconds: WARMUP_SECONDS,
+    playedSeconds: round(playedSeconds, 2),
+    framesPresented: presented.size,
+    framesExpected: Math.round(playedSeconds * 1000 / frameIntervalMilliseconds),
+
+    freezeCount: freezes.length,
+    freezeMedianMilliseconds: round(median(freezes.map((f) => f.durationMilliseconds))),
+    freezeWorstMilliseconds: round(Math.max(0, ...freezes.map((f) => f.durationMilliseconds))),
+    medianSkippedFrames: median(freezes.map((f) => f.skippedFrames)),
+    freezesOverlappingRead: freezes.filter((f) => f.readBytes > 0).length,
+    freezesWithRestart: freezes.filter((f) => f.restarted).length,
+
+    readCount: reads.length,
+    readMedianMilliseconds: round(median(readDurations)),
+    // 4 MB is the block the engine reads in during playback; 256 KB is the
+    // floor it drops to while landing on a frame. A median down at the floor
+    // means playback spent its time paying a round trip per quarter megabyte.
+    readMedianKilobytes: round(median(reads.map((read) => read.byteCount)) / 1024),
+    restartCount: restarts.length,
+    freezes,
+    // Every read, relative to the first tick, for reading a failure: which one
+    // did the driver block on, and how long did it take?
+    reads: reads.map((read) => ({
+      atMilliseconds: round(read.startedAt - origin),
+      durationMilliseconds: round((read.endedAt || performance.now()) - read.startedAt),
+      startMegabytes: round(read.start / (1 << 20), 2),
+      kilobytes: round(read.byteCount / 1024),
+    })),
+  };
+}
+
+function renderReport(result) {
+  const lines = [];
+  const say = (label, value) => lines.push(label.padEnd(26) + value);
+  say('clip', `${result.clip}  ${result.videoWidth}x${result.videoHeight}  `
+    + `${result.numFrames} frames, read-ahead ${result.windowAhead} frames`);
+  say('played', `${result.playedSeconds}s (after a ${result.warmupSeconds}s warm-up)`);
+  say('frames presented', `${result.framesPresented} of ${result.framesExpected} expected`);
+  lines.push('');
+  say('freezes', String(result.freezeCount));
+  say('  median / worst', `${result.freezeMedianMilliseconds} ms / `
+    + `${result.freezeWorstMilliseconds} ms`);
+  say('  median skip', `${result.medianSkippedFrames} frames`);
+  say('  overlapping a read', `${result.freezesOverlappingRead} of ${result.freezeCount}`);
+  say('  with a run restart', `${result.freezesWithRestart} of ${result.freezeCount}`);
+  lines.push('');
+  say('range reads', `${result.readCount}, median ${result.readMedianKilobytes} KB / `
+    + `${result.readMedianMilliseconds} ms`);
+  say('run restarts', String(result.restartCount));
+  lines.push('', 'at (ms)   held  held for  skipped  fed  read MB  restart');
+  for (const freeze of result.freezes) {
+    lines.push([
+      String(freeze.startedAt).padStart(8),
+      String(freeze.heldFrame).padStart(6),
+      (freeze.durationMilliseconds + ' ms').padStart(10),
+      String(freeze.skippedFrames).padStart(8),
+      String(freeze.samplesFed).padStart(5),
+      round(freeze.readBytes / (1 << 20), 2).toFixed(2).padStart(8),
+      (freeze.restarted ? '  yes' : '   no'),
+    ].join(''));
+  }
+  document.getElementById('report').textContent = lines.join('\n');
+}
+
+async function run() {
+  const engine = await createBestEngine(clipUrl(), {
+    canvas: document.querySelector('canvas'),
+    prefer: 'webcodecs',
+  });
+  // Everything below reads VideoEngine's internals; the <video> tier is a
+  // different subject. The usual way to land there without noticing is that
+  // VideoDecoder is undefined outside a secure context (localhost is one; a
+  // LAN address is not).
+  if (engine.tier !== 'webcodecs') {
+    throw new Error(`ran on the ${engine.tier} tier, which this page cannot trace`
+      + (window.isSecureContext ? '' : ' — not a secure context, so WebCodecs '
+        + 'was never available'));
+  }
+
+  const reads = [];
+  const restarts = [];
+  const ticks = [];
+  instrument(engine, reads, restarts);
+
+  engine.loop = false;
+  engine.seekToFrame(0);
+  await engine.ensureFrame(0);
+
+  // Real animation frames on the real clock: the thing being measured is how
+  // playback behaves against wall time, so a synthetic clock would erase it.
+  await new Promise((resolve) => {
+    const startedAt = performance.now();
+    engine.play();
+    (function tick(now) {
+      engine.update(now);
+      ticks.push({ now, presentedFrame: engine._shownFrame, fedThrough: engine._fedThrough });
+      if (now - startedAt >= PLAY_SECONDS * 1000 || engine.paused) resolve();
+      else requestAnimationFrame(tick);
+    }(performance.now()));
+  });
+  engine.pause();
+
+  const result = summarize(engine, ticks, reads, restarts);
+  renderReport(result);
+  window.__result = result;
+  engine.destroy();
+}
+run().catch((e) => {
+  window.__err = String(e && e.stack || e);
+  document.getElementById('report').textContent = 'error: ' + window.__err;
+});
+</script>

@@ -327,9 +327,12 @@ and the window fills behind them.
   "hold as much history as `cacheBytes` allows".
 - **The memory ceiling is bytes, not frames**: `cacheBytes` (default 96 MB).
   At the default, a 360p clip keeps the full 56-frame read-ahead while a 1080p
-  clip holds about a dozen frames — enough to play without stalling, and far
-  enough under the ceiling to leave the decoder its surfaces (iOS kills the
-  decode session outright if decoded frames exhaust its surface pool).
+  clip holds about a dozen frames — far enough under the ceiling to leave the
+  decoder its surfaces (iOS kills the decode session outright if decoded frames
+  exhaust its surface pool). A dozen frames is only a fraction of a second of
+  cover, so it is not what absorbs network latency: the *encoded* bytes are
+  read ahead separately, in 4 MB blocks with the next block always in flight
+  during playback, on a budget of their own that `cacheBytes` does not touch.
   Lowering it shrinks read-ahead first and history second; it never changes
   which frames are *available*, only how many are held in memory at once.
   `engine.setCacheBytes(bytes)` changes the ceiling at runtime (a no-op on the

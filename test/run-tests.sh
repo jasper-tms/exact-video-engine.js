@@ -20,7 +20,8 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-hevc.mkv ] \
         || [ ! -f test/clips/counter-mjpeg.avi ] \
         || [ ! -f test/clips/counter-mjpeg.mov ] \
-        || [ ! -f test/clips/corrupt-pure-garbage.bin ]; then
+        || [ ! -f test/clips/corrupt-pure-garbage.bin ] \
+        || [ ! -f test/clips/hd-long.mp4 ]; then
     bash test/make-test-clips.sh
 fi
 # The Ogg fixtures need an ffmpeg with libtheora, which not every machine has;
@@ -85,9 +86,13 @@ done
 # a Chromium-specific decoder error surface (decoder-failure), and the task they
 # verify is engine bookkeeping that is not browser-specific — so running them
 # under one engine is enough and porting them would only add contortions.
-echo "=== chromium-only: startup, memory, decoder-failure, known-bad-codec, index-cache, progressive ==="
+echo "=== chromium-only: startup, memory, stall, decoder-failure, known-bad-codec, index-cache, progressive ==="
 node test/startup-test.mjs || status=1
 node test/memory-test.mjs || status=1
+# stall plays a 1080p clip through serve.py's per-request latency and rate caps
+# (which reach any browser, unlike CDP throttling) and pins that playback does
+# not freeze on the encoded-byte reads. Engine bookkeeping again; one engine.
+node test/stall-test.mjs || status=1
 node test/decoder-failure-test.mjs || status=1
 # known-bad-codec spoofs navigator.vendor to exercise the WebKit routing path from
 # Chromium (the decision is codec-string-based, so no real HEVC decode is needed).

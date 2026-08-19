@@ -5003,6 +5003,17 @@ const MINIMUM_WINDOW_FRAMES = 4;
 // only a few. Past this, it is not in the pipeline: it was decoded earlier and
 // evicted, and it has to be decoded again rather than waited for.
 const REORDER_DEPTH = 16;
+// Encoded bytes are read in blocks of this size — one fat request beats twenty
+// thin ones — and never in blocks smaller than MIN_BLOCK, since a round trip
+// costs more than those bytes. This is the encoded-byte read-ahead's own budget,
+// deliberately separate from cacheBytes: a decoded frame costs about a thousand
+// times what its encoded bytes do (a 4 MB block is 4 s of a 1080p clip, four
+// decoded 1080p frames are 33 MB), so how far ahead the BYTES are fetched must
+// not be governed by how many FRAMES fit in memory. At most four blocks are
+// held at once — the one being decoded, the one before it, and one or two
+// prefetched behind it (_prefetchDepth) — 16 MB.
+const MAX_BLOCK = 1 << 22;   // 4 MB
+const MIN_BLOCK = 1 << 18;   // 256 KB
 
 // ==================================================================
 // VideoEngine — WebCodecs. Authoritative: we decide which frame is on screen.
@@ -5128,6 +5139,26 @@ class VideoEngine extends EventTarget {
     this._stalledFrame = -1;          // a frame the circuit-breaker gave up on
     this._byteBuffer = null;          // read-ahead buffer of encoded bytes
     this._byteBufferStart = 0;        // its file offset
+    // The block before _byteBuffer, kept while playback flows forward across
+    // blocks: a decode run restarts from its GOP's keyframe when the target
+    // crosses into a new GOP, and that keyframe can sit at the end of the block
+    // just left behind. Dropped on a seek (any read that is not a continuation).
+    this._previousByteBuffer = null;
+    this._previousByteBufferStart = 0;
+    this._prefetches = [];            // blocks in flight ahead of _byteBuffer,
+                                      // oldest first: { start, end, done, promise }
+    // How many blocks to keep banked ahead while playing. One is enough
+    // whenever each block arrives before the current one runs out; it becomes
+    // two the first time a boundary actually blocks (the prefetch was still in
+    // flight when the driver needed it) — evidence of jitter one block of cover
+    // cannot absorb, so the extra 4 MB is spent only on links that showed the
+    // need.
+    this._prefetchDepth = 1;
+    // True until the first urgent read after the playhead was MOVED (a seek, a
+    // loop wrap, load) rather than advanced by the clock; see _drive and update.
+    this._landing = true;
+    this._playheadAfterTick = -1;     // where update() last left the playhead
+    this._frameAfterTick = -1;        // and which frame that was
 
     this._shownFrame = -1;
     this._lastBitmap = null;
@@ -5756,14 +5787,23 @@ class VideoEngine extends EventTarget {
           if (this._videoDecoder.decodeQueueSize > 4) { await this._sleep(0); continue; }
           const k = this._fedThrough + 1;
           const s = this._samples[k];
-          // Until the target is on screen, every byte we fetch beyond the ones
-          // it depends on is a byte the viewer waits on for nothing. So read
-          // only as far as the target's own sample while it is outstanding, and
-          // switch to big background blocks once it has surfaced. On a slow link
-          // this is the difference between waiting for one keyframe and waiting
-          // for a fixed 4 MB block.
+          // While the viewer is waiting to LAND on a frame -- the first frame of
+          // the clip, a paused seek or step, the first read after a seek during
+          // playback -- every byte fetched beyond the ones that frame depends on
+          // is a byte the viewer waits on for nothing, so read only as far as
+          // the target's own sample. On a slow link this is the difference
+          // between waiting for one keyframe and waiting for a fixed 4 MB block.
+          //
+          // But during continuous playback an uncached target means something
+          // else: the decoder has fallen behind the wall clock. A small read
+          // there is one round trip per quarter megabyte, and the clock runs on
+          // through every one of them, so playback never climbs back out. Read
+          // full blocks instead, and land only once per move of the playhead.
+          const landing = !this.playing || this._shownFrame < 0 || this._landing;
+          const urgent = landing && !this._cache.has(target);
+          if (urgent && this.playing) this._landing = false;
           await this._ensureBytes(s.offset, s.size,
-            this._cache.has(target) ? 0 : this._bytesThrough(k, targetDecode));
+            urgent ? this._bytesThrough(k, targetDecode) : 0);
           if (!this._videoDecoder || this._fedThrough !== k - 1) continue;  // restarted mid-read
           // AVI stores H.264 as Annex B, but the decoder is configured in AVCC
           // mode (a description is present), so convert this frame's start-code
@@ -5847,31 +5887,131 @@ class VideoEngine extends EventTarget {
   // It is still a floor-and-ceiling, not an exact read: never less than this
   // sample (or the slice below would run off the end of the buffer), never more
   // than MAX_BLOCK, and never so small that a GOP costs one request per frame.
+  //
+  // During playback the block AFTER the current one is fetched in the background
+  // (_prefetchNextBlock), so the driver crosses a block boundary by adopting
+  // bytes already in hand instead of stopping to wait for them: a blocking
+  // refill here is a round trip plus the transfer with nothing decoding, and
+  // the few frames of decoded read-ahead a 1080p clip can afford under
+  // cacheBytes cover about 0.2 s of it.
   async _ensureBytes(offset, size, wanted = 0) {
-    const buffer = this._byteBuffer;
-    if (buffer && offset >= this._byteBufferStart
-        && offset + size <= this._byteBufferStart + buffer.length) return;
-    const MAX_BLOCK = 1 << 22;   // 4 MB
-    const MIN_BLOCK = 1 << 18;   // 256 KB — a round trip costs more than these bytes
-    const block = wanted > 0
-      ? Math.min(MAX_BLOCK, Math.max(size, Math.min(wanted, MAX_BLOCK), MIN_BLOCK))
-      : MAX_BLOCK;
-    const end = Math.min(this._reader.size, offset + block) - 1;
+    if (this._bufferHolding(offset, size)) {
+      this._prefetchNextBlock();
+      return;
+    }
     // Somebody is waiting on this one. Say so, so that an index pass still
     // streaming the rest of the container out of the same source stands aside
     // rather than racing us for the pipe (see read-priority-gate).
     beginPriorityRead();
     try {
-      this._byteBuffer = new Uint8Array(await this._reader.read(offset, end));
+      // Adopt prefetched blocks, oldest first, while the bytes begin in the
+      // current buffer or in the block under adoption. Usually one adoption; a
+      // sample straddling into the block after takes two, and the stitch in
+      // _bytesAt covers each crossed boundary.
+      while (!this._bufferHolding(offset, size)) {
+        const next = this._prefetches[0];
+        const beginsInCurrent = this._byteBuffer && offset >= this._byteBufferStart
+          && offset < this._byteBufferStart + this._byteBuffer.length;
+        if (!next || offset >= next.end + 1
+            || (offset < next.start && !beginsInCurrent)) break;
+        // Having to wait here is the evidence _prefetchDepth asks for: one
+        // block of cover was not enough for this link. But only a boundary
+        // crossed out of a FULL block says that -- the prefetch then had a
+        // whole block's consumption time as head start. Running out of a
+        // partial buffer (the landing read, moments after play begins) says
+        // nothing about the link.
+        if (!next.done && this._byteBuffer
+            && this._byteBuffer.length >= MAX_BLOCK) {
+          this._prefetchDepth = 2;
+        }
+        const bytes = await next.promise;
+        // Nothing else drops queued prefetches but this method and a reset, so
+        // a different head here means the engine was reset under the wait.
+        if (this._prefetches[0] !== next) return;
+        this._prefetches.shift();
+        if (!bytes) break;   // the prefetch failed; read directly below
+        // A continuation: keep the block being left behind (see the field).
+        this._previousByteBuffer = this._byteBuffer;
+        this._previousByteBufferStart = this._byteBufferStart;
+        this._byteBuffer = bytes;
+        this._byteBufferStart = next.start;
+      }
+      if (!this._bufferHolding(offset, size)) {
+        // Anything still queued is for somewhere the playhead no longer is.
+        this._prefetches = [];
+        const block = wanted > 0
+          ? Math.min(MAX_BLOCK, Math.max(size, Math.min(wanted, MAX_BLOCK), MIN_BLOCK))
+          : MAX_BLOCK;
+        const end = Math.min(this._reader.size, offset + block) - 1;
+        const bytes = new Uint8Array(await this._reader.read(offset, end));
+        this._previousByteBuffer = null;
+        this._byteBuffer = bytes;
+        this._byteBufferStart = offset;
+      }
     } finally {
       endPriorityRead();
     }
-    this._byteBufferStart = offset;
+    this._prefetchNextBlock();
+  }
+
+  // Keep the queue of blocks ahead of the current buffer topped up, to
+  // _prefetchDepth. Only while playing: a paused viewer is stepping or
+  // scrubbing, and 4 MB past every landing is bandwidth the next seek's read
+  // then has to share. A new block is started only once every queued one has
+  // resolved, so a struggling link never has speculative requests stacked on
+  // it. Not bracketed as a priority read -- nobody is waiting on it yet; if the
+  // driver catches up to it, the wait in _ensureBytes is. Never rejects: a
+  // failure resolves to null and the driver reads directly.
+  _prefetchNextBlock() {
+    if (!this.playing || !this._byteBuffer || !this._reader) return;
+    if (this._prefetches.length >= this._prefetchDepth) return;
+    const last = this._prefetches[this._prefetches.length - 1];
+    if (last && !last.done) return;
+    const start = last ? last.end + 1
+      : this._byteBufferStart + this._byteBuffer.length;
+    if (start >= this._reader.size) return;
+    const end = Math.min(this._reader.size, start + MAX_BLOCK) - 1;
+    const record = { start, end, done: false, promise: null };
+    record.promise = this._reader.read(start, end)
+      .then((bytes) => { record.done = true; return new Uint8Array(bytes); },
+            () => { record.done = true; return null; });
+    this._prefetches.push(record);
+  }
+  // Are the bytes [offset, offset+size) resident — in the current block, in the
+  // previous one, or (when the two are contiguous) spanning both?
+  _bufferHolding(offset, size) {
+    return this._bytesAt(offset, size, false) !== null;
+  }
+
+  // The resident bytes [offset, offset+size): a view into whichever block holds
+  // them whole, or, for a sample straddling the boundary between the previous
+  // block and the current one, a fresh copy stitched from both (a sample is a
+  // few kilobytes to a few hundred, so the copy is nothing). Null when they are
+  // not all resident. `materialize: false` only asks the question.
+  _bytesAt(offset, size, materialize = true) {
+    const current = this._byteBuffer, currentStart = this._byteBufferStart;
+    const previous = this._previousByteBuffer, previousStart = this._previousByteBufferStart;
+    const end = offset + size;
+    if (current && offset >= currentStart && end <= currentStart + current.length) {
+      return materialize ? current.subarray(offset - currentStart, end - currentStart) : current;
+    }
+    if (previous && offset >= previousStart && end <= previousStart + previous.length) {
+      return materialize ? previous.subarray(offset - previousStart, end - previousStart) : previous;
+    }
+    if (current && previous && previousStart + previous.length === currentStart
+        && offset >= previousStart && offset < currentStart && end <= currentStart + current.length) {
+      if (!materialize) return current;
+      const stitched = new Uint8Array(size);
+      const head = previous.subarray(offset - previousStart);
+      stitched.set(head, 0);
+      stitched.set(current.subarray(0, end - currentStart), head.length);
+      return stitched;
+    }
+    return null;
   }
   _sliceSample(k) {
     const s = this._samples[k];
-    const rel = s.offset - this._byteBufferStart;
-    return this._byteBuffer.subarray(rel, rel + s.size);
+    return this._bytesAt(s.offset, s.size);
   }
   _sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -5911,6 +6051,11 @@ class VideoEngine extends EventTarget {
     // flex reflow. Nothing announces that, so check it here rather than rely on
     // the host to call resizeCanvas() at exactly the right moment.
     this._syncCanvasSize();
+    // A playhead that is not where the last tick left it was moved by the host
+    // (seekToFrame, currentTime, playhead) rather than by the clock. The driver
+    // then LANDS on the new frame -- a small, urgent read -- instead of treating
+    // it as playback that fell behind (see _drive).
+    if (this.playhead !== this._playheadAfterTick) this._landing = true;
     if (this.playing) {
       if (this._lastNow) {
         const previousPlayhead = this.playhead;
@@ -5950,6 +6095,10 @@ class VideoEngine extends EventTarget {
     }
 
     const frame = this.frameAtTime(this.playhead);
+    // A loop wrap moves the playhead inside this tick; it is a jump like any other.
+    if (frame < this._frameAfterTick) this._landing = true;
+    this._playheadAfterTick = this.playhead;
+    this._frameAfterTick = frame;
     this._request(frame);   // streams/prefetches the window around `frame`
     if (this._inVoid) {
       // No frame at this time — show an empty image, not frame 0 held. Frame 0's
@@ -6092,6 +6241,13 @@ class VideoEngine extends EventTarget {
     this._stalledFrame = -1;
     this._byteBuffer = null;
     this._byteBufferStart = 0;
+    this._previousByteBuffer = null;
+    this._previousByteBufferStart = 0;
+    this._prefetches = [];
+    // _prefetchDepth is kept: it describes the link, not the clip.
+    this._landing = true;
+    this._playheadAfterTick = -1;
+    this._frameAfterTick = -1;
     this._lastBitmap = null;
     this._shownFrame = -1;
     this._hideError();

@@ -207,3 +207,24 @@ session down mid-playback. It needs a big-framed fixture to mean anything
 stays under the ceiling by accident), and it checks the ceiling in both
 directions: small frames must still get the full read-ahead, and a host that
 lowers `cacheBytes` must actually see it shrink.
+
+## Stall
+
+Plays a 1080p clip over a slow link and pins that the picture keeps moving —
+the one property none of the above can see, since every frame is correct
+whether or not it arrived in time, startup stops at the first frame, and
+localhost serves 4 MB in milliseconds. The link is slowed by `serve.py`
+itself (per-request latency and rate caps on the clip URL) rather than by
+DevTools throttling, so the same page can run under any browser. Two
+conditions: a round trip of 150 ms on a fast link, where a blocking refill of
+the encoded-byte block shows as one freeze per 4 MB of file; and the same
+round trip on a link a few times the clip's bitrate, where reads shrinking to
+their 256 KB landing floor mid-playback show as a collapse to a handful of
+frames presented. It asserts on the freeze count, on the median read size
+staying at the playback block, and on the fraction of due frames presented;
+on failure it prints every freeze with what overlapped it (a read, a run
+restart, samples fed) so the cause is in the output. The fixture has to be
+1080p — the decoded read-ahead then covers a fraction of a second, so the
+byte prefetch is the only thing covering a read — long enough to cross
+several block boundaries, and at a real bitrate, since the freeze period is
+block size over bitrate.
