@@ -65,6 +65,17 @@ a slow link into a collapse. So playback reads full blocks, and lands only once
 per move of the playhead (`_landing`, set by `update()` when the playhead is
 not where the last tick left it). `test/stall-test.mjs` pins all of this.
 
+While paused, no blocks are banked ahead — a viewer stepping or dragging the
+scrubber would have 4 MB fetched past every landing, and the next seek's read
+would share the pipe with it. The one exception is a *settled* playhead: once
+it has sat still for `SETTLE_MILLISECONDS` (500 ms), `update()` banks the one
+block after the landing buffer, because a settled seek is almost always about
+to be played and that `play()` otherwise starts from a landing read a fraction
+of a block long. A scrub drag moves the playhead far more often than every
+half second, so nothing is fetched under it. This runs from `update()`, so it
+happens only while the host keeps ticking; a host that stops calling `update()`
+when paused simply fetches on `play()` instead.
+
 ## Memory: the ceiling is bytes, not frames
 
 A decoded frame costs width × height × 4 bytes, so a window counted in

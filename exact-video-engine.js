@@ -5014,6 +5014,9 @@ const REORDER_DEPTH = 16;
 // prefetched behind it (_prefetchDepth) — 16 MB.
 const MAX_BLOCK = 1 << 22;   // 4 MB
 const MIN_BLOCK = 1 << 18;   // 256 KB
+// How long a paused playhead must sit still before the viewer counts as having
+// LANDED somewhere rather than scrubbing through it (see update).
+const SETTLE_MILLISECONDS = 500;
 
 // ==================================================================
 // VideoEngine — WebCodecs. Authoritative: we decide which frame is on screen.
@@ -5159,6 +5162,7 @@ class VideoEngine extends EventTarget {
     this._landing = true;
     this._playheadAfterTick = -1;     // where update() last left the playhead
     this._frameAfterTick = -1;        // and which frame that was
+    this._playheadMovedAt = 0;        // tick timestamp of the last move of it
 
     this._shownFrame = -1;
     this._lastBitmap = null;
@@ -5954,17 +5958,21 @@ class VideoEngine extends EventTarget {
     this._prefetchNextBlock();
   }
 
-  // Keep the queue of blocks ahead of the current buffer topped up, to
-  // _prefetchDepth. Only while playing: a paused viewer is stepping or
-  // scrubbing, and 4 MB past every landing is bandwidth the next seek's read
-  // then has to share. A new block is started only once every queued one has
-  // resolved, so a struggling link never has speculative requests stacked on
-  // it. Not bracketed as a priority read -- nobody is waiting on it yet; if the
-  // driver catches up to it, the wait in _ensureBytes is. Never rejects: a
-  // failure resolves to null and the driver reads directly.
-  _prefetchNextBlock() {
-    if (!this.playing || !this._byteBuffer || !this._reader) return;
-    if (this._prefetches.length >= this._prefetchDepth) return;
+  // Keep the queue of blocks ahead of the current buffer topped up, to `depth`
+  // blocks. While playing that is _prefetchDepth; while paused it is nothing at
+  // all, because a viewer stepping or dragging the scrubber would have 4 MB
+  // fetched past every landing and the next seek's read would have to share the
+  // pipe with it. The one exception is a playhead that has settled (update
+  // passes depth 1 then), where the next thing to happen is usually play.
+  //
+  // A new block is started only once every queued one has resolved, so a
+  // struggling link never has speculative requests stacked on it. Not bracketed
+  // as a priority read -- nobody is waiting on it yet; if the driver catches up
+  // to it, the wait in _ensureBytes is. Never rejects: a failure resolves to
+  // null and the driver reads directly.
+  _prefetchNextBlock(depth = this.playing ? this._prefetchDepth : 0) {
+    if (!this._byteBuffer || !this._reader) return;
+    if (this._prefetches.length >= depth) return;
     const last = this._prefetches[this._prefetches.length - 1];
     if (last && !last.done) return;
     const start = last ? last.end + 1
@@ -6055,7 +6063,10 @@ class VideoEngine extends EventTarget {
     // (seekToFrame, currentTime, playhead) rather than by the clock. The driver
     // then LANDS on the new frame -- a small, urgent read -- instead of treating
     // it as playback that fell behind (see _drive).
-    if (this.playhead !== this._playheadAfterTick) this._landing = true;
+    if (this.playhead !== this._playheadAfterTick) {
+      this._landing = true;
+      this._playheadMovedAt = now;
+    }
     if (this.playing) {
       if (this._lastNow) {
         const previousPlayhead = this.playhead;
@@ -6100,6 +6111,16 @@ class VideoEngine extends EventTarget {
     this._playheadAfterTick = this.playhead;
     this._frameAfterTick = frame;
     this._request(frame);   // streams/prefetches the window around `frame`
+    // A paused playhead that has sat still this long belongs to a viewer who
+    // landed somewhere, not one dragging the scrubber through it, and the play
+    // that usually follows starts from a landing read only a fraction of a
+    // block long. Bank the block after it now, while nothing is waiting on the
+    // pipe. Half a second of stillness is what separates the two: a drag moves
+    // the playhead far more often than that, so nothing is fetched under it.
+    if (!this.playing && this._playheadMovedAt
+        && now - this._playheadMovedAt >= SETTLE_MILLISECONDS) {
+      this._prefetchNextBlock(1);
+    }
     if (this._inVoid) {
       // No frame at this time — show an empty image, not frame 0 held. Frame 0's
       // window is still warmed above, so leaving the void paints instantly.
@@ -6248,6 +6269,7 @@ class VideoEngine extends EventTarget {
     this._landing = true;
     this._playheadAfterTick = -1;
     this._frameAfterTick = -1;
+    this._playheadMovedAt = 0;
     this._lastBitmap = null;
     this._shownFrame = -1;
     this._hideError();

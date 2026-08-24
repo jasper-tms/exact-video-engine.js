@@ -24,11 +24,19 @@ Bundler consumers do not use the generated file at all: `import` resolves to
 
 ## Tests
 
-`test/` needs `ffmpeg` on the PATH and Playwright (`npm install`):
+`test/` needs `ffmpeg` on the PATH and Playwright (`npm install`). A full run
+takes several minutes and prints more than fits on a screen, so send all of it
+to a log and read the log:
 
 ```sh
-bash test/run-tests.sh
+bash test/run-tests.sh > /tmp/run-tests.log 2>&1; echo "exit $?"
 ```
+
+Piping the run itself through `tail` or `grep` throws away everything that does
+not match, and the detail wanted next — the reads leading up to a stall, which
+browser a case failed on — is usually in the discarded part. Searching the log
+costs nothing; running the suite again costs another several minutes for output
+that was already produced once.
 
 What each test pins, why the fixture clips are shaped the way they are, and
 what would silently pass without each case is documented in

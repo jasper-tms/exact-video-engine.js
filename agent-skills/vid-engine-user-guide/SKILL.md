@@ -86,6 +86,14 @@ engine.play();
 `source` is either a URL string — the server must answer HTTP Range requests
 with `206` — or a `File`/`Blob`.
 
+The loop above keeps calling `update()` while paused, which is the common
+setup and the one that gets everything. If instead you stop ticking when
+paused, playback and seeking are unaffected — a seek reads what it needs on the
+spot — but one small optimization goes quiet: when the playhead has sat still
+for half a second, `VideoEngine` reads the next block ahead in the background so
+the next `play()` starts from bytes already in hand. A host that parks its rAF
+loop while paused simply skips that head start and fetches on `play()` instead.
+
 To use `VideoEngine` alone (no fallback), construct it with the canvas and
 call `load(source)`. `NativeVideoEngine` likewise takes the `<video>` element.
 
