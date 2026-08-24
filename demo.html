@@ -90,10 +90,12 @@
     --accent: #5aa9ff;
     --exact: #34c98b;
     --approximate: #e0a13a;
-    /* Buffered/cached segments on the scrubber track — lighter than the track
-       itself so they read as "already in memory", the way a video player shades
-       its buffered range. */
-    --cached: #5b6478;
+    /* The scrubber track's two shaded layers, the way a video player shades
+       its buffered range: pre-fetched frames (encoded bytes in hand) in dark
+       grey, pre-decoded frames (pixels in the cache) in light grey on top —
+       the brighter the shading, the readier the frame. */
+    --prefetched: #6b7383;
+    --predecoded: #b9c0cf;
     --hit: #34c98b;
     --miss: #e0a13a;
   }
@@ -265,11 +267,11 @@
     white-space: nowrap;
   }
   .readout strong { color: var(--text); font-weight: 600; }
-  /* Fully custom range so the track can be painted with the cache occupancy.
+  /* Fully custom range so the track can be painted with what the engine holds.
      Two stacked gradient layers live in --scrubber-track (set every tick from
-     the engine's cache): the played fill on top, the cached segments beneath,
-     over the flat --line base colour. Without appearance:none the browser draws
-     its own track over these. */
+     the engine): pre-decoded frames (light grey) on top, pre-fetched frames
+     (dark grey) beneath, over the flat --line base colour. Without
+     appearance:none the browser draws its own track over these. */
   #scrubber {
     -webkit-appearance: none;
     appearance: none;
@@ -493,12 +495,19 @@
       </span>
     </div>
 
-    <!-- Live caching diagnostics. The scrubber track above is shaded where
-         frames are resident in the engine's decode cache; this row names the
-         result of the most recent seek: whether the target frame was already
-         cached (so display was instant) and how long the seek took to land. -->
+    <!-- Live caching diagnostics, like a video player's buffered bar. The
+         scrubber track above is dark grey across every frame the engine has
+         fetched (pre-fetched), with light grey drawn on top wherever the pixels
+         are also decoded and resident (pre-decoded) — so pre-decoded is a subset
+         of pre-fetched, the brighter part of the same band. The seek readout
+         names the result of the most recent seek: whether the target frame was
+         already decoded (so display was instant) and how long the seek took to
+         land. -->
     <div class="diagnostics">
-      <span class="readout" id="cache-readout" title="Frames currently held in the WebCodecs engine's decode cache (the shaded segments on the scrubber).">cache: <strong>—</strong></span>
+      <span class="readout" id="prefetch-readout" title="Every frame the engine has fetched — bytes resident in a read block, bytes already handed to the decoder, or fully decoded. A superset of pre-decoded; the decoded frames render in the lighter shade on top.">pre-fetched frames (dark grey): <strong>—</strong></span>
+    </div>
+    <div class="diagnostics">
+      <span class="readout" id="cache-readout" title="Frames currently held decoded in the WebCodecs engine's frame cache.">pre-decoded frames (light grey): <strong>—</strong></span>
       <span class="readout" id="seek-readout">last seek: <strong>—</strong></span>
     </div>
 
@@ -508,7 +517,7 @@
          it calls engine.setCacheBytes: turn it down to watch the cache strip
          above evict, up to watch read-ahead reach further. -->
     <div class="cache-control">
-      <label class="readout" id="cache-size-label" for="cache-size">cache size: <strong>—</strong></label>
+      <label class="readout" id="cache-size-label" for="cache-size">decoded frames cache size: <strong>—</strong></label>
       <input id="cache-size" type="range" min="8" max="2048" step="8" value="96"
              title="Memory ceiling for decoded frames. The engine cuts its frame window to fit this, so a low ceiling on a high-resolution clip holds only a few frames.">
     </div>
@@ -552,6 +561,7 @@ const totalReadout = document.getElementById('total-readout');
 const timeReadout = document.getElementById('time-readout');
 const durationReadout = document.getElementById('duration-readout');
 const cacheReadout = document.getElementById('cache-readout');
+const prefetchReadout = document.getElementById('prefetch-readout');
 const seekReadout = document.getElementById('seek-readout');
 const headroomLabel = document.getElementById('headroom-label');
 const headroomFill = document.getElementById('headroom-fill');
@@ -667,6 +677,48 @@ async function takeSession() {
 let engine = null;
 let scrubbing = false;
 
+// Debug handle: the live engine is otherwise a module-scoped local, invisible to
+// the console (and to anyone driving the page over CDP). Assigned on every load,
+// nulled on destroy. window.dumpEngine(lo, hi) returns a JSON-friendly snapshot
+// of the state behind the two read-ahead readouts, optionally with the exact
+// sample (byte offset/size, decode index) for each display frame in [lo, hi] —
+// which is what turns "why is this range discontinuous" into a lookup. Only on
+// the WebCodecs tier; the native engine has none of these fields.
+window.dumpEngine = (lo, hi) => {
+  const e = window.engine;
+  if (!e) return 'no engine loaded';
+  if (!e._samples) return 'native engine (no WebCodecs internals to dump)';
+  const buffer = (buf, start) => buf
+    ? { start, length: buf.length, end: start + buf.length - 1 } : null;
+  const snapshot = {
+    playing: e.playing,
+    playhead: e.playhead,
+    shownFrame: e._shownFrame,
+    target: e._target,
+    numFrames: e.numFrames,
+    landing: e._landing,
+    prefetchDepth: e._prefetchDepth,
+    decodedCache: [...e._cache.keys()].sort((a, b) => a - b),
+    pending: [...(e._pending || [])].sort((a, b) => a - b),
+    previousBlock: buffer(e._previousByteBuffer, e._previousByteBufferStart),
+    currentBlock: buffer(e._byteBuffer, e._byteBufferStart),
+    prefetches: (e._prefetches || []).map((p) => ({ start: p.start, end: p.end, done: p.done })),
+    fileSize: e._reader ? e._reader.size : null,
+  };
+  if (lo !== undefined) {
+    snapshot.samples = [];
+    for (let d = lo; d <= (hi === undefined ? lo : hi); d++) {
+      const dec = e._displayToDecode[d];
+      const s = e._samples[dec];
+      snapshot.samples.push(s
+        ? { display: d, decode: dec, offset: s.offset, size: s.size,
+            end: s.offset + s.size - 1, isSync: s.isSync }
+        : { display: d, decode: dec, missing: true });
+    }
+  }
+  return snapshot;
+};
+
 // The waiting-for-frame indicator (dimmed picture + the pill under the video).
 // A paused seek names its target instantly (engine.currentFrame) but the pixels
 // arrive only when the frame is decoded (engine.presentedFrame); while those
@@ -778,11 +830,9 @@ function updateSeekMeasure() {
   }
 }
 
-// The resident frame indices, collapsed into contiguous [start, end] ranges —
-// what the scrubber shading and the cache readout both draw from.
-function cachedRanges() {
-  if (!hasFrameCache() || !engine._cache.size) return [];
-  const keys = [...engine._cache.keys()].sort((a, b) => a - b);
+// Collapse sorted frame indices into contiguous [start, end] ranges.
+function collapseIntoRanges(keys) {
+  if (!keys.length) return [];
   const ranges = [];
   let start = keys[0], prev = keys[0];
   for (let i = 1; i < keys.length; i++) {
@@ -795,47 +845,144 @@ function cachedRanges() {
   return ranges;
 }
 
-// Paint the scrubber track: the played fill on top, the cached segments beneath.
-// Both are stacked linear-gradients handed to the track's background-image via a
-// CSS variable; the flat track colour shows through the transparent gaps.
+// Pre-decoded frames: pixels resident in the engine's frame cache, as ranges.
+function predecodedRanges() {
+  if (!hasFrameCache() || !engine._cache.size) return [];
+  return collapseIntoRanges([...engine._cache.keys()].sort((a, b) => a - b));
+}
+
+// Pre-fetched frames: every frame the engine currently holds in ANY form past
+// the raw file — the way a video player's "buffered" bar spans everything loaded,
+// with the decoded/played part drawn brighter on top. A frame qualifies if it is
+// in any of three states, which the viewer has no reason to tell apart:
+//
+//   1. bytes resident in a read block (current, previous, or a resolved
+//      prefetch) — not yet handed to the decoder;
+//   2. bytes already handed to the decoder — fed and (being B-frames) held in
+//      its reorder buffer, their block since slid forward;
+//   3. decoded and cached (also reported on its own as pre-decoded).
+//
+// This is a SUPERSET of the pre-decoded set, deliberately: excluding decoded
+// frames would punch a hole in the fetched band exactly where a frame is furthest
+// along (a gap that reads as "not fetched" when the truth is "more than fetched").
+// Including state 2 also matters: without it a resident block's trailing edge
+// frays into a comb (167, 169, 171…), because reordering puts a frame's bytes just
+// inside the block while its display-neighbour's sit just past the decode frontier,
+// already consumed. States 2 and 3 fill exactly those gaps and no others — a frame
+// decoded long ago and since evicted from both the byte buffer and the frame cache
+// is in none of the three, and correctly stays dark.
+//
+// The container index is what makes state 1 knowable: it maps every frame to its
+// exact byte span, so "which frames do these bytes cover" is a lookup — the same
+// table a <video> element consults to report its buffered ranges.
+function prefetchedRanges() {
+  if (!hasFrameCache() || !engine._samples || !engine._displayToDecode) return [];
+  const byteRanges = [];
+  if (engine._previousByteBuffer) {
+    byteRanges.push([engine._previousByteBufferStart,
+      engine._previousByteBufferStart + engine._previousByteBuffer.length]);
+  }
+  if (engine._byteBuffer) {
+    byteRanges.push([engine._byteBufferStart,
+      engine._byteBufferStart + engine._byteBuffer.length]);
+  }
+  for (const block of engine._prefetches || []) {
+    if (block.done) byteRanges.push([block.start, block.end + 1]);
+  }
+  // A frame's bytes are resident when its sample lies wholly inside one byte
+  // range (or spans two contiguous ones, which the engine stitches). Merge
+  // contiguous ranges first so the straddle case needs no special handling.
+  byteRanges.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const [start, end] of byteRanges) {
+    const last = merged[merged.length - 1];
+    if (last && start <= last[1]) last[1] = Math.max(last[1], end);
+    else merged.push([start, end]);
+  }
+  const samples = engine._samples;
+  const displayToDecode = engine._displayToDecode;
+  const cache = engine._cache;
+  // The decoder emits in display order, so every display frame at or below the
+  // highest cached one has already been emitted; a fed-but-uncached frame is
+  // "still in the decoder" (state 2) only above that frontier. Below it, a
+  // fed-but-uncached frame is one already shown and evicted — history, not in
+  // hand — which this bound correctly excludes.
+  let emitFrontier = -1;
+  for (const key of cache.keys()) if (key > emitFrontier) emitFrontier = key;
+  const fedThrough = engine._fedThrough;
+  const frames = [];
+  for (let display = 0; display < displayToDecode.length; display++) {
+    const sample = samples[displayToDecode[display]];
+    if (!sample) continue;
+    const decoded = cache.has(display);                                // state 3
+    const bytesResident = merged.some(([start, end]) =>                // state 1
+      sample.offset >= start && sample.offset + sample.size <= end);
+    const heldInDecoder = display > emitFrontier                       // state 2
+      && displayToDecode[display] <= fedThrough;
+    if (decoded || bytesResident || heldInDecoder) frames.push(display);
+  }
+  return collapseIntoRanges(frames);
+}
+
+// One gradient layer for the scrubber track: the given ranges in `color`,
+// transparent elsewhere. Each range is widened a hair so a lone frame is still
+// a visible sliver.
+function trackLayer(ranges, color, pct) {
+  const parts = [];
+  let at = 0;
+  for (const [s, e] of ranges) {
+    let a = Math.max(at, pct(s) - 0.25);
+    let b = Math.max(a, Math.min(100, pct(e) + 0.25));
+    if (a > at) parts.push(`transparent ${at}% ${a}%`);
+    parts.push(`${color} ${a}% ${b}%`);
+    at = b;
+  }
+  if (at < 100) parts.push(`transparent ${at}% 100%`);
+  return `linear-gradient(to right, ${parts.join(', ')})`;
+}
+
+function describeRanges(ranges) {
+  const frames = ranges.reduce((n, [s, e]) => n + e - s + 1, 0);
+  const summary = ranges.length
+    ? ranges.map(([s, e]) => (s === e ? `${s}` : `${s}–${e}`)).join(', ')
+    : 'none';
+  return `<strong>${frames} frame${frames === 1 ? '' : 's'}</strong> [${summary}]`;
+}
+
+// Paint the scrubber track: pre-decoded frames (light grey) stacked over
+// pre-fetched frames (dark grey), both as linear-gradients handed to the
+// track's background-image via a CSS variable; the flat track colour shows
+// through the transparent gaps.
+//
+// No played/progress fill: a fill covering everything left of the playhead
+// would hide exactly the shading behind it (a backward scrub's free frames),
+// which is the point of this strip. The thumb already marks the playhead.
 function updateCacheStrip() {
   if (!engine) { scrubber.style.removeProperty('--scrubber-track'); return; }
   const denom = Math.max(1, engine.numFrames - 1);
   const pct = (f) => Math.max(0, Math.min(100, (f / denom) * 100));
 
-  // Only the cached segments are painted onto the track — no played/progress
-  // fill. A fill covering everything left of the playhead would hide exactly the
-  // cached frames behind it (a backward scrub's free frames), which are the point
-  // of this strip. The thumb already marks the playhead position.
-  const ranges = cachedRanges();
-  let cachedFrames = 0;
-  if (ranges.length) {
-    const parts = [];
-    let at = 0;
-    for (const [s, e] of ranges) {
-      cachedFrames += e - s + 1;
-      // Widen each range a hair so a lone cached frame is still a visible sliver.
-      let a = Math.max(at, pct(s) - 0.25);
-      let b = Math.max(a, Math.min(100, pct(e) + 0.25));
-      if (a > at) parts.push(`transparent ${at}% ${a}%`);
-      parts.push(`var(--cached) ${a}% ${b}%`);
-      at = b;
-    }
-    if (at < 100) parts.push(`transparent ${at}% 100%`);
-    scrubber.style.setProperty('--scrubber-track',
-      `linear-gradient(to right, ${parts.join(', ')})`);
+  const decoded = predecodedRanges();
+  const fetched = prefetchedRanges();
+  const layers = [];
+  if (decoded.length) layers.push(trackLayer(decoded, 'var(--predecoded)', pct));
+  if (fetched.length) layers.push(trackLayer(fetched, 'var(--prefetched)', pct));
+  if (layers.length) {
+    scrubber.style.setProperty('--scrubber-track', layers.join(', '));
   } else {
     scrubber.style.removeProperty('--scrubber-track');
   }
 
   if (!hasFrameCache()) {
-    cacheReadout.innerHTML = 'cache: <strong>— (native engine)</strong>';
+    prefetchReadout.innerHTML =
+      'pre-fetched frames (dark grey): <strong>— (native engine)</strong>';
+    cacheReadout.innerHTML =
+      'pre-decoded frames (light grey): <strong>— (native engine)</strong>';
   } else {
-    const summary = ranges.length
-      ? ranges.map(([s, e]) => (s === e ? `${s}` : `${s}–${e}`)).join(', ')
-      : 'empty';
-    cacheReadout.innerHTML = `cache: <strong>${cachedFrames} frame`
-      + `${cachedFrames === 1 ? '' : 's'}</strong> [${summary}]`;
+    prefetchReadout.innerHTML =
+      `pre-fetched frames (dark grey): ${describeRanges(fetched)}`;
+    cacheReadout.innerHTML =
+      `pre-decoded frames (light grey): ${describeRanges(decoded)}`;
   }
 }
 
@@ -912,8 +1059,8 @@ function applyCacheSize() {
   const reachable = hasFrameCache();
   cacheSizeInput.disabled = !!engine && !reachable;
   cacheSizeLabel.innerHTML = (engine && !reachable)
-    ? 'cache size: <strong>— (native engine)</strong>'
-    : `cache size: <strong>${formatCacheSize(megabytes)}</strong>`;
+    ? 'decoded frames cache size: <strong>— (native engine)</strong>'
+    : `decoded frames cache size: <strong>${formatCacheSize(megabytes)}</strong>`;
   if (reachable) engine.setCacheBytes(megabytes * BYTES_PER_MEGABYTE);
 }
 cacheSizeInput.addEventListener('input', applyCacheSize);
@@ -949,12 +1096,13 @@ async function load(file) {
   setStatus('Loading ' + file.name + '…');
   // Decoders are a limited browser resource, so hand back the previous engine's
   // before building another.
-  if (engine) { engine.destroy(); engine = null; }
+  if (engine) { engine.destroy(); engine = null; window.engine = null; }
   // A seek target from the previous engine means nothing to the new one.
   requestedFrame = null;
   seekMeasure = null;
   seekReadout.innerHTML = 'last seek: <strong>—</strong>';
-  cacheReadout.innerHTML = 'cache: <strong>—</strong>';
+  prefetchReadout.innerHTML = 'pre-fetched frames (dark grey): <strong>—</strong>';
+  cacheReadout.innerHTML = 'pre-decoded frames (light grey): <strong>—</strong>';
   headroomLabel.innerHTML = 'read-ahead: <strong>—</strong>';
   headroomFill.style.width = '0%';
   headroomFill.className = 'meter-fill';
@@ -989,6 +1137,7 @@ async function load(file) {
     // frames held behind the playhead across the entire range.
     engine = await createBestEngine(file, { canvas, video, prefer, index: containerIndex,
       windowAhead: Infinity, windowBack: Infinity });
+    window.engine = engine;   // debug handle; see window.dumpEngine above
   } catch (error) {
     // Nothing is playing now, so bring the drop panel back rather than leave a
     // dead player on screen.
