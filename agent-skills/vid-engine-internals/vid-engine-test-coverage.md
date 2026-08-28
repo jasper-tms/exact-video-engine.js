@@ -228,3 +228,51 @@ restart, samples fed) so the cause is in the output. The fixture has to be
 byte prefetch is the only thing covering a read — long enough to cross
 several block boundaries, and at a real bitrate, since the freeze period is
 block size over bitrate.
+
+## Rebuffer
+
+Plays the same 1080p fixture over a link *below* its bitrate — so the byte
+prefetch genuinely cannot stay ahead and playback stalls for data — and pins
+that the owned clock HOLDS and waits (buffering) rather than running on and
+dropping frames. It reads two things off the same slow link: with the hold on
+(the default), no freeze jumps more than one frame (the clock held, nothing was
+dropped), `rebuffering` was observed true, and real frames still reached the
+screen; with `rebufferSeconds: 0`, the same link drops a run of ~200 frames in a
+single jump — the collapse the hold prevents, and the proof the on-result is the
+feature working rather than the link keeping up. Stall-test cannot see this: its
+links are ones the prefetch keeps fed, so nothing ever stalls and the hold never
+engages. The `rebufferSeconds` query knob on `test-stall.html` selects the two
+modes; `maxSkippedFrames` and `everRebuffered` in its summary are what the test
+reads.
+
+`rebuffer-logic-test.mjs` is the Node-only companion: the throttled link above
+is byte-bound, so it only exercises the network-stall hold, while the
+decode-bound fallback (a decoder too slow to keep up gives up holding and drops
+frames rather than lurch) needs a decoder no fixture reliably is. It drives
+`_rebufferHold` directly against a stubbed index and cache — decoded frames and
+resident bytes set by hand — and pins the hysteresis (enter on one undecoded
+frame, leave on rebufferSeconds downloaded ahead), that "downloaded ahead" counts
+decoded-or-bytes-resident (so a played frame whose bytes are freed is not a gap),
+the decode-stall streak flipping to dropping and a recovery interval retiring it,
+and that a network stall still holds inside the fallback.
+
+## Paused frame
+
+The invariant the whole engine exists to hold: when playback PAUSES, the image
+on screen is the frame the clock is paused on — never a stale earlier frame left
+up because the picture was lagging the clock. The rebuffering/frame-dropping
+clock is the one thing that could break it, since while playing the picture may
+legitimately trail the clock. `frame-index-test.mjs` already proves
+`presentedFrame`'s pixels are correct for its index, but only across seeks, never
+after playback — this fills that gap. `test-paused-frame.html` plays a clip on
+real animation frames and, at intervals, pauses, settles (the `ensureFrame` + a
+render tick a paused host runs), and records the clock's frame, the reported
+presented frame, and — on the counter clips — the frame the PIXELS show. Two
+runs: `counter-cfr.mp4` unthrottled, where every pause must show the exact frame
+by pixels; and `hd-long.mp4` over a link below its bitrate with
+`rebufferSeconds: 0`, which drops frames so the picture genuinely trails the
+clock mid-playback, where every pause must still settle on `presentedFrame ===
+currentFrame` with that frame's bitmap in hand and at least one pause must have
+caught the picture still behind (`staleBefore`) so the recovery path is known to
+have run. The counter pane is the native 150×90 (like frame-index) with
+smoothing off, so the bar is not resampled onto a neighbouring column.

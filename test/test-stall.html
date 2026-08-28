@@ -150,6 +150,12 @@ function summarize(engine, allTicks, reads, restarts) {
     freezeMedianMilliseconds: round(median(freezes.map((f) => f.durationMilliseconds))),
     freezeWorstMilliseconds: round(Math.max(0, ...freezes.map((f) => f.durationMilliseconds))),
     medianSkippedFrames: median(freezes.map((f) => f.skippedFrames)),
+    // The most frames any single freeze jumped across. Zero means the clock
+    // HELD through every freeze (buffering) rather than running on and dropping
+    // the frames in between; the rebuffering hold is what makes it zero.
+    maxSkippedFrames: Math.max(0, ...freezes.map((f) => f.skippedFrames)),
+    // Whether the clock was ever held on the last frame waiting to rebuffer.
+    everRebuffered: ticks.some((tick) => tick.rebuffering),
     freezesOverlappingRead: freezes.filter((f) => f.readBytes > 0).length,
     freezesWithRestart: freezes.filter((f) => f.restarted).length,
 
@@ -206,9 +212,14 @@ function renderReport(result) {
 }
 
 async function run() {
+  // rebufferSeconds lets the rebuffer test drive both the buffering hold (a
+  // positive value, the default) and the old drop-frames behaviour (0) over the
+  // same throttled link; absent, the engine's own default applies.
+  const rebufferParam = params.get('rebufferSeconds');
   const engine = await createBestEngine(clipUrl(), {
     canvas: document.querySelector('canvas'),
     prefer: 'webcodecs',
+    ...(rebufferParam == null ? {} : { rebufferSeconds: Number(rebufferParam) }),
   });
   // Everything below reads VideoEngine's internals; the <video> tier is a
   // different subject. The usual way to land there without noticing is that
@@ -236,7 +247,8 @@ async function run() {
     engine.play();
     (function tick(now) {
       engine.update(now);
-      ticks.push({ now, presentedFrame: engine._shownFrame, fedThrough: engine._fedThrough });
+      ticks.push({ now, presentedFrame: engine._shownFrame, fedThrough: engine._fedThrough,
+        rebuffering: engine.rebuffering });
       if (now - startedAt >= PLAY_SECONDS * 1000 || engine.paused) resolve();
       else requestAnimationFrame(tick);
     }(performance.now()));

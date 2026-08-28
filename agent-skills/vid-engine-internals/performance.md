@@ -76,6 +76,48 @@ half second, so nothing is fetched under it. This runs from `update()`, so it
 happens only while the host keeps ticking; a host that stops calling `update()`
 when paused simply fetches on `play()` instead.
 
+## Buffering: holding the clock instead of dropping frames
+
+When the frame under the playhead is not decoded yet, `update()` HOLDS the owned
+clock on the last frame and waits, rather than advancing through the gap and
+leaving those frames undrawn — the buffering pause an online player shows, in
+place of silent frame-dropping. `playing` stays true, the last frame stays
+painted, and `rebuffering` reads true so a host can show a spinner. The hold is
+`VideoEngine`-only; `NativeVideoEngine` buffers on the `<video>` element's own
+clock, and its `rebuffering` merely observes that (readyState below
+HAVE_FUTURE_DATA).
+
+The subtlety is the resume threshold. A hold releases once `rebufferSeconds`
+(default 0.3 s, `options.rebufferSeconds`; 0 disables the hold) of upcoming
+content is buffered ahead of the playhead — but measured in **downloaded**
+seconds, not decoded ones. The decoded-frame cache is deliberately tiny for HD
+(the bytes-not-frames ceiling below leaves ~6 frames, a fifth of a second), far
+under any reasonable threshold, so gating resume on decoded lookahead would hold
+such a clip for ever. `_downloadedAheadSeconds` instead counts frames that can
+play without a network wait — decoded OR encoded-bytes-resident — from the
+playhead forward; both halves are needed, since a just-played frame is decoded
+but its bytes are long freed while a frame further ahead has bytes but is not
+decoded yet. Reaching the last indexed frame (or the loop region's end) returns
+Infinity, so a short tail or the growing edge of an index does not freeze the
+clock — the growing edge resumes into the accumulation step's own
+`waitingForIndex` wait, the right instrument for a stall on the indexer.
+
+Holding helps only while WAITING closes the gap. A byte stall is a bounded
+backlog draining at link speed whether the clock runs or not, so the hold always
+catches up. A decoder that simply cannot keep up in real time would hold, spurt,
+drain, and hold again for ever — slow motion, not smooth — so a decode-bound
+hold (the frame's bytes are resident but it is undecoded) that recurs
+`DECODE_STALL_LIMIT` times without a `DECODE_RECOVERY_SECONDS` recovery in
+between concedes the point: the clock is let run and frames are dropped (real
+time, the browser's own decode-behind behaviour) until decode has kept up again.
+Counting a streak of un-recovered stalls rather than stalls-per-time-window
+matters because a badly outmatched decoder produces long holds — three
+two-second freezes are not "rapid", but they are what the fallback exists to
+end. A network-bound stall always holds, even inside the fallback: dropping
+frames with no bytes in hand just races the clock past a frozen picture.
+`test/rebuffer-test.mjs` pins the hold-not-drop behaviour (and that
+`rebufferSeconds: 0` restores dropping) over a link below the clip's bitrate.
+
 ## Memory: the ceiling is bytes, not frames
 
 A decoded frame costs width × height × 4 bytes, so a window counted in

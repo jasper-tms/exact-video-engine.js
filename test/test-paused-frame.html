@@ -1,0 +1,167 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine paused-frame test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, monospace; background: #12141a;
+         color: #e8eaf0; margin: 16px; }
+  /* Native counter size, like test-frame-index.html: the canvas backing store
+     then matches the decoded frame (up to an integer device-pixel scale), so the
+     bars are not resampled onto other columns and visibleFrame reads them exactly. */
+  #pane { width: 150px; height: 90px; background: #000; }
+  #pane canvas { width: 100%; height: 100%; display: block; }
+  pre { white-space: pre-wrap; }
+</style>
+<div id="pane"><canvas></canvas></div>
+<pre id="report">loading…</pre>
+<script>
+// When the user PAUSES, does the image on screen match the frame the clock is
+// paused on? That is the invariant the whole engine exists to hold, and the
+// frame-dropping/rebuffering clock added around update() is the one thing that
+// could compromise it: while playing, the picture may lag the clock (a frame
+// still decoding, or one deliberately dropped because decode fell behind), so a
+// pause landing in that moment must still repaint the EXACT frame under the
+// playhead, not leave the stale one up.
+//
+// This page plays a clip on real animation frames and, at intervals, pauses and
+// lets the engine settle, recording for each pause what the clock says
+// (`currentFrame`), what the engine reports on screen (`presentedFrame`), and —
+// on the counter clips — what the PIXELS actually show (`visibleFrame`, ground
+// truth). `staleBefore` records whether the picture was still behind the clock
+// at the instant of the pause, so the harness can confirm it actually exercised
+// the recovery rather than only ever pausing on an already-correct frame.
+//
+// Query parameters, all optional:
+//   file=counter-cfr.mp4        clip under test/clips
+//   playSeconds=6               how long to run
+//   pauseEveryTicks=3           pause-and-check once every this many played ticks
+//   warmupTicks=4               played ticks before the first pause
+//   rebufferSeconds=            passed to VideoEngine (0 forces frame-dropping)
+//   latencyMilliseconds=150     round trip serve.py charges on every clip read
+//   bytesPerSecond=1200000      rate cap serve.py writes the clip body at
+const params = new URLSearchParams(location.search);
+const CLIP = params.get('file') || 'counter-cfr.mp4';
+const PLAY_SECONDS = Number(params.get('playSeconds') || 6);
+const PAUSE_EVERY_TICKS = Number(params.get('pauseEveryTicks') || 3);
+const WARMUP_TICKS = Number(params.get('warmupTicks') || 4);
+
+// The counter clips draw one 5 px bar per frame across 150 px, so the bar's
+// position is the frame number recoverable from the pixels with no trust in any
+// clock (identical to test-frame-index.html's reader). Clips without the bars
+// (hd-long) read as -1 here and are checked on presentedFrame instead.
+const BARS_ACROSS = 30;
+function visibleFrame(canvas) {
+  const width = canvas.width, height = canvas.height;
+  const row = canvas.getContext('2d')
+    .getImageData(0, Math.floor(height * 3 / 4), width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < width; x++) {
+    if (row[x * 4] > 128) { sum += x; count += 1; }
+  }
+  if (!count) return -1;
+  return Math.floor((sum / count) / (width / BARS_ACROSS));
+}
+
+function clipUrl() {
+  const url = new URL('clips/' + CLIP, location.href);
+  for (const name of ['latencyMilliseconds', 'bytesPerSecond']) {
+    if (params.get(name)) url.searchParams.set(name, params.get(name));
+  }
+  return url.href;
+}
+
+const probe = document.createElement('canvas');
+probe.width = 150; probe.height = 90;
+const probeContext = probe.getContext('2d');
+
+const raf = () => new Promise((resolve) => requestAnimationFrame(resolve));
+
+async function run() {
+  const rebufferParam = params.get('rebufferSeconds');
+  const canvas = document.querySelector('canvas');
+  const engine = await createBestEngine(clipUrl(), {
+    canvas,
+    prefer: 'webcodecs',
+    // Exact, uninterpolated pixels, so the counter bar stays a crisp block that
+    // visibleFrame reads without an interpolated edge shifting it a slot.
+    imageSmoothingEnabled: false,
+    ...(rebufferParam == null ? {} : { rebufferSeconds: Number(rebufferParam) }),
+  });
+  if (engine.tier !== 'webcodecs') {
+    throw new Error(`ran on the ${engine.tier} tier; this page traces the owned clock`
+      + (window.isSecureContext ? '' : ' — not a secure context, so WebCodecs was '
+        + 'never available'));
+  }
+  engine.loop = false;
+  engine.seekToFrame(0);
+  await engine.ensureFrame(0);
+
+  const rows = [];
+  let everRebuffered = false, everDropped = false;
+
+  // Settle the way a host that needs pixels would: decode the frame under the
+  // (now paused) playhead, then paint it. Both are exactly what a paused host
+  // does — ensureFrame + a render tick — so this measures the engine's own
+  // guarantee, not a test-only shortcut.
+  async function settleAndRecord() {
+    const target = engine.currentFrame;
+    const presentedBefore = engine.presentedFrame;
+    await engine.ensureFrame(target);
+    engine.update(performance.now());
+    probeContext.drawImage(canvas, 0, 0, probe.width, probe.height);
+    rows.push({
+      currentFrame: engine.currentFrame,
+      presentedFrame: engine.presentedFrame,
+      visible: visibleFrame(probe),
+      // Was the picture still behind the clock when we paused? (Proves the
+      // recovery path was actually exercised, not just already-correct pauses.)
+      staleBefore: presentedBefore !== target,
+      hasBitmap: !!engine.bitmapForFrame(target),
+    });
+  }
+
+  const startedAt = performance.now();
+  engine.play();
+  let ticksSincePause = 0;
+  while (performance.now() - startedAt < PLAY_SECONDS * 1000 && !engine.paused) {
+    engine.update(performance.now());
+    if (engine.rebuffering) everRebuffered = true;
+    if (engine._droppingFrames) everDropped = true;
+    ticksSincePause += 1;
+    if (ticksSincePause >= WARMUP_TICKS + PAUSE_EVERY_TICKS
+        || (rows.length === 0 && ticksSincePause >= WARMUP_TICKS)) {
+      engine.pause();
+      await settleAndRecord();
+      ticksSincePause = 0;
+      engine.play();
+    }
+    await raf();
+  }
+
+  return {
+    clip: CLIP,
+    tier: engine.tier,
+    numFrames: engine.numFrames,
+    rebufferSeconds: engine._rebufferSeconds,
+    everRebuffered,
+    everDropped,
+    rows,
+  };
+}
+
+run().then((result) => {
+  window.__result = result;
+  const bad = result.rows.filter((r) => r.presentedFrame !== r.currentFrame
+    || (r.visible >= 0 && r.visible !== r.currentFrame));
+  document.getElementById('report').textContent =
+    `${result.clip} (${result.tier}) — ${result.rows.length} pauses, `
+    + `${bad.length} mismatched, everDropped ${result.everDropped}, `
+    + `everRebuffered ${result.everRebuffered}\n`
+    + result.rows.map((r) => `f=${r.currentFrame} presented=${r.presentedFrame} `
+      + `visible=${r.visible} staleBefore=${r.staleBefore}`).join('\n');
+}).catch((e) => {
+  window.__err = String(e && e.stack || e);
+  document.getElementById('report').textContent = 'error: ' + window.__err;
+});
+</script>

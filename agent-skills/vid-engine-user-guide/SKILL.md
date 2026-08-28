@@ -169,6 +169,7 @@ Both engines expose the following.
 | `frameIndexIsExact` | True on every engine `createBestEngine` returns. Goes false only if the runtime watcher later catches the table disagreeing with the frames actually presented, alongside a fatal `errormessage`. |
 | `frameIndexState` | `complete` (the ordinary case), `growing` (the index is still being built and `numFrames` is still rising), or `truncated` (the pass stopped early; what is here is final, the rest of the clip is not coming). `VideoEngine` only — the native path refuses a growing index. |
 | `waitingForIndex` | True while playback is pinned at the last indexed frame waiting for the index to catch up. A stall on the indexer, not the end of the clip, so `loop` does not fire. |
+| `rebuffering` | True while playback is buffering — the picture held on the last frame, `playing` still true, resuming on its own once enough is buffered ahead. Bind a spinner to it. On `VideoEngine` the engine holds its own clock (see `rebufferSeconds`); on `NativeVideoEngine` it observes the `<video>` element's own buffering. Distinct from `waitingForIndex` (pinned on the indexer) and `paused` (the host stopped playback). |
 | events `indexextended` / `indexcomplete` / `indextruncated` | The index published more frames, finished, or stopped early. `indextruncated` also emits a fatal `errormessage`. |
 | `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when the index carries no decoder configuration (Ogg, or a Matroska codec the engine does not configure). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. `mjpeg` is this library's own marker for Motion JPEG clips (WebCodecs registers no string for it). |
 | `failed` | True once the engine can no longer stand behind its output: an unrecoverable `VideoDecoder` error (`VideoEngine`), or the container index caught disagreeing with the presented frames during playback (`NativeVideoEngine`). Both also emit a fatal `errormessage`. |
@@ -346,10 +347,20 @@ and the window fills behind them.
   `engine.setCacheBytes(bytes)` changes the ceiling at runtime (a no-op on the
   native tier, which has no addressable frame cache) — turn it down on a
   low-memory warning and back up when there is room.
+- **Buffering instead of dropping frames**: when a frame is not decoded in time,
+  `VideoEngine` holds its clock on the last frame and waits — the buffering pause
+  of an ordinary online player — rather than running the clock on and dropping
+  frames. It resumes once `rebufferSeconds` (default 0.3 s) of upcoming content
+  is buffered ahead of the playhead, and `rebuffering` is true meanwhile (bind a
+  spinner to it). `rebufferSeconds: 0` turns the hold off, so the clock never
+  waits for the decoder. A machine that simply cannot decode the clip in real
+  time would buffer endlessly, so after a few holds in a row it concedes and
+  plays on at real time, dropping frames, until decode has kept up again. The
+  option is `VideoEngine`-only — the native `<video>` tier buffers on its own.
 
 ```js
 const engine = await createBestEngine(source, { canvas, video, windowAhead: 0 });
-new VideoEngine(canvas, { cacheBytes: 32 << 20 });
+new VideoEngine(canvas, { cacheBytes: 32 << 20, rebufferSeconds: 0.5 });
 ```
 
 ## When the decoder dies mid-playback

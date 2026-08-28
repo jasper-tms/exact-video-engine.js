@@ -46,6 +46,7 @@ node test/ogg-table-test.mjs || node_status=1
 node test/avi-table-test.mjs || node_status=1
 node test/progressive-index-test.mjs || node_status=1
 node test/frame-reorder-bound-test.mjs || node_status=1
+node test/rebuffer-logic-test.mjs || node_status=1
 
 # test/serve.py, not `python3 -m http.server`: the latter ignores Range headers
 # and answers 200 with the whole file, which the engine reads over Range. That is
@@ -93,6 +94,16 @@ node test/memory-test.mjs || status=1
 # (which reach any browser, unlike CDP throttling) and pins that playback does
 # not freeze on the encoded-byte reads. Engine bookkeeping again; one engine.
 node test/stall-test.mjs || status=1
+# rebuffer plays the same 1080p clip over a link BELOW its bitrate and pins that
+# playback holds its clock and waits (buffering) rather than running on and
+# dropping frames -- and that rebufferSeconds:0 restores the old dropping. The
+# owned clock again; one engine.
+node test/rebuffer-test.mjs || status=1
+# paused-frame pins the non-negotiable invariant that a PAUSE lands on the exact
+# frame the clock is on, even when playback was lagging (dropping frames): pixel-
+# verified on a counter clip, and convergence-verified while dropping over a slow
+# link. The owned clock; one engine.
+node test/paused-frame-test.mjs || status=1
 node test/decoder-failure-test.mjs || status=1
 # known-bad-codec spoofs navigator.vendor to exercise the WebKit routing path from
 # Chromium (the decision is codec-string-based, so no real HEVC decode is needed).

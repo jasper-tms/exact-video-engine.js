@@ -115,6 +115,16 @@ export class NativeVideoEngine extends EventTarget {
 
   get displayElement() { return this.video; }
   get paused() { return this.video.paused; }
+  // Parity with VideoEngine.rebuffering, so a host can bind one buffering
+  // spinner to either tier. The <video> element owns its own clock here, so this
+  // only OBSERVES that it wants to play but has stalled for data — it is not a
+  // clock this engine holds, and there is no rebufferSeconds to tune (the
+  // browser decides when it has buffered enough). HAVE_FUTURE_DATA is the
+  // readyState below which the element cannot advance to the next frame.
+  get rebuffering() {
+    return !this.video.paused && !this.video.ended
+      && this.video.readyState < this.video.HAVE_FUTURE_DATA;
+  }
   play() { const p = this.video.play(); if (p) p.catch(() => {}); }
   pause() { this.video.pause(); }
   get playbackRate() { return this.video.playbackRate; }

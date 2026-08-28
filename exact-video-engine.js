@@ -5017,6 +5017,28 @@ const MIN_BLOCK = 1 << 18;   // 256 KB
 // How long a paused playhead must sit still before the viewer counts as having
 // LANDED somewhere rather than scrubbing through it (see update).
 const SETTLE_MILLISECONDS = 500;
+// Rebuffering. While playing, if the frame under the playhead is not decoded
+// yet, the owned clock HOLDS on the last frame rather than running on and
+// leaving that frame (and every frame until it catches up) undrawn — the
+// buffering pause an online player shows, in place of silent frame-dropping.
+// The hold releases once REBUFFER_SECONDS worth of frames ahead of the playhead
+// are decoded (options.rebufferSeconds; 0 disables the hold and restores the
+// old run-the-clock-and-drop behaviour). A hold helps only while WAITING closes
+// the gap: a network backlog drains at link speed whether the clock runs or
+// not, but a machine that simply cannot decode this clip in real time would
+// hold, spurt, drain, and hold again forever — slow motion, not smooth. So a
+// decode-bound hold that recurs DECODE_STALL_LIMIT times without a full
+// recovery in between concedes the point: the clock is let run and frames are
+// dropped (realtime, the browser's own decode-behind behaviour) until decode
+// has kept up for DECODE_RECOVERY_SECONDS. Counting a STREAK of un-recovered
+// stalls rather than stalls-per-time-window matters because a badly outmatched
+// decoder produces long holds — three two-second freezes are not "rapid", but
+// they are exactly what the fallback exists to end. A network-bound stall
+// always holds — dropping frames with no bytes in hand just races the clock
+// past a frozen picture.
+const DEFAULT_REBUFFER_SECONDS = 0.3;
+const DECODE_STALL_LIMIT = 3;
+const DECODE_RECOVERY_SECONDS = 3;   // seconds
 
 // ==================================================================
 // VideoEngine — WebCodecs. Authoritative: we decide which frame is on screen.
@@ -5039,6 +5061,16 @@ class VideoEngine extends EventTarget {
   // options.cacheBytes: the memory ceiling for decoded frames (default 96 MB).
   // This, not the windows, is what bounds the engine's memory — each window is
   // cut to fit it, so a 4K clip caches few frames and a 360p clip caches many.
+  //
+  // options.rebufferSeconds: how far ahead the decode must reach before playback
+  // resumes from a buffering hold (default 0.3 s of decoded frames ahead of the
+  // playhead). When the frame under the playhead is not yet decoded, the clock
+  // holds on the last frame and waits — the buffering pause of an ordinary
+  // online player — instead of running on and dropping frames. 0 turns the hold
+  // off, restoring the older behaviour where the clock never waits for the
+  // decoder. See the DEFAULT_REBUFFER_SECONDS block for how a decode-bound hold
+  // that keeps recurring falls back to frame-dropping so a slow machine plays at
+  // real time rather than in lurching slow motion.
   //
   // options.imageSmoothingEnabled: true by default, matching every prior
   // release — the presentation canvas is sized to the pane in device pixels
@@ -5171,6 +5203,12 @@ class VideoEngine extends EventTarget {
     // Set while the playhead sits on the last indexed frame of an index that is
     // still growing. Playback is not over and not paused — it is waiting.
     this._waitingForIndex = false;
+    // Rebuffering state (see the DEFAULT_REBUFFER_SECONDS block and update).
+    this._rebufferSeconds = Math.max(0, options.rebufferSeconds ?? DEFAULT_REBUFFER_SECONDS);
+    this._rebuffering = false;          // clock held, waiting for the buffer to refill
+    this._droppingFrames = false;       // decode can't keep up: run the clock, drop frames
+    this._decodeStallStreak = 0;        // consecutive decode-bound stalls, un-recovered
+    this._lastDecodeShortfall = 0;      // performance.now() decode was last behind (recovery)
     // Listeners on the index, kept so _teardown can drop them: an index outlives
     // the engine that adopted it (createBestEngine may hand the same one to a
     // second engine after a WebCodecs load fails).
@@ -5207,6 +5245,16 @@ class VideoEngine extends EventTarget {
   // True while playback is pinned at the last indexed frame waiting for the
   // index to catch up — a stall on the indexer, not on the decoder.
   get waitingForIndex() { return this._waitingForIndex; }
+
+  // True while playing but holding the clock on the last frame, waiting for the
+  // decoder to catch up — the cue for a buffering spinner. Distinct from
+  // `paused` (the host stopped playback) and `waitingForIndex` (pinned on the
+  // last indexed frame while the index grows): here `playing` stays true, the
+  // last frame stays on screen, and playback resumes on its own once
+  // rebufferSeconds of frames ahead are decoded. Never true when the drop-frames
+  // fallback has taken over (a decoder that can't keep up plays on, dropping
+  // frames, rather than holding).
+  get rebuffering() { return this._rebuffering; }
 
   // The clip's total length in seconds as the CONTAINER DECLARES IT, where it
   // declares one (Matroska's Info/Duration), and 0 where it does not. This is
@@ -6049,6 +6097,124 @@ class VideoEngine extends EventTarget {
   // pixels should check `frameIndexIsExact` or `tier` first.
   bitmapForFrame(frameIndex) { return this._cache.get(frameIndex); }
 
+  // ---- rebuffering ---------------------------------------------------------
+  // A display frame is "buffered" once it is decoded — resident in the cache, or
+  // emitted and still becoming an ImageBitmap (_pending): either way it will
+  // paint within a tick or two, so both count toward the lookahead the clock
+  // waits for.
+  _buffered(frame) { return this._cache.has(frame) || this._pending.has(frame); }
+
+  // Seconds of contiguously-COVERED frames at and ahead of `frame`, where a
+  // frame counts as covered if it can be shown without waiting on the network —
+  // already decoded, OR its encoded bytes are resident and only need decoding.
+  // (Both halves are needed: a frame just played has been decoded but its bytes
+  // are long since freed, while a frame further ahead has bytes but is not
+  // decoded yet — a bytes-only test would stop at the first already-played frame
+  // and read zero.) This is the buffer that refills during a stall and the one a
+  // normal player's buffer bar shows; the DECODED-frame cache alone cannot serve
+  // here, because the bytes-not-frames memory ceiling keeps it to a handful of
+  // frames on an HD clip (well under any reasonable rebufferSeconds), so gating
+  // resume on decoded lookahead would hold such a clip for ever. Decode keeping
+  // pace is a separate concern, answered by the drop-frames fallback.
+  //
+  // Infinity when the run reaches the last frame this engine can currently name
+  // (the loop region's end, or the last indexed frame): there is no more to
+  // download, so a short tail — or the growing edge of an index still being
+  // built — must not hold the clock for ever. Reaching the growing edge resumes
+  // the clock into the accumulation step's own `_waitingForIndex` wait, the
+  // right instrument for a stall on the indexer rather than on bytes or decode.
+  // The scan stops the moment it clears rebufferSeconds, so it never walks the
+  // whole clip.
+  _downloadedAheadSeconds(frame) {
+    if (!this._index) return 0;
+    const times = this._index.presentationTimes;
+    const lastPlayable = this._loopEndFrame != null
+      ? Math.min(this._loopEndFrame, this.numFrames - 1)
+      : this.numFrames - 1;
+    let m = frame;
+    while (m <= lastPlayable) {
+      const s = this._samples[this._displayToDecode[m]];
+      const covered = this._buffered(m) || (s && this._bufferHolding(s.offset, s.size));
+      if (!covered) break;
+      const ahead = times[m] - times[frame];
+      if (m > frame && ahead >= this._rebufferSeconds) return ahead;
+      m++;
+    }
+    if (m > lastPlayable) return Infinity;
+    return m > frame ? times[m - 1] - times[frame] : 0;
+  }
+
+  // Decide, at the top of a playing tick, whether the clock must HOLD this tick
+  // rather than advance. Called before the playhead is advanced, so `frame` is
+  // where playback currently sits. Sets this._rebuffering and returns it.
+  //
+  // Entering a hold takes a single undecoded frame under the playhead; LEAVING
+  // one takes rebufferSeconds of decoded frames ahead of it. That hysteresis is
+  // the point: resuming the instant the current frame alone decodes would
+  // re-stall on the very next frame, so a hold refills a cushion before it lets
+  // go — the way a buffering player waits past the first frame it recovers.
+  _rebufferHold(now) {
+    if (this._rebufferSeconds <= 0 || !this._index) { this._rebuffering = false; return false; }
+    const frame = this.frameAtTime(this.playhead);
+    // A void position (a leading empty edit) has no frame to wait on, and a
+    // frame the decode circuit-breaker gave up on will never arrive — never
+    // freeze on either.
+    const unwaitable = this._inVoid || frame === this._stalledFrame;
+    const buffered = this._buffered(frame);
+    // Decode is behind (as opposed to the network) when the current frame is not
+    // decoded but its ENCODED bytes are already resident: waiting on the network
+    // would not be what unblocks it. Classified every tick, so the recovery
+    // timer below measures real elapsed time since decode last fell short —
+    // including the ticks spent holding.
+    let decodeBehind = false;
+    if (!unwaitable && !buffered) {
+      const sample = this._samples[this._displayToDecode[frame]];
+      decodeBehind = !!(sample && this._bufferHolding(sample.offset, sample.size));
+    }
+    if (decodeBehind) this._lastDecodeShortfall = now;
+    // Decode has kept up for a full recovery interval: retire the drop-frames
+    // fallback and clear the streak, so a later transient stall buffers cleanly
+    // again. (The streak also clears when no fallback is active, so isolated
+    // stalls spread across a session never accumulate into one.)
+    else if (now - this._lastDecodeShortfall >= DECODE_RECOVERY_SECONDS * 1000) {
+      this._droppingFrames = false;
+      this._decodeStallStreak = 0;
+    }
+
+    if (this._rebuffering) {
+      // Mid-hold: resume once the current frame is decoded (something to show)
+      // AND the download has refilled to rebufferSeconds ahead of it (a cushion,
+      // so we do not re-stall on the very next frame). A decode-bound hold has
+      // its bytes already resident, so this reduces to "resume when the frame
+      // decodes" — the drop-frames fallback, not a longer hold, is what answers
+      // a decoder that cannot keep up.
+      const resume = unwaitable
+        || (buffered && this._downloadedAheadSeconds(frame) >= this._rebufferSeconds);
+      if (resume) {
+        this._rebuffering = false;
+        return false;
+      }
+      return true;
+    }
+
+    // Not holding, and not stalled: advance.
+    if (unwaitable || buffered) return false;
+
+    // A fresh stall.
+    if (decodeBehind && !this._droppingFrames) {
+      // Count consecutive decode stalls not separated by a recovery; enough of
+      // them means decode simply cannot keep up here.
+      if (++this._decodeStallStreak >= DECODE_STALL_LIMIT) this._droppingFrames = true;
+    }
+    // In the fallback: let the clock run and drop frames rather than lurch. The
+    // present step below holds the last frame until a newer one decodes. Only a
+    // decode-bound stall drops — a network-bound one always holds, since
+    // dropping frames with no bytes in hand just races the clock past a freeze.
+    if (decodeBehind && this._droppingFrames) return false;
+    this._rebuffering = true;
+    return true;
+  }
+
   // ---- per-tick clock + presentation --------------------------------------
   // Called once per render tick with the rAF timestamp. Advances the owned
   // playhead, drives decoding of the surrounding window, and paints the frame.
@@ -6068,7 +6234,13 @@ class VideoEngine extends EventTarget {
       this._playheadMovedAt = now;
     }
     if (this.playing) {
-      if (this._lastNow) {
+      // Hold the clock on the last frame instead of advancing into a frame that
+      // is not decoded yet: playback buffers, the way an online player does,
+      // rather than running the clock on and dropping every frame until decode
+      // catches up (see _rebufferHold). _lastNow is still stamped below whether
+      // we hold or not, so releasing the hold resumes without a time jump.
+      const holdForBuffer = this._rebufferHold(now);
+      if (this._lastNow && !holdForBuffer) {
         const previousPlayhead = this.playhead;
         this.playhead += (now - this._lastNow) / 1000 * this._playbackRate;
         // A loop region wraps early — but only for a playhead that reached its
@@ -6103,6 +6275,7 @@ class VideoEngine extends EventTarget {
       this._lastNow = now;
     } else {
       this._lastNow = 0;
+      this._rebuffering = false;
     }
 
     const frame = this.frameAtTime(this.playhead);
@@ -6232,6 +6405,12 @@ class VideoEngine extends EventTarget {
     this.playing = false;
     this.failed = false;
     this._waitingForIndex = false;
+    // Rebuffering conclusions are per-clip: a new load may be a different
+    // resolution/codec the machine decodes at a different rate.
+    this._rebuffering = false;
+    this._droppingFrames = false;
+    this._decodeStallStreak = 0;
+    this._lastDecodeShortfall = 0;
     // Stop listening to the index before letting go of it: the same index can be
     // handed on to another engine (createBestEngine falls back to the <video>
     // element after a WebCodecs load failure), and a torn-down engine must not
@@ -6399,6 +6578,16 @@ class NativeVideoEngine extends EventTarget {
 
   get displayElement() { return this.video; }
   get paused() { return this.video.paused; }
+  // Parity with VideoEngine.rebuffering, so a host can bind one buffering
+  // spinner to either tier. The <video> element owns its own clock here, so this
+  // only OBSERVES that it wants to play but has stalled for data — it is not a
+  // clock this engine holds, and there is no rebufferSeconds to tune (the
+  // browser decides when it has buffered enough). HAVE_FUTURE_DATA is the
+  // readyState below which the element cannot advance to the next frame.
+  get rebuffering() {
+    return !this.video.paused && !this.video.ended
+      && this.video.readyState < this.video.HAVE_FUTURE_DATA;
+  }
   play() { const p = this.video.play(); if (p) p.catch(() => {}); }
   pause() { this.video.pause(); }
   get playbackRate() { return this.video.playbackRate; }
@@ -7093,6 +7282,11 @@ async function createBestEngine(source, options = {}) {
     // control (the browser resamples its own decoded frames, not us), so this
     // is a no-op on that tier. See the VideoEngine constructor.
     imageSmoothingEnabled,
+    // Passed through to VideoEngine: how far ahead the decode must reach before
+    // playback resumes from a buffering hold (seconds; 0 disables the hold). The
+    // <video> element buffers on its own clock, so this is a no-op on that tier.
+    // See the VideoEngine constructor.
+    rebufferSeconds,
     // How long the WebM index is allowed to take. Building it means reading the
     // whole file (Matroska keeps no central sample table), which is quick from
     // disk and as slow as the network from a URL — so it gets a deadline. A clip
@@ -7248,7 +7442,7 @@ async function createBestEngine(source, options = {}) {
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
     webCodecsWasTried = true;
     const engine = new VideoEngine(canvas,
-      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled });
+      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled, rebufferSeconds });
     try {
       await engine.load(source, { index });
       return engine;

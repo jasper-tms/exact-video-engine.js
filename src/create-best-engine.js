@@ -38,6 +38,11 @@ export async function createBestEngine(source, options = {}) {
     // control (the browser resamples its own decoded frames, not us), so this
     // is a no-op on that tier. See the VideoEngine constructor.
     imageSmoothingEnabled,
+    // Passed through to VideoEngine: how far ahead the decode must reach before
+    // playback resumes from a buffering hold (seconds; 0 disables the hold). The
+    // <video> element buffers on its own clock, so this is a no-op on that tier.
+    // See the VideoEngine constructor.
+    rebufferSeconds,
     // How long the WebM index is allowed to take. Building it means reading the
     // whole file (Matroska keeps no central sample table), which is quick from
     // disk and as slow as the network from a URL — so it gets a deadline. A clip
@@ -193,7 +198,7 @@ export async function createBestEngine(source, options = {}) {
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
     webCodecsWasTried = true;
     const engine = new VideoEngine(canvas,
-      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled });
+      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled, rebufferSeconds });
     try {
       await engine.load(source, { index });
       return engine;
