@@ -80,6 +80,20 @@ done
 ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
     -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 0 -g 10 -sc_threshold 0 clips/counter-cfr.mp4
 
+# The same 30 counter frames as ONE group of pictures: a single keyframe at
+# frame 0 and B-frames throughout (-g 1000 -keyint_min 1000 so no second keyframe
+# fits in 30 frames; -bf 3 for the pyramid B-frame layout a phone/export encoder
+# emits). This is the shape loop-decode-test.mjs needs: a clip whose every frame
+# depends on the keyframe, so a frame evicted from the cache can only be redecoded
+# by restarting the run from frame 0. Combined with looping, that used to trip the
+# decode circuit-breaker on whichever frame was cold at each wrap. -sc_threshold 0
+# keeps x264 from inserting a scene-change keyframe when the counter's digits
+# change shape. Real videopose exports and many short phone clips look exactly
+# like this (see the Ma_Long example clip that surfaced the bug).
+ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
+    -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 3 -g 1000 \
+    -keyint_min 1000 -sc_threshold 0 clips/counter-single-gop.mp4
+
 # settb pins the timebase to milliseconds so the setpts expression below is in
 # whole ms and needs no rounding; without it the encoder re-times against the
 # source's 1/15360 timebase and the intended gaps come out wrong.

@@ -6,6 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
+        || [ ! -f test/clips/counter-single-gop.mp4 ] \
         || [ ! -f test/clips/counter-vfr.webm ] || [ ! -f test/clips/startup.mp4 ] \
         || [ ! -f test/clips/midsize.mp4 ] || [ ! -f test/clips/hd.mp4 ] \
         || [ ! -f test/clips/counter-trimming-elst.mp4 ] \
@@ -104,6 +105,14 @@ node test/rebuffer-test.mjs || status=1
 # verified on a counter clip, and convergence-verified while dropping over a slow
 # link. The owned clock; one engine.
 node test/paused-frame-test.mjs || status=1
+# loop-decode pins that a looped SINGLE-GOP clip (one keyframe, every frame
+# decoded from frame 0) plays every loop without the decode circuit-breaker
+# giving up on a frame, in both cache regimes: a clip that fits the budget stays
+# resident across the wrap (no re-decode after loop 1), and one that exceeds it
+# takes its inherent one-restart-per-wrap without a false stall, with the loop
+# origin's bytes prefetched. Engine bookkeeping (eviction, the circuit-breaker,
+# byte prefetch); one engine covers it.
+node test/loop-decode-test.mjs || status=1
 node test/decoder-failure-test.mjs || status=1
 # known-bad-codec spoofs navigator.vendor to exercise the WebKit routing path from
 # Chromium (the decision is codec-string-based, so no real HEVC decode is needed).

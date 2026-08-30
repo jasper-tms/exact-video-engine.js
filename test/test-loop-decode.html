@@ -1,0 +1,157 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine loop-decode test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<style>
+  body { font: 12px/1.4 ui-monospace, Menlo, monospace; background:#12141a; color:#e8eaf0; margin:12px; }
+  #pane { width: 150px; height: 90px; background:#000; }
+  #pane canvas { width:100%; height:100%; display:block; }
+  pre { white-space: pre-wrap; }
+</style>
+<div id="pane"><canvas></canvas></div>
+<pre id="report">loading…</pre>
+<script>
+// Drives the decode circuit-breaker / loop-eviction / loop-origin-prefetch
+// behaviour on a SINGLE-GOP looping clip (counter-single-gop.mp4: one keyframe,
+// so every frame can only be produced by decoding forward from frame 0).
+//
+// The bug this guards: on a looped single-GOP clip the frame cold at each wrap
+// -- the loop origin when the clip is larger than the read-ahead window/budget,
+// or the tail past the window's forward edge when the clip fits -- needs one
+// decode-run restart from the keyframe every loop. Those restarts SUCCEED, but
+// the circuit-breaker counted them across loops and, after three, gave up on a
+// perfectly decodable frame ("VideoEngine: cannot decode frame N; holding") and
+// skipped it forever. Two regimes, selected by the window/budget the driver
+// hands us:
+//   * FITS: the whole clip fits the budget. It must stay resident across the
+//     wrap (loop-aware keep window), so after the first loop NOTHING re-decodes.
+//   * EXCEEDS: the clip is larger than the budget. One restart per wrap is then
+//     inherent, but it must not be miscounted as a failure, and the loop origin's
+//     bytes are prefetched so the wrap does not block on a read from frame 0.
+//
+// Query parameters (all optional):
+//   file=counter-single-gop.mp4
+//   playSeconds=12   rate=3   windowAhead=  windowBack=  cacheBytes=
+//   loopStart=  loopEnd=      (else the whole clip loops)
+//   latencyMilliseconds=  bytesPerSecond=   (serve.py link shaping)
+const params = new URLSearchParams(location.search);
+const CLIP = params.get('file') || 'counter-single-gop.mp4';
+const PLAY_SECONDS = Number(params.get('playSeconds') || 12);
+const RATE = Number(params.get('rate') || 3);
+
+const BARS_ACROSS = 30;   // the counter draws one 5px bar per frame across 150px
+function visibleFrame(canvas) {
+  const width = canvas.width, height = canvas.height;
+  const row = canvas.getContext('2d')
+    .getImageData(0, Math.floor(height * 3 / 4), width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < width; x++) if (row[x * 4] > 128) { sum += x; count += 1; }
+  if (!count) return -1;
+  return Math.floor((sum / count) / (width / BARS_ACROSS));
+}
+
+function clipUrl() {
+  const url = new URL('clips/' + CLIP, location.href);
+  for (const name of ['latencyMilliseconds', 'bytesPerSecond']) {
+    if (params.get(name)) url.searchParams.set(name, params.get(name));
+  }
+  return url.href;
+}
+
+const raf = () => new Promise((r) => setTimeout(r, 8));
+
+async function run() {
+  const canvas = document.querySelector('canvas');
+  const opts = { canvas, prefer: 'webcodecs', imageSmoothingEnabled: false };
+  for (const name of ['windowAhead', 'windowBack', 'cacheBytes']) {
+    if (params.get(name) != null) opts[name] = Number(params.get(name));
+  }
+  const engine = await createBestEngine(clipUrl(), opts);
+  if (engine.tier !== 'webcodecs') throw new Error('ran on tier ' + engine.tier);
+
+  // ---- instrumentation ----
+  let wraps = 0, emits = 0, emitsAfterFirstWrap = 0, prefetchArmed = 0;
+  let warnings = [];
+  const origWarn = console.warn.bind(console);
+  console.warn = function (...a) {
+    const m = a.join(' ');
+    if (/cannot decode frame/.test(m)) warnings.push(m);
+    origWarn(...a);
+  };
+  const origAbsorb = engine._absorb.bind(engine);
+  engine._absorb = function (frame) {
+    emits += 1;
+    if (wraps > 0) emitsAfterFirstWrap += 1;
+    return origAbsorb(frame);
+  };
+  const origWrap = engine._wrapToLoopOrigin.bind(engine);
+  engine._wrapToLoopOrigin = function (t) { wraps += 1; return origWrap(t); };
+  // Defensive so this page also runs against a build without the fix (it then
+  // has no _prefetchLoopOrigin, and must still exercise the stall it guards).
+  let lastArmed = null;
+  if (typeof engine._prefetchLoopOrigin === 'function') {
+    const origPrefetch = engine._prefetchLoopOrigin.bind(engine);
+    engine._prefetchLoopOrigin = function () {
+      origPrefetch();
+      if (engine._loopOriginPrefetch && engine._loopOriginPrefetch !== lastArmed) {
+        prefetchArmed += 1; lastArmed = engine._loopOriginPrefetch;
+      }
+    };
+  }
+
+  // ---- drive like the viewer ----
+  engine.loop = true;
+  engine.playbackRate = RATE;
+  if (params.get('loopStart') != null) engine.loopStartFrame = Number(params.get('loopStart'));
+  if (params.get('loopEnd') != null) engine.loopEndFrame = Number(params.get('loopEnd'));
+  const loopStart = engine.loopStartFrame == null ? 0 : engine.loopStartFrame;
+  const loopEnd = engine.loopEndFrame == null ? engine.numFrames - 1 : engine.loopEndFrame;
+
+  engine.seekToFrame(loopStart);
+  await engine.ensureFrame(loopStart);
+
+  let presented = 0, lastShown = -1;
+  const started = performance.now();
+  engine.play();
+  while (performance.now() - started < PLAY_SECONDS * 1000) {
+    engine.update(performance.now());
+    if (engine._shownFrame !== lastShown && engine._shownFrame >= 0) {
+      presented += 1; lastShown = engine._shownFrame;
+    }
+    await raf();
+  }
+  engine.pause();
+
+  // ---- exactness: every frame the wrap used to strand must decode to the RIGHT
+  // pixels. Check the whole loop region, paused, straight from the engine. Only
+  // the counter clips carry a readable bar; skip it (checkPixels=0) for others.
+  const mismatches = [];
+  if (params.get('checkPixels') !== '0') {
+    for (let f = loopStart; f <= loopEnd; f++) {
+      engine.seekToFrame(f);
+      await engine.ensureFrame(f);
+      engine.update(performance.now());
+      const visible = visibleFrame(canvas);
+      if (visible !== f) mismatches.push({ frame: f, visible });
+    }
+  }
+
+  return {
+    clip: CLIP, tier: engine.tier, numFrames: engine.numFrames,
+    windowBack: engine._windowBack, windowAhead: engine._windowAhead,
+    windowSlack: engine._windowSlack, cacheBudget: engine._cacheBudget,
+    loopStart, loopEnd, regionSpan: loopEnd - loopStart + 1,
+    wraps, emits, emitsAfterFirstWrap, prefetchArmed, presented,
+    warnings, warningCount: warnings.length, mismatches,
+  };
+}
+
+run().then((result) => {
+  window.__result = result;
+  document.getElementById('report').textContent = JSON.stringify(result, null, 1);
+}).catch((e) => {
+  window.__err = String((e && e.stack) || e);
+  document.getElementById('report').textContent = 'error: ' + window.__err;
+});
+</script>

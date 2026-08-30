@@ -5017,6 +5017,12 @@ const MIN_BLOCK = 1 << 18;   // 256 KB
 // How long a paused playhead must sit still before the viewer counts as having
 // LANDED somewhere rather than scrubbing through it (see update).
 const SETTLE_MILLISECONDS = 500;
+// How far ahead of a loop wrap (in composition-time seconds) to begin warming
+// the loop origin's encoded bytes, so the read from the start of the file that
+// the wrap triggers is already in hand. Enough to cover a round trip to a
+// distant bucket, short enough not to fetch on a clip that merely has looping
+// enabled but is nowhere near wrapping.
+const LOOP_PREFETCH_LEAD_SECONDS = 0.75;
 // Rebuffering. While playing, if the frame under the playhead is not decoded
 // yet, the owned clock HOLDS on the last frame rather than running on and
 // leaving that frame (and every frame until it catches up) undrawn — the
@@ -5189,6 +5195,10 @@ class VideoEngine extends EventTarget {
     // cannot absorb, so the extra 4 MB is spent only on links that showed the
     // need.
     this._prefetchDepth = 1;
+    // A background read of the loop origin's bytes, armed as a wrap approaches
+    // and adopted by _ensureBytes at the wrap: { start, end, originFrame, done,
+    // bytes, promise }. See _prefetchLoopOrigin.
+    this._loopOriginPrefetch = null;
     // True until the first urgent read after the playhead was MOVED (a seek, a
     // loop wrap, load) rather than advanced by the clock; see _drive and update.
     this._landing = true;
@@ -5682,11 +5692,30 @@ class VideoEngine extends EventTarget {
   // the current GOP that a backward scrub would re-decode from an earlier
   // keyframe regardless.
   _keepRanges() {
-    return this._windowCenters().map((center) => {
+    const ranges = this._windowCenters().map((center) => {
       const back = Math.min(center - this._windowBack,
         this._keyframeDisplayFor(Math.max(0, center)));
       return [back, center + this._windowAhead + this._windowSlack];
     });
+    // When looping, keep the WHOLE loop region resident if it fits the budget:
+    // the playhead replays every frame in it on the next wrap, so dropping the
+    // part beyond the read-ahead window's forward edge — for a single-GOP clip,
+    // most of the clip — only forces a re-decode from the keyframe every loop.
+    // This is a superset of the normal window, so it never keeps FEWER frames;
+    // gated on fitting the budget, so it never lifts the memory ceiling (the
+    // budget pass in _evict still enforces it if a seek out of the region pushes
+    // the resident set over). When the region does not fit, this adds nothing and
+    // the ordinary window plus the budget pass govern, as before.
+    if (this.loop && this.numFrames > 0) {
+      const loopStart = this._loopStartFrame != null
+        ? Math.min(this._loopStartFrame, this.numFrames - 1) : 0;
+      const loopEnd = this._loopEndFrame != null
+        ? Math.min(this._loopEndFrame, this.numFrames - 1) : this.numFrames - 1;
+      if (loopEnd >= loopStart && (loopEnd - loopStart + 1) <= this._cacheBudget) {
+        ranges.push([loopStart, loopEnd]);
+      }
+    }
+    return ranges;
   }
 
   _insideKeepWindow(displayIndex, ranges = this._keepRanges()) {
@@ -5804,6 +5833,22 @@ class VideoEngine extends EventTarget {
         // Decoded, or decoded and still becoming an ImageBitmap. Either way it is
         // coming, and re-decoding it would be wasted work.
         const haveTarget = this._cache.has(target) || this._pending.has(target);
+
+        // The frame the circuit-breaker was counting restarts against has
+        // surfaced, so those restarts SUCCEEDED: clear the breaker. Its job is to
+        // give up on a frame that restarts over and over WITHOUT ever appearing
+        // (a corrupt sample, an impossible target) — not on one that needs a
+        // legitimate restart each time it comes around. A looped clip does
+        // exactly that: every wrap, the frame cold at the loop origin (for a clip
+        // larger than the cache) or the tail past the read-ahead window (for one
+        // that fits) needs one restart from the keyframe. Without this reset those
+        // successful restarts accumulate ACROSS loops — the counter only cleared
+        // when the target changed — until the breaker passed its limit and
+        // wrongly stranded a perfectly decodable frame (see the restart branch).
+        if (haveTarget && target === this._restartTarget) {
+          this._restartTarget = -1;
+          this._restartCount = 0;
+        }
 
         // Hard restart when the target lives in a different GOP than the current
         // run. Backward seeks within the same GOP are handled below.
@@ -5988,6 +6033,22 @@ class VideoEngine extends EventTarget {
         this._byteBuffer = bytes;
         this._byteBufferStart = next.start;
       }
+      // A wrap's read from the loop origin: adopt the background prefetch that
+      // warmed it (see _prefetchLoopOrigin) instead of blocking on a fresh read.
+      if (!this._bufferHolding(offset, size) && this._loopOriginPrefetch
+          && offset >= this._loopOriginPrefetch.start
+          && offset + size <= this._loopOriginPrefetch.end + 1) {
+        const origin = this._loopOriginPrefetch;
+        const bytes = origin.done ? origin.bytes : await origin.promise;
+        if (this._loopOriginPrefetch === origin) {   // not reset under the await
+          this._loopOriginPrefetch = null;
+          if (bytes) {
+            this._previousByteBuffer = null;
+            this._byteBuffer = bytes;
+            this._byteBufferStart = origin.start;
+          }
+        }
+      }
       if (!this._bufferHolding(offset, size)) {
         // Anything still queued is for somewhere the playhead no longer is.
         this._prefetches = [];
@@ -6033,6 +6094,42 @@ class VideoEngine extends EventTarget {
             () => { record.done = true; return null; });
     this._prefetches.push(record);
   }
+
+  // Warm the loop origin's encoded bytes as a wrap approaches. The origin sits at
+  // the start of the file, behind the tail the driver is streaming, so the read
+  // the wrap triggers — the decode run restarts from the origin's keyframe — is a
+  // blocking round trip, seconds of frozen picture on a distant bucket. Fetch it
+  // in the background instead, into a side buffer _ensureBytes adopts at the wrap.
+  //
+  // A no-op when the origin frame is already decoded: a clip small enough to stay
+  // cached across the wrap (see _keepRanges) needs no byte read there, so this
+  // spends bytes only for a clip too large to keep resident — the case that
+  // stalls. Never rejects; a failed read resolves to null and the wrap reads
+  // directly, exactly as it does today.
+  _prefetchLoopOrigin() {
+    if (!this.loop || !this._reader || !this._index || !this._samples
+        || !this._displayToDecode) return;
+    const originFrame = this._loopStartFrame != null
+      ? Math.min(this._loopStartFrame, this.numFrames - 1) : 0;
+    // The wrap will show this frame from the cache — no byte read to warm.
+    if (this._cache.has(originFrame)) return;
+    const decodeIndex = this._displayToDecode[originFrame];
+    if (decodeIndex === undefined) return;
+    const sample = this._samples[this._keyframeForDecode(decodeIndex)];
+    if (!sample) return;
+    // Already in the read-ahead buffer, or already armed for this origin.
+    if (this._bufferHolding(sample.offset, sample.size)) return;
+    if (this._loopOriginPrefetch
+        && this._loopOriginPrefetch.originFrame === originFrame) return;
+    const start = sample.offset;
+    const end = Math.min(this._reader.size, start + MAX_BLOCK) - 1;
+    const record = { start, end, originFrame, done: false, bytes: null, promise: null };
+    record.promise = this._reader.read(start, end).then(
+      (bytes) => { record.done = true; record.bytes = new Uint8Array(bytes); return record.bytes; },
+      () => { record.done = true; return null; });
+    this._loopOriginPrefetch = record;
+  }
+
   // Are the bytes [offset, offset+size) resident — in the current block, in the
   // previous one, or (when the two are contiguous) spanning both?
   _bufferHolding(offset, size) {
@@ -6294,6 +6391,14 @@ class VideoEngine extends EventTarget {
         && now - this._playheadMovedAt >= SETTLE_MILLISECONDS) {
       this._prefetchNextBlock(1);
     }
+    // Approaching a loop wrap while playing: warm the origin's bytes so the wrap
+    // does not stall on a read from the start of the file (_prefetchLoopOrigin).
+    if (this.playing && this.loop) {
+      const untilWrap = this._loopWrapTime - this.playhead;
+      if (untilWrap > 0 && untilWrap <= LOOP_PREFETCH_LEAD_SECONDS) {
+        this._prefetchLoopOrigin();
+      }
+    }
     if (this._inVoid) {
       // No frame at this time — show an empty image, not frame 0 held. Frame 0's
       // window is still warmed above, so leaving the void paints instantly.
@@ -6444,6 +6549,7 @@ class VideoEngine extends EventTarget {
     this._previousByteBuffer = null;
     this._previousByteBufferStart = 0;
     this._prefetches = [];
+    this._loopOriginPrefetch = null;
     // _prefetchDepth is kept: it describes the link, not the clip.
     this._landing = true;
     this._playheadAfterTick = -1;
