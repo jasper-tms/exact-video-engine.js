@@ -60,10 +60,13 @@ floored at 256 KB) only while the viewer is *landing* on a frame: the first
 frame of the clip, any paused seek or step, and the first read after a seek
 during playback. Once playback is flowing, an uncached target means the
 decoder has fallen behind the wall clock, and a small read there — one round
-trip per quarter megabyte, with the clock running on through every one — turns
-a slow link into a collapse. So playback reads full blocks, and lands only once
-per move of the playhead (`_landing`, set by `update()` when the playhead is
-not where the last tick left it). `test/stall-test.mjs` pins all of this.
+trip per quarter megabyte — turns a slow link into a collapse. The clock now
+*holds* on that stall rather than running on (see the buffering section below),
+but the full-block read is still what makes the hold effective: a held clock
+refilling a quarter megabyte per round trip would crawl just the same. So
+playback reads full blocks, and lands only once per move of the playhead
+(`_landing`, set by `update()` when the playhead is not where the last tick left
+it). `test/stall-test.mjs` pins all of this.
 
 While paused, no blocks are banked ahead — a viewer stepping or dragging the
 scrubber would have 4 MB fetched past every landing, and the next seek's read
