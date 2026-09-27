@@ -256,6 +256,22 @@ decoded-or-bytes-resident (so a played frame whose bytes are freed is not a gap)
 the decode-stall streak flipping to dropping and a recovery interval retiring it,
 and that a network stall still holds inside the fallback.
 
+## Decoder lag (plain Node)
+
+`decoder-lag-test.mjs` pins that the decode driver waits as long as the decoder
+actually holds a frame back. The driver stops feeding a bounded number of samples
+past its target and concludes the frame was evicted; that bound used to be a fixed
+16, and a level 5.1 H.264 stream that declares no `max_num_reorder_frames` (a
+macOS screen recording at 2606x1172) made Chrome's hardware decoder lag by up to
+18 — so ordinary frames tripped the restart circuit-breaker and playback updated
+once per keyframe. The bound is now the stream's declared reorder depth plus
+pipeline slack, floored at 16. How far a decoder lags is the decoder's choice, and
+a test browser's software decoder may not lag at all, so a browser case would pass
+with the bug in place; this one drives the real driver against a stub decoder with
+an 18-sample lag instead. It also runs a control with the bound forced back to 16
+and asserts a frame is stranded, so a stub that stopped reproducing the lag would
+fail rather than pass vacuously.
+
 ## Paused frame
 
 The invariant the whole engine exists to hold: when playback PAUSES, the image

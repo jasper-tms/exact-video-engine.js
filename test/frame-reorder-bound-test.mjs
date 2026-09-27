@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { ContainerIndex } from '../src/container-index.js';
 import {
-  declaredFrameReorderDepth, removeEmulationPrevention,
+  declaredFrameReorderDepth, decoderConfigFrameReorderDepth, removeEmulationPrevention,
 } from '../src/frame-reorder-bound.js';
 import {
   buildAvcC, buildH264SequenceParameterSet, buildHevcRecord,
@@ -114,12 +114,44 @@ checkEqual('H.264 level ceiling is capped at sixteen frames',
     writeVideoUsability: false,
   }))), 16);
 
+// The shape of a macOS screen recording: level 5.1, 2606x1172 (163 x 74
+// macroblocks), no bitstream restrictions. 184320 / 12062 is fifteen frames — a
+// depth decoders really do hold back for, past the playback driver's old fixed
+// bound of 16 once their own pipeline is added (see video-engine.js).
+checkEqual('H.264 level 5.1 screen recording falls back to fifteen frames',
+  declaredFrameReorderDepth('avcC', buildAvcC(buildH264SequenceParameterSet({
+    levelIdc: 51, widthInMacroblocks: 163, heightInMapUnits: 74,
+    declaredReorderFrames: null,
+  }))), 15);
+
 // constraint_set3_flag on these profiles is the stream saying outright that it
 // does not reorder, which beats the level ceiling.
 checkEqual('H.264 constrained High profile infers no reordering',
   declaredFrameReorderDepth('avcC', buildAvcC(buildH264SequenceParameterSet({
     profileIdc: 100, constraintFlags: 0x10, writeVideoUsability: false,
   }))), 0);
+
+// ------------------------------------------------------------------
+// decoderConfigFrameReorderDepth: the same answer, keyed by a WebCodecs codec
+// string, and whatever buffer type the decoder configuration carries.
+// ------------------------------------------------------------------
+{
+  const avcC = buildAvcC(buildH264SequenceParameterSet({
+    levelIdc: 51, widthInMacroblocks: 163, heightInMapUnits: 74,
+    declaredReorderFrames: null,
+  }));
+  checkEqual('decoder config: avc1 reads the avcC',
+    decoderConfigFrameReorderDepth('avc1.4d0033', avcC), 15);
+  checkEqual('decoder config: an ArrayBuffer description reads the same',
+    decoderConfigFrameReorderDepth('avc1.4d0033', avcC.slice().buffer), 15);
+  checkEqual('decoder config: hvc1 reads the hvcC',
+    decoderConfigFrameReorderDepth('hvc1.1.6.L93.B0',
+      buildHevcRecord({ declaredReorderPictures: 2 })), 2);
+  checkEqual('decoder config: a codec with no declaration has no answer',
+    decoderConfigFrameReorderDepth('vp09.00.10.08', avcC), null);
+  checkEqual('decoder config: no description has no answer',
+    decoderConfigFrameReorderDepth('avc1.4d0033', undefined), null);
+}
 
 // ------------------------------------------------------------------
 // The cases where the honest answer is "no answer".

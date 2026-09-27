@@ -81,6 +81,21 @@ export function declaredFrameReorderDepth(setupRecordKind, setupRecordBytes) {
   return null;
 }
 
+// The same bound, for a WebCodecs decoder configuration: the codec string says
+// which kind of setup record the description is. An `avc3`/`hev1` stream keeps
+// its parameter sets in-band, so its description is usually empty and the
+// answer null.
+export function decoderConfigFrameReorderDepth(codec, description) {
+  if (!codec || !description) return null;
+  const bytes = description instanceof Uint8Array ? description
+    : ArrayBuffer.isView(description)
+      ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+      : new Uint8Array(description);
+  if (/^avc[13]/.test(codec)) return declaredFrameReorderDepth('avcC', bytes);
+  if (/^(hvc1|hev1)/.test(codec)) return declaredFrameReorderDepth('hvcC', bytes);
+  return null;
+}
+
 // ==================================================================
 // H.264
 // ==================================================================

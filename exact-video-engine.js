@@ -1054,6 +1054,21 @@ function declaredFrameReorderDepth(setupRecordKind, setupRecordBytes) {
   return null;
 }
 
+// The same bound, for a WebCodecs decoder configuration: the codec string says
+// which kind of setup record the description is. An `avc3`/`hev1` stream keeps
+// its parameter sets in-band, so its description is usually empty and the
+// answer null.
+function decoderConfigFrameReorderDepth(codec, description) {
+  if (!codec || !description) return null;
+  const bytes = description instanceof Uint8Array ? description
+    : ArrayBuffer.isView(description)
+      ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+      : new Uint8Array(description);
+  if (/^avc[13]/.test(codec)) return declaredFrameReorderDepth('avcC', bytes);
+  if (/^(hvc1|hev1)/.test(codec)) return declaredFrameReorderDepth('hvcC', bytes);
+  return null;
+}
+
 // ==================================================================
 // H.264
 // ==================================================================
@@ -3926,12 +3941,6 @@ function mpeg4VisualTrack(file, info) {
 }
 // ------------------------------------------------------------------
 
-function isobmffReorderDepth(codec, description) {
-  if (/^avc[13]/.test(codec)) return declaredFrameReorderDepth('avcC', description);
-  if (/^(hvc1|hev1)/.test(codec)) return declaredFrameReorderDepth('hvcC', description);
-  return null;
-}
-
 // Codecs with no presentation reordering, by WebCodecs codec string: their
 // frames are stored in the order they are shown. This is a property of the
 // codecs — VP8 has no B-frames at all, and VP9's altref frames are hidden inside
@@ -4332,7 +4341,7 @@ class ContainerIndex extends EventTarget {
   // sample carries its own, so a certified frame is immediately complete.
   _fragmentedPublisher(file, videoTrack, editWindow) {
     const declared = new DeclaredReorderWatermark(
-      isobmffReorderDepth(videoTrack.codec, this.decoderConfig.description));
+      decoderConfigFrameReorderDepth(videoTrack.codec, this.decoderConfig.description));
     const decodeOrderIsDisplayOrder = isobmffCodecHasNoPresentationReordering(videoTrack.codec);
 
     let observedCount = 0;      // samples fed to the watermark
@@ -4999,10 +5008,21 @@ const WINDOW_SLACK = 8;
 const MINIMUM_WINDOW_FRAMES = 4;
 // How far past a frame we keep feeding the decoder before concluding the frame
 // is not going to come out. Decoders hold frames back to settle display order,
-// so a frame we asked for can legitimately lag the samples we fed by a few — but
-// only a few. Past this, it is not in the pipeline: it was decoded earlier and
-// evicted, and it has to be decoded again rather than waited for.
-const REORDER_DEPTH = 16;
+// so a frame we asked for can legitimately lag the samples we fed — past that
+// lag, it is not in the pipeline: it was decoded earlier and evicted, and it has
+// to be decoded again rather than waited for.
+//
+// The lag is the clip's, not a constant. An H.264 stream that declares no
+// max_num_reorder_frames makes the decoder assume its level's whole
+// decoded-picture buffer — 15 frames for a level 5.1 screen recording at
+// 2606x1172 — and Chrome's decoder was measured holding such a clip's frames
+// back by up to 18 samples, past the old fixed bound of 16. Every such frame
+// then tripped the restart circuit-breaker as "undecodable", and playback
+// updated only once per keyframe. So the bound is the stream's declared reorder
+// depth plus DECODER_PIPELINE_SLACK for the decoder's own pipeline, never less
+// than MINIMUM_REORDER_DEPTH.
+const MINIMUM_REORDER_DEPTH = 16;
+const DECODER_PIPELINE_SLACK = 8;
 // Encoded bytes are read in blocks of this size — one fat request beats twenty
 // thin ones — and never in blocks smaller than MIN_BLOCK, since a round trip
 // costs more than those bytes. This is the encoded-byte read-ahead's own budget,
@@ -5128,6 +5148,8 @@ class VideoEngine extends EventTarget {
     this._reader = null;
     this._videoDecoder = null;
     this._decoderConfig = null;
+    this._reorderDepth = MINIMUM_REORDER_DEPTH;   // set per clip in _adoptIndex
+    this._declaredReorderDepth = 0;               // likewise
     // True when the index's samples are an Annex B bitstream (AVI's H.264) that
     // must be converted to length-prefixed AVCC before the decoder — which is
     // configured in AVCC mode — will accept them. False for ISOBMFF, whose
@@ -5504,6 +5526,13 @@ class VideoEngine extends EventTarget {
     this._index = index;
     this._reader = index.reader;
     this._decoderConfig = index.decoderConfig;
+    // See MINIMUM_REORDER_DEPTH. A codec with no readable declaration (VP8,
+    // VP9, AV1, in-band parameter sets) keeps the minimum.
+    const declaredReorderDepth = index.decoderConfig ? decoderConfigFrameReorderDepth(
+      index.decoderConfig.codec, index.decoderConfig.description) : null;
+    this._declaredReorderDepth = declaredReorderDepth ?? 0;
+    this._reorderDepth = Math.max(MINIMUM_REORDER_DEPTH,
+      this._declaredReorderDepth + DECODER_PIPELINE_SLACK);
     this._annexBSamples = !!index.samplesAreAnnexB;
     this._timescale = index.timescale;
     this.rotation = index.rotation;
@@ -5854,9 +5883,17 @@ class VideoEngine extends EventTarget {
         const keyframe = this._keyframeForDecode(targetDecode);
         // Read-ahead goal in decode-index terms: enough to also produce the
         // frames ahead of the target (so playback doesn't stall every frame).
+        // A decoder releases a frame only once the samples that may reorder
+        // ahead of it have gone in, so the read-ahead frames come OUT only if
+        // the stream's declared reorder depth is fed past them. Without that, a
+        // stream declaring a deep reorder (15 for a level 5.1 screen recording)
+        // whose read-ahead the byte budget cut to a few frames never has a frame
+        // out before it is due, and plays in the drop-frames fallback throughout.
         const aheadFrame = Math.min(this.numFrames - 1, target + this._windowAhead);
-        const decodeGoal = Math.max(targetDecode, this._displayToDecode[aheadFrame]);
         const lastSample = this._samples.length - 1;
+        const decodeGoal = Math.min(lastSample,
+          Math.max(targetDecode, this._displayToDecode[aheadFrame])
+          + (this._windowAhead > 0 ? this._declaredReorderDepth : 0));
         // Decoded, or decoded and still becoming an ImageBitmap. Either way it is
         // coming, and re-decoding it would be wasted work.
         const haveTarget = this._cache.has(target) || this._pending.has(target);
@@ -5894,14 +5931,14 @@ class VideoEngine extends EventTarget {
         // the goal; it is the ordinary case once the byte budget cuts the window
         // on a big clip.
         //
-        // Bounded by REORDER_DEPTH: a decoder holds only a few frames back, so
+        // Bounded by _reorderDepth: a decoder holds only a few frames back, so
         // once we are well past the target with nothing to show for it, the frame
         // is not in the pipeline at all -- it came out earlier and was evicted
         // (a backward seek), and feeding forward would read to the end of the
         // clip to find something that is behind us.
         const stillComing = !haveTarget
           && this._fedThrough < lastSample
-          && this._fedThrough < targetDecode + REORDER_DEPTH;
+          && this._fedThrough < targetDecode + this._reorderDepth;
         if (this._fedThrough < decodeGoal || stillComing) {
           // A drained decoder accepts nothing but a key frame, and the next
           // sample in decode order is a delta. Begin the run again.

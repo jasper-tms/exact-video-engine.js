@@ -3,7 +3,7 @@ import { deriveIndexCacheKey, loadCachedIndexPayload, storeCachedIndexPayload, s
 import { readMatroskaFrameTable, IndexBudgetExceededError } from './matroska.js';
 import { readOggFrameTable } from './ogg.js';
 import { readAviFrameTable } from './avi.js';
-import { declaredFrameReorderDepth } from './frame-reorder-bound.js';
+import { decoderConfigFrameReorderDepth } from './frame-reorder-bound.js';
 import { longestCertifiedRun, DeclaredReorderWatermark } from './certified-prefix.js';
 import { MOTION_JPEG_CODEC } from './image-frame-decoder.js';
 
@@ -308,12 +308,6 @@ function mpeg4VisualTrack(file, info) {
   return null;
 }
 // ------------------------------------------------------------------
-
-function isobmffReorderDepth(codec, description) {
-  if (/^avc[13]/.test(codec)) return declaredFrameReorderDepth('avcC', description);
-  if (/^(hvc1|hev1)/.test(codec)) return declaredFrameReorderDepth('hvcC', description);
-  return null;
-}
 
 // Codecs with no presentation reordering, by WebCodecs codec string: their
 // frames are stored in the order they are shown. This is a property of the
@@ -715,7 +709,7 @@ export class ContainerIndex extends EventTarget {
   // sample carries its own, so a certified frame is immediately complete.
   _fragmentedPublisher(file, videoTrack, editWindow) {
     const declared = new DeclaredReorderWatermark(
-      isobmffReorderDepth(videoTrack.codec, this.decoderConfig.description));
+      decoderConfigFrameReorderDepth(videoTrack.codec, this.decoderConfig.description));
     const decodeOrderIsDisplayOrder = isobmffCodecHasNoPresentationReordering(videoTrack.codec);
 
     let observedCount = 0;      // samples fed to the watermark
