@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine source-unavailable test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<input type="file" id="picker">
+<canvas id="canvas" width="480" height="270"></canvas>
+<video id="video" width="480" height="270"></video>
+<script>
+// A clip whose source disappears after it loaded: the local file is renamed
+// out from under the page. test/source-unavailable-test.mjs picks a real file
+// on disk through the file input (so the File is disk-backed, as a person's
+// would be), calls loadEngine(), renames the file, then calls
+// observeFailure(). Nothing is simulated: the reads really fail.
+let engine = null;
+let fatalDetail = null;
+let consoleErrorCount = 0;
+const innerConsoleError = console.error.bind(console);
+console.error = (...args) => { consoleErrorCount++; innerConsoleError(...args); };
+
+function tick(now) {
+  if (engine) engine.update(now);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+window.loadEngine = async (prefer) => {
+  const file = document.getElementById('picker').files[0];
+  engine = await createBestEngine(file, {
+    canvas: document.getElementById('canvas'),
+    video: document.getElementById('video'),
+    prefer,
+  });
+  engine.addEventListener('errormessage', (event) => {
+    if (event.detail && event.detail.fatal) fatalDetail = event.detail;
+  });
+  return { tier: engine.tier, numFrames: engine.numFrames };
+};
+
+// Go somewhere the engine has not read yet, so the next read has to reach the
+// (now missing) file, then wait for the engine to say so.
+window.observeFailure = async (timeoutMilliseconds) => {
+  engine.seekToFrame(engine.numFrames - 10);
+  engine.play();
+  const startedAt = performance.now();
+  while (!fatalDetail && performance.now() - startedAt < timeoutMilliseconds) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const failureMilliseconds = performance.now() - startedAt;
+
+  // Before the fix a failed read was retried on every animation frame, forever,
+  // logging each time. Count what the next two seconds log.
+  const errorsBefore = consoleErrorCount;
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  const errorsAfterFailure = consoleErrorCount - errorsBefore;
+
+  // Waiters must fail fast off the failed flag, not sit out a timeout. Mid-clip,
+  // so the frame is not one still cached from the start or the seek.
+  let ensureError = null, ensureMilliseconds = null;
+  if (engine.ensureFrame) {
+    const ensureStartedAt = performance.now();
+    try { await engine.ensureFrame(Math.floor(engine.numFrames / 2)); } catch (e) { ensureError = String(e && e.message || e); }
+    ensureMilliseconds = performance.now() - ensureStartedAt;
+  }
+
+  return {
+    failed: engine.failed === true,
+    failureMilliseconds,
+    errorsAfterFailure,
+    ensureError, ensureMilliseconds,
+    detail: fatalDetail && {
+      message: fatalDetail.message,
+      fatal: fatalDetail.fatal,
+      sourceUnavailable: fatalDetail.sourceUnavailable,
+      errorName: fatalDetail.errorName,
+      nativeErrorCode: fatalDetail.nativeErrorCode,
+      frame: fatalDetail.frame,
+    },
+  };
+};
+</script>

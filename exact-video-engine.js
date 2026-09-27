@@ -5046,6 +5046,27 @@ const DEFAULT_REBUFFER_SECONDS = 0.3;
 const DECODE_STALL_LIMIT = 3;
 const DECODE_RECOVERY_SECONDS = 3;   // seconds
 
+// How long the decode driver waits before each retry of an encoded-byte read
+// that failed, and so how many retries it makes before declaring the source
+// gone. Only a URL source retries: a network blip or a briefly unreachable
+// server can recover, and giving up at once would kill a clip over a hiccup. A
+// File's read failing means the file on disk was moved, renamed, deleted, or
+// changed since it was opened — nothing that waiting fixes — so it fails at
+// once. (The retries matter for what they replace, too: before them a failed
+// read was logged and retried on the very next tick, forever, from every
+// update() call.)
+const SOURCE_READ_RETRY_MILLISECONDS = [500, 1000, 2000, 4000];
+
+// A read of the clip's encoded bytes failed: the source itself, not the decoder.
+// Thrown from _ensureBytes so the decode driver can tell the two apart.
+class SourceReadError extends Error {
+  constructor(cause) {
+    super(cause && cause.message ? cause.message : String(cause));
+    this.name = 'SourceReadError';
+    this.cause = cause;
+  }
+}
+
 // ==================================================================
 // VideoEngine — WebCodecs. Authoritative: we decide which frame is on screen.
 // ==================================================================
@@ -5113,7 +5134,8 @@ class VideoEngine extends EventTarget {
     // samples are already AVCC. Set from the index in _adoptIndex.
     this._annexBSamples = false;
     // True once the VideoDecoder has reported an unrecoverable error (see
-    // _decoderFailed); cleared by load()/_teardown().
+    // _decoderFailed) or the source's bytes can no longer be read (see
+    // _sourceReadFailed); cleared by load()/_teardown().
     this.failed = false;
     this._timescale = 1;
 
@@ -5178,6 +5200,7 @@ class VideoEngine extends EventTarget {
     this._restartTarget = -1;         // circuit-breaker: target of the last restart
     this._restartCount = 0;           // consecutive restarts for that same target
     this._stalledFrame = -1;          // a frame the circuit-breaker gave up on
+    this._sourceReadFailures = 0;     // consecutive failed encoded-byte reads
     this._byteBuffer = null;          // read-ahead buffer of encoded bytes
     this._byteBufferStart = 0;        // its file offset
     // The block before _byteBuffer, kept while playback flows forward across
@@ -5810,6 +5833,10 @@ class VideoEngine extends EventTarget {
   // samples forward from the right keyframe and fills the cache window.
   _request(frameIndex) {
     if (frameIndex === this._stalledFrame) return;   // known-undecodable; don't spin
+    // A failed engine has nothing to decode with, or nothing to read from, and
+    // update() calls here every tick: starting the driver again would only fail
+    // again, once per frame, for as long as the page stays open.
+    if (this.failed) return;
     this._target = frameIndex;
     // Prune to the window centred on the new target now, not only when the next
     // frame is absorbed: a seek onto already-cached frames (or one whose decode
@@ -5948,9 +5975,51 @@ class VideoEngine extends EventTarget {
         if (this._target === target) { this._driving = false; return; }
       }
     } catch (err) {
+      if (err instanceof SourceReadError) { this._sourceReadFailed(err.cause); return; }
       console.error('decode driver:', err);
     }
     this._driving = false;
+  }
+
+  // The decode driver could not read the clip's encoded bytes. For a URL, wait
+  // and try again (see SOURCE_READ_RETRY_MILLISECONDS), keeping _driving set
+  // through the wait so update() does not start another pass straight into the
+  // same failure. Otherwise, or once the retries run out, the source is gone:
+  // mark the engine failed, which stops the driver for good and makes waiters
+  // (ensureFrame) fail fast, and tell the host. The event is fatal like a dead
+  // decoder's, but carries sourceUnavailable so a host can tell them apart —
+  // rebuilding on the native tier cures a decoder that died, but not a file that
+  // is no longer there; that wants the person to open it again.
+  _sourceReadFailed(cause) {
+    const attempt = this._sourceReadFailures++;
+    const fromUrl = this._reader instanceof UrlRangeReader;
+    if (fromUrl && attempt < SOURCE_READ_RETRY_MILLISECONDS.length) {
+      const delay = SOURCE_READ_RETRY_MILLISECONDS[attempt];
+      console.warn(`VideoEngine: reading the clip failed (${cause}); retrying in ${delay} ms`);
+      const decoder = this._videoDecoder;
+      setTimeout(() => {
+        // Torn down or reloaded during the wait: that session's driver is gone.
+        if (this._videoDecoder !== decoder || !decoder || this.failed) return;
+        this._drive();
+      }, delay);
+      return;
+    }
+    console.error('VideoEngine: the clip\'s source can no longer be read:', cause);
+    this._driving = false;
+    this.failed = true;
+    const message = fromUrl
+      ? 'This video\'s URL stopped answering requests for its data, so it cannot '
+        + 'be played any further.'
+      : 'This video\'s file can no longer be read. It was probably moved, renamed, '
+        + 'or deleted after it was opened; open it again to keep playing.';
+    this.dispatchEvent(new CustomEvent('errormessage', { detail: {
+      message,
+      fatal: true,
+      sourceUnavailable: true,
+      errorName: (cause && cause.name) || null,
+      sourceErrorMessage: (cause && cause.message) || String(cause),
+      frame: this.currentFrame,
+    } }));
   }
 
   _restartRun(keyframe) {
@@ -6056,7 +6125,13 @@ class VideoEngine extends EventTarget {
           ? Math.min(MAX_BLOCK, Math.max(size, Math.min(wanted, MAX_BLOCK), MIN_BLOCK))
           : MAX_BLOCK;
         const end = Math.min(this._reader.size, offset + block) - 1;
-        const bytes = new Uint8Array(await this._reader.read(offset, end));
+        let bytes;
+        try {
+          bytes = new Uint8Array(await this._reader.read(offset, end));
+        } catch (err) {
+          throw new SourceReadError(err);
+        }
+        this._sourceReadFailures = 0;
         this._previousByteBuffer = null;
         this._byteBuffer = bytes;
         this._byteBufferStart = offset;
@@ -6544,6 +6619,7 @@ class VideoEngine extends EventTarget {
     this._restartTarget = -1;
     this._restartCount = 0;
     this._stalledFrame = -1;
+    this._sourceReadFailures = 0;
     this._byteBuffer = null;
     this._byteBufferStart = 0;
     this._previousByteBuffer = null;
@@ -6607,6 +6683,11 @@ class VideoEngine extends EventTarget {
 // is never cut off by it).
 const LOAD_STALL_MILLISECONDS = 10000;
 
+// Shared by both ways the native engine learns that a local file has gone.
+const SOURCE_FILE_UNREADABLE_MESSAGE = 'This video\'s file can no longer be read. '
+  + 'It was probably moved, renamed, or deleted after it was opened; open it '
+  + 'again to keep playing.';
+
 class NativeVideoEngine extends EventTarget {
   constructor(videoElement) {
     super();
@@ -6635,6 +6716,7 @@ class NativeVideoEngine extends EventTarget {
     this._loopEndFrame = null;
     this._rate = 1;                // reapplied after each load (src reset clears it)
     this._objectUrl = null;
+    this._sourceFile = null;       // the File/Blob being played, when it is one
 
     // The presented-frame clock: the exact PTS of the frame currently on screen
     // and the wall-clock moment it was presented. Both stay null/0 until the
@@ -6663,6 +6745,21 @@ class NativeVideoEngine extends EventTarget {
       const promise = this.video.play();
       if (promise) promise.catch(() => {});
     });
+
+    // An element error AFTER load: the browser has given up on the clip partway
+    // through. Registered once here, like the listeners above; errors during
+    // load are _loadElement's to report and arrive while `ready` is still false.
+    videoElement.addEventListener('error', () => this._elementFailed());
+    // A local file moved, renamed, or deleted while it plays does NOT reliably
+    // produce that error: Chromium sometimes gives up and fires it, and
+    // sometimes just parks the element at HAVE_METADATA for good, which is a
+    // silent freeze. So whenever the element goes looking for data it does not
+    // have, ask the file directly whether it can still be read (see
+    // _checkSourceReadable). A URL source has no such cheap question to ask, and
+    // for it a wait is ordinary buffering.
+    for (const type of ['waiting', 'stalled', 'seeking', 'error']) {
+      videoElement.addEventListener(type, () => this._checkSourceReadable());
+    }
 
     this.hasPresentedFrameClock = 'requestVideoFrameCallback' in videoElement;
     this._clockStopped = false;
@@ -7020,6 +7117,7 @@ class NativeVideoEngine extends EventTarget {
   // never cut off, while an element that has gone quiet without a frame is
   // refused with an error naming the likely cause.
   _loadElement(source) {
+    this._sourceFile = (typeof source === 'string') ? null : source;
     const url = (typeof source === 'string')
       ? source : (this._objectUrl = URL.createObjectURL(source));
     return new Promise((resolve, reject) => {
@@ -7317,6 +7415,68 @@ class NativeVideoEngine extends EventTarget {
     } }));
   }
 
+  // The element reported an error after the clip loaded. Chromium does this when
+  // a local file is moved, renamed, or deleted while it plays (a network error,
+  // once its own retries run out); a URL that stops answering does the same.
+  // Left alone, the element just sits on its last frame, which looks exactly
+  // like a pause. Latch `failed` and fire a fatal errormessage, as VideoEngine
+  // does, with sourceUnavailable set when the element could not READ the clip
+  // (as opposed to decode it) — rebuilding the engine cannot help that case; the
+  // person has to open the file again.
+  _elementFailed() {
+    if (!this.ready || this.failed) return;
+    const mediaError = this.video.error;
+    const code = mediaError ? mediaError.code : undefined;
+    const sourceUnavailable = code === MediaError.MEDIA_ERR_NETWORK;
+    let message;
+    if (!sourceUnavailable) {
+      message = 'The browser stopped playing this video partway through, so it '
+        + 'cannot be played any further.';
+    } else if (this._sourceFile) {
+      message = SOURCE_FILE_UNREADABLE_MESSAGE;
+    } else {
+      message = 'This video\'s URL stopped answering requests for its data, so it '
+        + 'cannot be played any further.';
+    }
+    this._failMidPlayback(message, {
+      sourceUnavailable,
+      nativeErrorCode: code,
+      nativeErrorMessage: (mediaError && mediaError.message) || undefined,
+    });
+  }
+
+  // Can the File being played still be read? One byte answers it: the browser
+  // re-checks the file on disk for every read of a File, and a moved, renamed,
+  // or deleted one throws (NotFoundError), as does one modified since it was
+  // picked (NotReadableError). An in-memory Blob always answers.
+  async _checkSourceReadable() {
+    const file = this._sourceFile;
+    if (!file || !this.ready || this.failed) return;
+    try {
+      await file.slice(0, 1).arrayBuffer();
+    } catch (error) {
+      // Reloaded or failed some other way while the read was out.
+      if (this._sourceFile !== file || !this.ready || this.failed) return;
+      this._failMidPlayback(SOURCE_FILE_UNREADABLE_MESSAGE, {
+        sourceUnavailable: true,
+        errorName: (error && error.name) || null,
+        sourceErrorMessage: (error && error.message) || String(error),
+      });
+    }
+  }
+
+  // Latch `failed` and tell the host, fatally, as VideoEngine does.
+  _failMidPlayback(message, fields) {
+    this.failed = true;
+    console.error('NativeVideoEngine: ' + message);
+    this.dispatchEvent(new CustomEvent('errormessage', { detail: {
+      message,
+      fatal: true,
+      ...fields,
+      frame: this.currentFrame,
+    } }));
+  }
+
   update() {}          // the <video> element advances its own clock
   resizeCanvas() {}    // CSS object-fit handles letterboxing
   setCacheBytes() {}   // no decoded-frame cache here; the browser buffers itself
@@ -7335,6 +7495,7 @@ class NativeVideoEngine extends EventTarget {
     this.ready = false;
     try { this.video.pause(); } catch (e) { /* not loaded */ }
     if (this._objectUrl) { URL.revokeObjectURL(this._objectUrl); this._objectUrl = null; }
+    this._sourceFile = null;
     // The previous clip's clock says nothing about the next one's.
     this._presentedMediaTime = null;
     this._presentedAt = 0;

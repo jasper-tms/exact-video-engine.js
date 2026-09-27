@@ -172,11 +172,11 @@ Both engines expose the following.
 | `rebuffering` | True while playback is buffering — the picture held on the last frame, `playing` still true, resuming on its own once enough is buffered ahead. Bind a spinner to it. On `VideoEngine` the engine holds its own clock (see `rebufferSeconds`); on `NativeVideoEngine` it observes the `<video>` element's own buffering. Distinct from `waitingForIndex` (pinned on the indexer) and `paused` (the host stopped playback). |
 | events `indexextended` / `indexcomplete` / `indextruncated` | The index published more frames, finished, or stopped early. `indextruncated` also emits a fatal `errormessage`. |
 | `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when the index carries no decoder configuration (Ogg, or a Matroska codec the engine does not configure). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. `mjpeg` is this library's own marker for Motion JPEG clips (WebCodecs registers no string for it). |
-| `failed` | True once the engine can no longer stand behind its output: an unrecoverable `VideoDecoder` error (`VideoEngine`), or the container index caught disagreeing with the presented frames during playback (`NativeVideoEngine`). Both also emit a fatal `errormessage`. |
+| `failed` | True once the engine can no longer stand behind its output: an unrecoverable `VideoDecoder` error (`VideoEngine`), the container index caught disagreeing with the presented frames during playback (`NativeVideoEngine`), or the source's bytes no longer readable (either engine; see "When the source disappears"). Each also emits a fatal `errormessage`. |
 | `destroy()` | Release resources when done (decoders are a limited browser resource). |
 | `resizeCanvas()` | Re-size the canvas backing store to its parent and repaint (`VideoEngine`); a no-op on `NativeVideoEngine`, where CSS `object-fit` handles it. `update()` already does this every tick, so you rarely need to call it — a pane that gains its size *after* the clip loads is handled without you having to get the timing right. |
 | event `loaded` | Fired when `load()` completes. |
-| event `errormessage` | `detail.message`: human-readable error string, or null to clear. See "When the decoder dies mid-playback" below for the `fatal: true` case. |
+| event `errormessage` | `detail.message`: human-readable error string, or null to clear. See "When the decoder dies mid-playback" and "When the source disappears" below for the `fatal: true` cases. |
 
 ### Looping a sub-range: `loopStartFrame` / `loopEndFrame`
 
@@ -374,15 +374,42 @@ clip. A host that can fall back should respond by rebuilding:
 
 ```js
 engine.addEventListener('errormessage', ({ detail }) => {
-  if (detail.fatal) rebuildWith(createBestEngine(source, { canvas, video, prefer: 'native' }));
+  if (!detail.fatal || detail.incomplete || detail.sourceUnavailable) return;
+  rebuildWith(createBestEngine(source, { canvas, video, prefer: 'native' }));
 });
 ```
+
+A fatal event with `incomplete: true` (an index that stopped early) or
+`sourceUnavailable: true` (below) is not a dead decoder, and rebuilding does
+not help it.
 
 The best-known such combination (10-bit HEVC on WebKit) is headed off before
 it happens — `createBestEngine` routes it straight to the `<video>` element —
 so this event is the net for combinations not yet in that table. For which
 codecs decode where, load the **vid-engine-format-support-per-browser** skill next
 to this one.
+
+## When the source disappears
+
+A clip's bytes are read on demand for as long as it plays, so a local file
+moved, renamed, deleted, or modified after it was picked — or a URL that stops
+answering — breaks playback partway through. Either engine then sets `failed`
+and emits one `errormessage` with `fatal: true` and `sourceUnavailable: true`,
+and stops reading. A File fails on the first failed read. A URL is retried
+with backoff for about seven seconds first, so a network blip recovers on its
+own. Alongside `message` and `frame`, the detail carries `errorName` and
+`sourceErrorMessage` when the failing read supplied them (`NotFoundError` for
+a moved file, for example), or `nativeErrorCode` / `nativeErrorMessage` when
+the `<video>` element reported the failure.
+
+Rebuilding the engine on the same source would only fail again. Ask the person
+to open the file again, and load that instead:
+
+```js
+engine.addEventListener('errormessage', ({ detail }) => {
+  if (detail.sourceUnavailable) offerToReopen(detail.message);
+});
+```
 
 ## Building an index without an engine
 

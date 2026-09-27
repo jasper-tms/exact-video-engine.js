@@ -88,7 +88,7 @@ done
 # a Chromium-specific decoder error surface (decoder-failure), and the task they
 # verify is engine bookkeeping that is not browser-specific — so running them
 # under one engine is enough and porting them would only add contortions.
-echo "=== chromium-only: startup, memory, stall, decoder-failure, known-bad-codec, index-cache, progressive ==="
+echo "=== chromium-only: startup, memory, stall, decoder-failure, source-unavailable, known-bad-codec, index-cache, progressive ==="
 node test/startup-test.mjs || status=1
 node test/memory-test.mjs || status=1
 # stall plays a 1080p clip through serve.py's per-request latency and rate caps
@@ -114,6 +114,12 @@ node test/paused-frame-test.mjs || status=1
 # byte prefetch); one engine covers it.
 node test/loop-decode-test.mjs || status=1
 node test/decoder-failure-test.mjs || status=1
+# source-unavailable renames a real picked file out from under each tier and pins
+# that the engine fails once, fatally, with sourceUnavailable -- rather than
+# retrying the read every tick forever behind a silently frozen picture.
+# Chromium-only because only there does Playwright hand a file input a real
+# path, so the File is disk-backed and the rename is felt.
+node test/source-unavailable-test.mjs || status=1
 # known-bad-codec spoofs navigator.vendor to exercise the WebKit routing path from
 # Chromium (the decision is codec-string-based, so no real HEVC decode is needed).
 node test/known-bad-codec-test.mjs || status=1

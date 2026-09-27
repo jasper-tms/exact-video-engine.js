@@ -3,6 +3,7 @@ import { convertAnnexBToAvcc } from './avi.js';
 import { beginPriorityRead, endPriorityRead } from './read-priority-gate.js';
 import { ImageFrameDecoder, isImageFrameCodec, canDecodeImageFrames } from './image-frame-decoder.js';
 import { UnplayableClipError } from './unplayable-clip.js';
+import { UrlRangeReader } from './range-readers.js';
 
 // Frames the cache holds beyond the read-ahead window's far edge. Decoded
 // frames arrive a little past the target while the playhead is still catching
@@ -60,6 +61,27 @@ const LOOP_PREFETCH_LEAD_SECONDS = 0.75;
 const DEFAULT_REBUFFER_SECONDS = 0.3;
 const DECODE_STALL_LIMIT = 3;
 const DECODE_RECOVERY_SECONDS = 3;   // seconds
+
+// How long the decode driver waits before each retry of an encoded-byte read
+// that failed, and so how many retries it makes before declaring the source
+// gone. Only a URL source retries: a network blip or a briefly unreachable
+// server can recover, and giving up at once would kill a clip over a hiccup. A
+// File's read failing means the file on disk was moved, renamed, deleted, or
+// changed since it was opened — nothing that waiting fixes — so it fails at
+// once. (The retries matter for what they replace, too: before them a failed
+// read was logged and retried on the very next tick, forever, from every
+// update() call.)
+const SOURCE_READ_RETRY_MILLISECONDS = [500, 1000, 2000, 4000];
+
+// A read of the clip's encoded bytes failed: the source itself, not the decoder.
+// Thrown from _ensureBytes so the decode driver can tell the two apart.
+class SourceReadError extends Error {
+  constructor(cause) {
+    super(cause && cause.message ? cause.message : String(cause));
+    this.name = 'SourceReadError';
+    this.cause = cause;
+  }
+}
 
 // ==================================================================
 // VideoEngine — WebCodecs. Authoritative: we decide which frame is on screen.
@@ -128,7 +150,8 @@ export class VideoEngine extends EventTarget {
     // samples are already AVCC. Set from the index in _adoptIndex.
     this._annexBSamples = false;
     // True once the VideoDecoder has reported an unrecoverable error (see
-    // _decoderFailed); cleared by load()/_teardown().
+    // _decoderFailed) or the source's bytes can no longer be read (see
+    // _sourceReadFailed); cleared by load()/_teardown().
     this.failed = false;
     this._timescale = 1;
 
@@ -193,6 +216,7 @@ export class VideoEngine extends EventTarget {
     this._restartTarget = -1;         // circuit-breaker: target of the last restart
     this._restartCount = 0;           // consecutive restarts for that same target
     this._stalledFrame = -1;          // a frame the circuit-breaker gave up on
+    this._sourceReadFailures = 0;     // consecutive failed encoded-byte reads
     this._byteBuffer = null;          // read-ahead buffer of encoded bytes
     this._byteBufferStart = 0;        // its file offset
     // The block before _byteBuffer, kept while playback flows forward across
@@ -825,6 +849,10 @@ export class VideoEngine extends EventTarget {
   // samples forward from the right keyframe and fills the cache window.
   _request(frameIndex) {
     if (frameIndex === this._stalledFrame) return;   // known-undecodable; don't spin
+    // A failed engine has nothing to decode with, or nothing to read from, and
+    // update() calls here every tick: starting the driver again would only fail
+    // again, once per frame, for as long as the page stays open.
+    if (this.failed) return;
     this._target = frameIndex;
     // Prune to the window centred on the new target now, not only when the next
     // frame is absorbed: a seek onto already-cached frames (or one whose decode
@@ -963,9 +991,51 @@ export class VideoEngine extends EventTarget {
         if (this._target === target) { this._driving = false; return; }
       }
     } catch (err) {
+      if (err instanceof SourceReadError) { this._sourceReadFailed(err.cause); return; }
       console.error('decode driver:', err);
     }
     this._driving = false;
+  }
+
+  // The decode driver could not read the clip's encoded bytes. For a URL, wait
+  // and try again (see SOURCE_READ_RETRY_MILLISECONDS), keeping _driving set
+  // through the wait so update() does not start another pass straight into the
+  // same failure. Otherwise, or once the retries run out, the source is gone:
+  // mark the engine failed, which stops the driver for good and makes waiters
+  // (ensureFrame) fail fast, and tell the host. The event is fatal like a dead
+  // decoder's, but carries sourceUnavailable so a host can tell them apart —
+  // rebuilding on the native tier cures a decoder that died, but not a file that
+  // is no longer there; that wants the person to open it again.
+  _sourceReadFailed(cause) {
+    const attempt = this._sourceReadFailures++;
+    const fromUrl = this._reader instanceof UrlRangeReader;
+    if (fromUrl && attempt < SOURCE_READ_RETRY_MILLISECONDS.length) {
+      const delay = SOURCE_READ_RETRY_MILLISECONDS[attempt];
+      console.warn(`VideoEngine: reading the clip failed (${cause}); retrying in ${delay} ms`);
+      const decoder = this._videoDecoder;
+      setTimeout(() => {
+        // Torn down or reloaded during the wait: that session's driver is gone.
+        if (this._videoDecoder !== decoder || !decoder || this.failed) return;
+        this._drive();
+      }, delay);
+      return;
+    }
+    console.error('VideoEngine: the clip\'s source can no longer be read:', cause);
+    this._driving = false;
+    this.failed = true;
+    const message = fromUrl
+      ? 'This video\'s URL stopped answering requests for its data, so it cannot '
+        + 'be played any further.'
+      : 'This video\'s file can no longer be read. It was probably moved, renamed, '
+        + 'or deleted after it was opened; open it again to keep playing.';
+    this.dispatchEvent(new CustomEvent('errormessage', { detail: {
+      message,
+      fatal: true,
+      sourceUnavailable: true,
+      errorName: (cause && cause.name) || null,
+      sourceErrorMessage: (cause && cause.message) || String(cause),
+      frame: this.currentFrame,
+    } }));
   }
 
   _restartRun(keyframe) {
@@ -1071,7 +1141,13 @@ export class VideoEngine extends EventTarget {
           ? Math.min(MAX_BLOCK, Math.max(size, Math.min(wanted, MAX_BLOCK), MIN_BLOCK))
           : MAX_BLOCK;
         const end = Math.min(this._reader.size, offset + block) - 1;
-        const bytes = new Uint8Array(await this._reader.read(offset, end));
+        let bytes;
+        try {
+          bytes = new Uint8Array(await this._reader.read(offset, end));
+        } catch (err) {
+          throw new SourceReadError(err);
+        }
+        this._sourceReadFailures = 0;
         this._previousByteBuffer = null;
         this._byteBuffer = bytes;
         this._byteBufferStart = offset;
@@ -1559,6 +1635,7 @@ export class VideoEngine extends EventTarget {
     this._restartTarget = -1;
     this._restartCount = 0;
     this._stalledFrame = -1;
+    this._sourceReadFailures = 0;
     this._byteBuffer = null;
     this._byteBufferStart = 0;
     this._previousByteBuffer = null;

@@ -38,6 +38,11 @@ import { UnplayableClipError } from './unplayable-clip.js';
 // is never cut off by it).
 const LOAD_STALL_MILLISECONDS = 10000;
 
+// Shared by both ways the native engine learns that a local file has gone.
+const SOURCE_FILE_UNREADABLE_MESSAGE = 'This video\'s file can no longer be read. '
+  + 'It was probably moved, renamed, or deleted after it was opened; open it '
+  + 'again to keep playing.';
+
 export class NativeVideoEngine extends EventTarget {
   constructor(videoElement) {
     super();
@@ -66,6 +71,7 @@ export class NativeVideoEngine extends EventTarget {
     this._loopEndFrame = null;
     this._rate = 1;                // reapplied after each load (src reset clears it)
     this._objectUrl = null;
+    this._sourceFile = null;       // the File/Blob being played, when it is one
 
     // The presented-frame clock: the exact PTS of the frame currently on screen
     // and the wall-clock moment it was presented. Both stay null/0 until the
@@ -94,6 +100,21 @@ export class NativeVideoEngine extends EventTarget {
       const promise = this.video.play();
       if (promise) promise.catch(() => {});
     });
+
+    // An element error AFTER load: the browser has given up on the clip partway
+    // through. Registered once here, like the listeners above; errors during
+    // load are _loadElement's to report and arrive while `ready` is still false.
+    videoElement.addEventListener('error', () => this._elementFailed());
+    // A local file moved, renamed, or deleted while it plays does NOT reliably
+    // produce that error: Chromium sometimes gives up and fires it, and
+    // sometimes just parks the element at HAVE_METADATA for good, which is a
+    // silent freeze. So whenever the element goes looking for data it does not
+    // have, ask the file directly whether it can still be read (see
+    // _checkSourceReadable). A URL source has no such cheap question to ask, and
+    // for it a wait is ordinary buffering.
+    for (const type of ['waiting', 'stalled', 'seeking', 'error']) {
+      videoElement.addEventListener(type, () => this._checkSourceReadable());
+    }
 
     this.hasPresentedFrameClock = 'requestVideoFrameCallback' in videoElement;
     this._clockStopped = false;
@@ -451,6 +472,7 @@ export class NativeVideoEngine extends EventTarget {
   // never cut off, while an element that has gone quiet without a frame is
   // refused with an error naming the likely cause.
   _loadElement(source) {
+    this._sourceFile = (typeof source === 'string') ? null : source;
     const url = (typeof source === 'string')
       ? source : (this._objectUrl = URL.createObjectURL(source));
     return new Promise((resolve, reject) => {
@@ -748,6 +770,68 @@ export class NativeVideoEngine extends EventTarget {
     } }));
   }
 
+  // The element reported an error after the clip loaded. Chromium does this when
+  // a local file is moved, renamed, or deleted while it plays (a network error,
+  // once its own retries run out); a URL that stops answering does the same.
+  // Left alone, the element just sits on its last frame, which looks exactly
+  // like a pause. Latch `failed` and fire a fatal errormessage, as VideoEngine
+  // does, with sourceUnavailable set when the element could not READ the clip
+  // (as opposed to decode it) — rebuilding the engine cannot help that case; the
+  // person has to open the file again.
+  _elementFailed() {
+    if (!this.ready || this.failed) return;
+    const mediaError = this.video.error;
+    const code = mediaError ? mediaError.code : undefined;
+    const sourceUnavailable = code === MediaError.MEDIA_ERR_NETWORK;
+    let message;
+    if (!sourceUnavailable) {
+      message = 'The browser stopped playing this video partway through, so it '
+        + 'cannot be played any further.';
+    } else if (this._sourceFile) {
+      message = SOURCE_FILE_UNREADABLE_MESSAGE;
+    } else {
+      message = 'This video\'s URL stopped answering requests for its data, so it '
+        + 'cannot be played any further.';
+    }
+    this._failMidPlayback(message, {
+      sourceUnavailable,
+      nativeErrorCode: code,
+      nativeErrorMessage: (mediaError && mediaError.message) || undefined,
+    });
+  }
+
+  // Can the File being played still be read? One byte answers it: the browser
+  // re-checks the file on disk for every read of a File, and a moved, renamed,
+  // or deleted one throws (NotFoundError), as does one modified since it was
+  // picked (NotReadableError). An in-memory Blob always answers.
+  async _checkSourceReadable() {
+    const file = this._sourceFile;
+    if (!file || !this.ready || this.failed) return;
+    try {
+      await file.slice(0, 1).arrayBuffer();
+    } catch (error) {
+      // Reloaded or failed some other way while the read was out.
+      if (this._sourceFile !== file || !this.ready || this.failed) return;
+      this._failMidPlayback(SOURCE_FILE_UNREADABLE_MESSAGE, {
+        sourceUnavailable: true,
+        errorName: (error && error.name) || null,
+        sourceErrorMessage: (error && error.message) || String(error),
+      });
+    }
+  }
+
+  // Latch `failed` and tell the host, fatally, as VideoEngine does.
+  _failMidPlayback(message, fields) {
+    this.failed = true;
+    console.error('NativeVideoEngine: ' + message);
+    this.dispatchEvent(new CustomEvent('errormessage', { detail: {
+      message,
+      fatal: true,
+      ...fields,
+      frame: this.currentFrame,
+    } }));
+  }
+
   update() {}          // the <video> element advances its own clock
   resizeCanvas() {}    // CSS object-fit handles letterboxing
   setCacheBytes() {}   // no decoded-frame cache here; the browser buffers itself
@@ -766,6 +850,7 @@ export class NativeVideoEngine extends EventTarget {
     this.ready = false;
     try { this.video.pause(); } catch (e) { /* not loaded */ }
     if (this._objectUrl) { URL.revokeObjectURL(this._objectUrl); this._objectUrl = null; }
+    this._sourceFile = null;
     // The previous clip's clock says nothing about the next one's.
     this._presentedMediaTime = null;
     this._presentedAt = 0;

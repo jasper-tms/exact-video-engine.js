@@ -276,3 +276,17 @@ currentFrame` with that frame's bitmap in hand and at least one pause must have
 caught the picture still behind (`staleBefore`) so the recovery path is known to
 have run. The counter pane is the native 150×90 (like frame-index) with
 smoothing off, so the bar is not resampled onto a neighbouring column.
+
+## Source unavailable
+
+Picks a real 30-second clip on disk through a file input, loads it on each tier,
+renames the file, and seeks somewhere not yet read. Pins one fatal
+`errormessage` with `sourceUnavailable`, `failed` set, no further console
+errors over the next two seconds, and (WebCodecs) `ensureFrame` rejecting off
+the failed flag. Without the fix, the WebCodecs driver retried the failed read
+on every `update()` tick forever, and the native element froze silently. The
+clip is long so that the seek lands on bytes neither tier read while loading.
+The native tier's case pins the file-readability
+probe, not the element's own `error`: after a rename Chromium sometimes fires
+that error and sometimes just parks at HAVE_METADATA. The URL retry path is not
+covered, because serve.py has no way to fail a read on request.
