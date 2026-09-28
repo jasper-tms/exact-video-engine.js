@@ -135,6 +135,14 @@ export class VideoEngine extends EventTarget {
   // displaying exact pixel values (an annotation tool matching source pixels
   // 1:1, say) wants the opposite: pass false to keep every presented frame an
   // exact, uninterpolated blow-up of the decoded one.
+  //
+  // options.applyPixelAspectRatio: true by default — an anamorphic clip (see
+  // pixelAspectRatio) is letterboxed at the shape it is meant to be SEEN at,
+  // as a <video> element shows it. A host that composites the canvas into its
+  // own stored-pixel rectangle and applies the pixel shape itself (an
+  // annotation tool whose coordinates index stored pixels, say) passes false,
+  // and the canvas is letterboxed at the stored-pixel shape instead, so a pane
+  // sized videoWidth × videoHeight is filled one stored pixel per pane pixel.
   constructor(presentationCanvas, options = {}) {
     super();
     this.canvas = presentationCanvas;
@@ -172,10 +180,13 @@ export class VideoEngine extends EventTarget {
     // Upright display geometry, taken from the container index: the track's
     // rotation metadata (0/90/180/270) and the dimensions consumers should
     // letterbox and annotate against (coded axes swapped when rotation is
-    // 90/270).
+    // 90/270). The dimensions count stored pixels; pixelAspectRatio (width ÷
+    // height of one upright stored pixel, 1 unless the clip is anamorphic) says
+    // what shape to show them at.
     this.rotation = 0;
     this.videoWidth = 0;
     this.videoHeight = 0;
+    this.pixelAspectRatio = 1;
 
     // Decode-order sample table, aliased from the index (the decode driver
     // reads these on every tick).
@@ -211,6 +222,7 @@ export class VideoEngine extends EventTarget {
     // presentation canvas and the decoder's own frame pool also draw against.
     this._cacheBytes = Math.max(8 << 20, options.cacheBytes ?? (96 << 20));
     this._imageSmoothingEnabled = options.imageSmoothingEnabled ?? true;
+    this._applyPixelAspectRatio = options.applyPixelAspectRatio ?? true;
     // Filled in by _sizeWindows() from _cacheBytes and the clip's frame size.
     this._windowBack = this._wantedWindowBack;
     this._windowAhead = this._wantedWindowAhead;
@@ -546,6 +558,7 @@ export class VideoEngine extends EventTarget {
     this.rotation = index.rotation;
     this.videoWidth = index.videoWidth;
     this.videoHeight = index.videoHeight;
+    this.pixelAspectRatio = index.pixelAspectRatio || 1;
     this._readIndexTables();
     this._sizeWindows();
 
@@ -796,9 +809,16 @@ export class VideoEngine extends EventTarget {
     // Downscale oversized frames (e.g. 4K) when caching — display only. Same
     // arithmetic _sizeWindows() budgeted against, so what lands in the cache is
     // the size it was told to expect.
+    //
+    // Sized from the STORED pixels (the visible rectangle), not displayWidth:
+    // a decoder may fold an anamorphic stream's pixel shape into displayWidth,
+    // and createImageBitmap would then resample every column into a stretched
+    // bitmap. Cached bitmaps hold stored pixels one for one; the pixel shape is
+    // applied once, at presentation (_drawBitmap).
+    const storedWidth = frame.visibleRect ? frame.visibleRect.width : frame.displayWidth;
+    const storedHeight = frame.visibleRect ? frame.visibleRect.height : frame.displayHeight;
     let options;
-    const [width, height] =
-      this._cachedBitmapSize(frame.displayWidth, frame.displayHeight);
+    const [width, height] = this._cachedBitmapSize(storedWidth, storedHeight);
     if (width !== frame.displayWidth || height !== frame.displayHeight) {
       options = { resizeWidth: width, resizeHeight: height, resizeQuality: 'medium' };
     }
@@ -1592,7 +1612,9 @@ export class VideoEngine extends EventTarget {
     // contain), centered, preserving the source aspect — so a host aligning
     // other elements to the video can compute the same rectangle. The track's
     // display rotation is applied here: cached bitmaps stay in coded
-    // orientation, and the upright (display) aspect drives the letterbox.
+    // orientation, and the upright (display) aspect drives the letterbox. So is
+    // an anamorphic clip's pixel shape, unless the host asked to be handed
+    // stored pixels (applyPixelAspectRatio: false).
     const cw = this.canvas.width, ch = this.canvas.height, ctx = this.context;
     if (!cw || !ch) return;   // pane not laid out yet; resizeCanvas will repaint
     ctx.clearRect(0, 0, cw, ch);
@@ -1604,7 +1626,8 @@ export class VideoEngine extends EventTarget {
     const swapAxes = rotation === 90 || rotation === 270;
     const displayW = swapAxes ? bitmap.height : bitmap.width;
     const displayH = swapAxes ? bitmap.width : bitmap.height;
-    const sourceAspect = displayW / displayH, paneAspect = cw / ch;
+    const pixelAspectRatio = this._applyPixelAspectRatio ? (this.pixelAspectRatio || 1) : 1;
+    const sourceAspect = displayW * pixelAspectRatio / displayH, paneAspect = cw / ch;
     let drawWidth, drawHeight;
     if (paneAspect > sourceAspect) { drawHeight = ch; drawWidth = ch * sourceAspect; }
     else { drawWidth = cw; drawHeight = cw / sourceAspect; }

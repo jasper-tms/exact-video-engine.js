@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine pixel aspect ratio test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<style>
+  .pane { width: 200px; height: 200px; }
+  .pane canvas { width: 100%; height: 100%; display: block; }
+</style>
+<div class="pane" id="pane-display"><canvas id="canvas-display"></canvas></div>
+<div class="pane" id="pane-stored"><canvas id="canvas-stored"></canvas></div>
+<video id="ground-truth-video" muted playsinline></video>
+<video id="native-engine-video" muted playsinline></video>
+<canvas id="native-engine-canvas"></canvas>
+<script>
+// Loads ?file=<clip> every way a host can and reports, for the driver to judge:
+//   * the WebCodecs engine's videoWidth/videoHeight/pixelAspectRatio, and the
+//     size of the bitmap it cached for frame 0 (stored pixels, one for one);
+//   * the shape of the picture it painted into a square pane, once with the
+//     default presentation and once with applyPixelAspectRatio: false;
+//   * the native engine's videoWidth/videoHeight/pixelAspectRatio;
+//   * a bare <video> element's videoWidth/videoHeight — the browser's own idea
+//     of the display shape, or null if this browser cannot play the clip.
+const file = 'clips/' + new URLSearchParams(location.search).get('file');
+
+// The extent of painted (non-transparent) pixels along the middle row and the
+// middle column. The canvas is cleared to transparent before each paint, so
+// the letterbox bars read as alpha 0.
+function paintedShape(canvas) {
+  const context = canvas.getContext('2d');
+  const { width, height } = canvas;
+  const row = context.getImageData(0, Math.floor(height / 2), width, 1).data;
+  const column = context.getImageData(Math.floor(width / 2), 0, 1, height).data;
+  const extent = (data, length) => {
+    let first = -1, last = -1;
+    for (let i = 0; i < length; i++) {
+      if (data[i * 4 + 3] > 0) { if (first < 0) first = i; last = i; }
+    }
+    return first < 0 ? 0 : last - first + 1;
+  };
+  return { width: extent(row, width), height: extent(column, height) };
+}
+
+async function webCodecsReport(blob, canvasId, options) {
+  const canvas = document.getElementById(canvasId);
+  const engine = new VideoEngine(canvas, options);
+  engine.addEventListener('errormessage', (event) => {
+    if (event.detail.message) window.__err = event.detail.message;
+  });
+  await engine.load(blob);
+  await engine.ensureFrame(0);
+  engine.update(performance.now());
+  const bitmap = engine.bitmapForFrame(0);
+  return {
+    videoWidth: engine.videoWidth,
+    videoHeight: engine.videoHeight,
+    pixelAspectRatio: engine.pixelAspectRatio,
+    bitmap: bitmap ? { width: bitmap.width, height: bitmap.height } : null,
+    painted: paintedShape(canvas),
+  };
+}
+
+async function groundTruth() {
+  const video = document.getElementById('ground-truth-video');
+  video.src = file;
+  const loaded = await new Promise((resolve) => {
+    video.onloadeddata = () => resolve(true);
+    video.onerror = () => resolve(false);
+    video.load();
+  });
+  return loaded ? { width: video.videoWidth, height: video.videoHeight } : null;
+}
+
+async function nativeReport(blob) {
+  try {
+    const engine = await createBestEngine(blob, {
+      canvas: document.getElementById('native-engine-canvas'),
+      video: document.getElementById('native-engine-video'),
+      prefer: 'native',
+    });
+    return {
+      tier: engine.tier,
+      videoWidth: engine.videoWidth,
+      videoHeight: engine.videoHeight,
+      pixelAspectRatio: engine.pixelAspectRatio,
+    };
+  } catch (error) {
+    return { error: String(error.message || error) };
+  }
+}
+
+async function run() {
+  const blob = await (await fetch(file)).blob();
+  window.__result = {
+    webCodecsDisplay: await webCodecsReport(blob, 'canvas-display', {}),
+    webCodecsStored: await webCodecsReport(blob, 'canvas-stored', { applyPixelAspectRatio: false }),
+    native: await nativeReport(blob),
+    groundTruth: await groundTruth(),
+  };
+}
+run().catch((e) => { window.__err = String(e); });
+</script>

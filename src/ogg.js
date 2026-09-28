@@ -85,8 +85,12 @@ function parseTheoraIdentificationHeader(bytes) {
   // timeline does not care where the picture sits, only how big it is.
   const frameRateNumerator = readBigEndian(bytes, 22, 4);      // FRN
   const frameRateDenominator = readBigEndian(bytes, 26, 4);    // FRD
-  // bytes[30..32] PARN, bytes[33..35] PARD (pixel aspect ratio), bytes[36] CS
-  // (colorspace), bytes[37..39] NOMBR (nominal bitrate) — none affect timing.
+  // PARN:PARD is the pixel aspect ratio, width to height of one pixel. Either
+  // being zero means the encoder did not say, which Theora defines as square.
+  const pixelAspectNumerator = readBigEndian(bytes, 30, 3);    // PARN (24-bit)
+  const pixelAspectDenominator = readBigEndian(bytes, 33, 3);  // PARD (24-bit)
+  // bytes[36] CS (colorspace), bytes[37..39] NOMBR (nominal bitrate) — neither
+  // affects timing or geometry.
 
   // The last two bytes pack four fields, read most-significant-bit first across
   // the 16-bit big-endian value: QUAL(6) KFGSHIFT(5) PF(2) Res(3). Only the
@@ -109,6 +113,8 @@ function parseTheoraIdentificationHeader(bytes) {
     // frame size only when a header leaves the picture dimensions at zero.
     videoWidth: pictureWidth || frameWidthMacroblocks * 16,
     videoHeight: pictureHeight || frameHeightMacroblocks * 16,
+    pixelAspectRatio: (pixelAspectNumerator > 0 && pixelAspectDenominator > 0)
+      ? pixelAspectNumerator / pixelAspectDenominator : 1,
   };
 }
 
@@ -144,7 +150,7 @@ function granuleToFrameCount(granulePosition, keyframeGranuleShift, versionRevis
 //   options.chunkBytes           refill/progress granularity (default 1 MB)
 //
 // Returns {presentationTimes (seconds, presentation order, first frame at t = 0),
-// defaultFrameDuration (seconds), videoWidth, videoHeight}. Throws
+// defaultFrameDuration (seconds), videoWidth, videoHeight, pixelAspectRatio}. Throws
 // IndexBudgetExceededError when it runs out of budget, and a plain Error when the
 // file is not a single-Theora-stream Ogg we can trust.
 export async function readOggFrameTable(reader, options = {}) {
@@ -245,7 +251,8 @@ export async function readOggFrameTable(reader, options = {}) {
       + `${state.lastGranuleFrameCount} frames, packets say ${videoFrames}`);
   }
 
-  const { frameRateNumerator, frameRateDenominator, videoWidth, videoHeight } = state.header;
+  const { frameRateNumerator, frameRateDenominator, videoWidth, videoHeight,
+    pixelAspectRatio } = state.header;
   const frameDurationSeconds = frameRateDenominator / frameRateNumerator;
   // presentationTimes[n] = n * FRD / FRN. Built from the real per-frame packet
   // count above, not assumed from a declared rate — Theora's constant frame
@@ -262,6 +269,7 @@ export async function readOggFrameTable(reader, options = {}) {
     defaultFrameDuration: frameDurationSeconds,
     videoWidth,
     videoHeight,
+    pixelAspectRatio,
   };
 }
 

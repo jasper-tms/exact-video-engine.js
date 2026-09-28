@@ -38,6 +38,12 @@ export async function createBestEngine(source, options = {}) {
     // control (the browser resamples its own decoded frames, not us), so this
     // is a no-op on that tier. See the VideoEngine constructor.
     imageSmoothingEnabled,
+    // Passed through to VideoEngine: false letterboxes an anamorphic clip at its
+    // stored-pixel shape rather than its display shape. The <video> element
+    // always shows the display shape, so this is a no-op on that tier; a host
+    // drawing that element into a rectangle of its own choosing gets whatever
+    // shape it draws it at. See the VideoEngine constructor.
+    applyPixelAspectRatio,
     // Passed through to VideoEngine: how far ahead the decode must reach before
     // playback resumes from a buffering hold (seconds; 0 disables the hold). The
     // <video> element buffers on its own clock, so this is a no-op on that tier.
@@ -198,7 +204,8 @@ export async function createBestEngine(source, options = {}) {
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
     webCodecsWasTried = true;
     const engine = new VideoEngine(canvas,
-      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled, rebufferSeconds });
+      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled,
+        applyPixelAspectRatio, rebufferSeconds });
     try {
       await engine.load(source, { index });
       return engine;

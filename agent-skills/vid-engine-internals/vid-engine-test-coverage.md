@@ -22,6 +22,25 @@ in nothing else.
 Renders clips with 0/90/180/270° rotation metadata through both the engine
 and a native `<video>` element and compares where an asymmetric marker lands.
 
+## Pixel aspect ratio
+
+Loads anamorphic clips (320×180 stored with 1:2 pixels, as an MP4 `pasp` box
+and as WebM DisplayWidth/DisplayHeight, plus a 90°-rotated MP4 whose upright
+pixels are 2:1) and the square `plain.mp4` control through both engines.
+It pins four things:
+- Both tiers report stored-pixel `videoWidth`/`videoHeight` and the same
+  `pixelAspectRatio`. The native tier once reported the element's
+  display-shaped size, so coordinates depended on the tier.
+- `bitmapForFrame` holds stored pixels one for one.
+- The canvas letterboxes at the display shape by default, and at the stored
+  shape with `applyPixelAspectRatio: false`.
+- Wherever the browser plays the clip natively, the `<video>` element's own
+  display shape agrees with the engine's. The element's reported *size*
+  differs by browser, so only the shape is compared.
+
+The Matroska ratio arithmetic (defaults, DisplayUnit 3 and 4) is also checked
+in plain Node in `matroska-table-test.mjs`.
+
 ## Frame index
 
 Walks every frame of the counter clips through each engine and checks that

@@ -162,7 +162,8 @@ Both engines expose the following.
 | `seekToFrame(n)` | Land on display frame `n`. |
 | `frameAtTime(t)` | Display frame index on screen at time `t`. |
 | `ensureFrame(n)` | Async: resolves once frame `n` is decoded (`VideoEngine`) or once the element has settled on it (`NativeVideoEngine`). |
-| `videoWidth` / `videoHeight` | Upright display dimensions (rotation applied). Annotate in this coordinate space. |
+| `videoWidth` / `videoHeight` | Upright dimensions in **stored** pixels (rotation applied), the same on both tiers. Annotate in this coordinate space. For an anamorphic clip this is not the shape it is shown at; see `pixelAspectRatio`. |
+| `pixelAspectRatio` | Width ÷ height of one upright stored pixel: 1 for ordinary square-pixel video, otherwise the container's declared pixel shape (see "Anamorphic clips" below). The picture is meant to be seen `videoWidth × pixelAspectRatio` wide by `videoHeight` tall. |
 | `rotation` | The track's display rotation in degrees: 0, 90, 180, or 270. Informational — both engines already present upright. |
 | `displayElement` | The canvas or `<video>` the engine presents into. |
 | `tier` | What this engine got, e.g. `webcodecs` or `native (container index, presented clock)`. Useful for a dev label. |
@@ -214,11 +215,37 @@ tier that matters most in practice: the native engine is the fallback for
 browsers with no `VideoDecoder` (pre-16.4 iOS Safari). A host that needs the
 region's bounds honored to the frame should check `tier`.
 
+### Anamorphic clips: `pixelAspectRatio`
+
+Some clips store pixels that are meant to be shown non-square. HandBrake's
+automatic anamorphic output, DV and some broadcast masters do this. For
+example, a HandBrake encode may store 1472 × 1080 with pixels 0.544 as wide as
+they are tall, so it is meant to be seen at about 801 × 1080. The engine
+reads the pixel shape from the container (MP4 `pasp`, Matroska
+DisplayWidth/DisplayHeight, Theora's header) and keeps two things apart:
+
+- `videoWidth` / `videoHeight` count the **stored** pixels (1472 × 1080), on
+  both tiers. Coordinates in this space name real pixels of the file, the same
+  ones Python or ffmpeg decode.
+- `pixelAspectRatio` (0.544 here) says how to show them.
+
+Both tiers *present* the clip at its display shape by default, the way any
+player does. A host that composites the engine's canvas into its own
+`videoWidth × videoHeight` rectangle and applies the pixel shape itself, such
+as an annotation tool whose stage is in stored pixels, passes
+`applyPixelAspectRatio: false` to `createBestEngine` (or the `VideoEngine`
+constructor). The canvas is then letterboxed at the stored shape, so a pane
+sized `videoWidth × videoHeight` is filled one stored pixel per pane pixel. The
+`<video>` tier always shows the display shape; drawing that element with
+`drawImage(video, x, y, videoWidth, videoHeight)` gives the stored shape
+either way.
+
 ### Named-frame pixels: `bitmapForFrame(n)`
 
 `VideoEngine` additionally has `bitmapForFrame(n)`, the decoded `ImageBitmap`
-for a frame (coded orientation, possibly downscaled to 1920 on the long side —
-apply `rotation` yourself). `NativeVideoEngine` has no equivalent: a `<video>`
+for a frame (coded orientation, stored pixels one for one even for an
+anamorphic clip, possibly downscaled to 1920 on the long side — apply
+`rotation` and `pixelAspectRatio` yourself). `NativeVideoEngine` has no equivalent: a `<video>`
 element cannot hand back a frame you can name. Hosts that need pixels should
 check `tier` first — which clips reach the WebCodecs engine depends on the
 browser as well as the container.

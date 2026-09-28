@@ -188,14 +188,24 @@ export class NativeVideoEngine extends EventTarget {
     return this.duration;
   }
 
-  // Upright display dimensions. The element applies the track's rotation
-  // itself, so these already account for it — the same meaning VideoEngine's
-  // videoWidth/videoHeight carry.
+  // Upright stored-pixel dimensions — the same meaning VideoEngine's
+  // videoWidth/videoHeight carry. Read from the index first: the element's own
+  // videoWidth/videoHeight already account for rotation, but ALSO for an
+  // anamorphic clip's pixel shape (a 1472-wide clip of 0.54-wide pixels reports
+  // 801), which would make the same file's coordinates depend on the tier that
+  // happened to play it. The element is only the fallback for a load without
+  // an index.
   get videoWidth() {
-    return this.video.videoWidth || (this._index ? this._index.videoWidth : 0);
+    return (this._index ? this._index.videoWidth : 0) || this.video.videoWidth;
   }
   get videoHeight() {
-    return this.video.videoHeight || (this._index ? this._index.videoHeight : 0);
+    return (this._index ? this._index.videoHeight : 0) || this.video.videoHeight;
+  }
+
+  // Width ÷ height of one upright stored pixel (1 unless the clip is
+  // anamorphic). The element already shows the clip at this shape.
+  get pixelAspectRatio() {
+    return (this._index && this._index.pixelAspectRatio) || 1;
   }
 
   get duration() {

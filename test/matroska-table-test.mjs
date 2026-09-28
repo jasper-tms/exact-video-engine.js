@@ -28,8 +28,8 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { readMatroskaFrameTable, hevcCodecString, av1CodecString, IndexBudgetExceededError }
-  from '../src/matroska.js';
+import { readMatroskaFrameTable, hevcCodecString, av1CodecString, IndexBudgetExceededError,
+  matroskaPixelAspectRatio } from '../src/matroska.js';
 import { ContainerIndex } from '../src/container-index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -230,6 +230,37 @@ check('a too-short av1C yields no codec string',
   av1CodecString(new Uint8Array([0x81])) === null, 'null');
 check('no record at all yields no codec string',
   hevcCodecString(null) === null && av1CodecString(null) === null, 'null');
+
+// --- the pixel shape ---------------------------------------------------------
+//
+// Matroska states an anamorphic track's pixel shape only indirectly, as a
+// DisplayWidth × DisplayHeight to show the PixelWidth × PixelHeight frame at.
+// anamorphic.webm is 320x180 stored with 1:2 pixels (shown 160x180); every
+// counter clip states no display size, which must read as square.
+if (existsSync(clip('anamorphic.webm'))) {
+  const { table } = await tableFor('anamorphic.webm');
+  check('anamorphic.webm pixel shape', table.pixelAspectRatio === 0.5
+    && table.videoWidth === 320 && table.videoHeight === 180,
+    `${table.videoWidth}x${table.videoHeight} pixelAspectRatio=${table.pixelAspectRatio} `
+    + '(want 320x180 stored, 0.5)');
+}
+{
+  const { table } = await tableFor('counter-cfr.webm');
+  check('a track with no display size has square pixels', table.pixelAspectRatio === 1,
+    `pixelAspectRatio=${table.pixelAspectRatio}`);
+}
+check('display size alone gives the shape',
+  matroskaPixelAspectRatio(1472, 1080, 801, 1080) === (801 / 1080) / (1472 / 1080),
+  `${matroskaPixelAspectRatio(1472, 1080, 801, 1080)}`);
+check('an absent display dimension defaults to the pixel one',
+  matroskaPixelAspectRatio(720, 480, 853, 0) === (853 / 480) / (720 / 480),
+  `${matroskaPixelAspectRatio(720, 480, 853, 0)}`);
+check('display unit 3 (a bare aspect ratio) still gives the shape',
+  matroskaPixelAspectRatio(1440, 1080, 16, 9, 3) === (16 / 9) / (1440 / 1080),
+  `${matroskaPixelAspectRatio(1440, 1080, 16, 9, 3)}`);
+check('display unit 4 (unknown) states no shape, so square',
+  matroskaPixelAspectRatio(1440, 1080, 16, 9, 4) === 1,
+  `${matroskaPixelAspectRatio(1440, 1080, 16, 9, 4)}`);
 
 // --- the budget contract, unchanged by any of the above ----------------------
 {

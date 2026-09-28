@@ -67,6 +67,9 @@ const EBML_ID = {
   video: 0xE0,
   pixelWidth: 0xB0,
   pixelHeight: 0xBA,
+  displayWidth: 0x54B0,
+  displayHeight: 0x54BA,
+  displayUnit: 0x54B2,
   codecId: 0x86,
   codecPrivate: 0x63A2,
   cluster: 0x1F43B675,
@@ -285,6 +288,7 @@ export function formatProgress(progress) {
 //     timescale,              // ticks per second (1000 for the default 1 ms scale)
 //     defaultFrameDuration,   // seconds, from DefaultDuration (0 if absent)
 //     videoWidth, videoHeight,
+//     pixelAspectRatio,       // width ÷ height of one stored pixel (1 = square)
 //     codecId,                // Matroska CodecID, e.g. 'V_VP9'
 //     decoderConfig }         // WebCodecs configuration, or null for a codec we
 //                             //   cannot configure (the clip then plays through
@@ -318,6 +322,7 @@ export async function readMatroskaFrameTable(reader, options = {}) {
     defaultFrameDuration: 0,
     videoWidth: 0,
     videoHeight: 0,
+    pixelAspectRatio: 1,
     codecId: '',
     codecPrivate: null,
     clusterTimestamp: 0,
@@ -430,6 +435,7 @@ export async function readMatroskaFrameTable(reader, options = {}) {
       declaredDuration: state.declaredDurationTicks * state.timestampScaleSeconds,
       videoWidth: state.videoWidth,
       videoHeight: state.videoHeight,
+      pixelAspectRatio: state.pixelAspectRatio,
       codecId: state.codecId,
     });
   };
@@ -529,6 +535,7 @@ export async function readMatroskaFrameTable(reader, options = {}) {
     declaredDuration: state.declaredDurationTicks * state.timestampScaleSeconds,
     videoWidth: state.videoWidth,
     videoHeight: state.videoHeight,
+    pixelAspectRatio: state.pixelAspectRatio,
     codecId: state.codecId,
     decoderConfig,
     // How many frames went out through onFramesCertified. The rest are in
@@ -652,11 +659,32 @@ async function readMatroskaTracks(cursor, end, state) {
   }
 }
 
+// DisplayUnit 4 is "unknown": the DisplayWidth/DisplayHeight pair then states
+// no shape at all. Units 0 (pixels), 1 (centimeters), 2 (inches) and 3 (a bare
+// aspect ratio) all make DisplayWidth ÷ DisplayHeight the picture's shape.
+const MATROSKA_DISPLAY_UNIT_UNKNOWN = 4;
+
+// Width ÷ height of one stored pixel, from a track's Video element. Matroska
+// says it indirectly: PixelWidth × PixelHeight is what is stored and
+// DisplayWidth × DisplayHeight the shape to show it at, each display field
+// defaulting to its pixel counterpart when absent (so a track that states
+// neither is square). PixelCrop is not applied — the engine presents the whole
+// stored frame — so the ratio is taken against the uncropped pixel counts.
+export function matroskaPixelAspectRatio(
+  pixelWidth, pixelHeight, displayWidth, displayHeight, displayUnit = 0) {
+  if (!(pixelWidth > 0) || !(pixelHeight > 0)) return 1;
+  if (displayUnit === MATROSKA_DISPLAY_UNIT_UNKNOWN) return 1;
+  const shownWidth = displayWidth > 0 ? displayWidth : pixelWidth;
+  const shownHeight = displayHeight > 0 ? displayHeight : pixelHeight;
+  return (shownWidth / shownHeight) / (pixelWidth / pixelHeight);
+}
+
 // Take the first video track, and only if it is a video track: a WebM whose
 // first TrackEntry is audio must not have its audio packets counted as frames.
 async function readMatroskaTrackEntry(cursor, end, state) {
   let trackNumber = null, trackType = null;
   let defaultDuration = 0, width = 0, height = 0;
+  let displayWidth = 0, displayHeight = 0, displayUnit = 0;
   let codecId = '', codecPrivate = null;
 
   while (cursor.position < end && !cursor.atEnd) {
@@ -680,6 +708,9 @@ async function readMatroskaTrackEntry(cursor, end, state) {
         const videoContentStart = cursor.position;
         if (videoId === EBML_ID.pixelWidth) width = await readEbmlUnsigned(cursor, videoSize);
         else if (videoId === EBML_ID.pixelHeight) height = await readEbmlUnsigned(cursor, videoSize);
+        else if (videoId === EBML_ID.displayWidth) displayWidth = await readEbmlUnsigned(cursor, videoSize);
+        else if (videoId === EBML_ID.displayHeight) displayHeight = await readEbmlUnsigned(cursor, videoSize);
+        else if (videoId === EBML_ID.displayUnit) displayUnit = await readEbmlUnsigned(cursor, videoSize);
         cursor.position = videoContentStart + videoSize;
       }
     }
@@ -691,6 +722,8 @@ async function readMatroskaTrackEntry(cursor, end, state) {
   state.defaultFrameDuration = defaultDuration;
   state.videoWidth = width;
   state.videoHeight = height;
+  state.pixelAspectRatio = matroskaPixelAspectRatio(
+    width, height, displayWidth, displayHeight, displayUnit);
   state.codecId = codecId;
   state.codecPrivate = codecPrivate;
   // Read once, here, because it has to be known before the first block is

@@ -39,7 +39,10 @@
 //    carry timestamps alone, which would pin a cached clip to the <video> tier
 //    forever while a freshly built index of the same file plays through
 //    WebCodecs. A miss and a rebuild is the honest answer.
-export const INDEX_CACHE_SCHEMA_VERSION = 2;
+// 3: indexes gained pixelAspectRatio. A version 2 entry for an anamorphic clip
+//    has no record of its pixel shape, and hydrating it would quietly present
+//    the clip stretched until the entry happened to be evicted.
+export const INDEX_CACHE_SCHEMA_VERSION = 3;
 
 const DATABASE_NAME = 'exact-video-engine-index-cache';
 const DATABASE_VERSION = 1;
@@ -284,6 +287,7 @@ export function serializeContainerIndex(index) {
     rotation: index.rotation,
     videoWidth: index.videoWidth,
     videoHeight: index.videoHeight,
+    pixelAspectRatio: index.pixelAspectRatio,
     numFrames: index.numFrames,
     duration: index.duration,
     trimmedByEditList: index.trimmedByEditList,
@@ -319,6 +323,7 @@ export function hydrateContainerIndex(index, payload) {
   index.rotation = payload.rotation;
   index.videoWidth = payload.videoWidth;
   index.videoHeight = payload.videoHeight;
+  index.pixelAspectRatio = payload.pixelAspectRatio;
   index.numFrames = payload.numFrames;
   index.duration = payload.duration;
   index.trimmedByEditList = !!payload.trimmedByEditList;

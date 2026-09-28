@@ -344,8 +344,15 @@ export class ContainerIndex extends EventTarget {
     // for containers whose samples are already length-prefixed (ISOBMFF).
     this.samplesAreAnnexB = false;
     this.rotation = 0;               // 0/90/180/270
-    this.videoWidth = 0;             // upright display dimensions (rotation applied)
+    this.videoWidth = 0;             // upright stored-pixel dimensions (rotation applied)
     this.videoHeight = 0;
+    // Width ÷ height of one upright stored pixel as the container says it should
+    // be shown. 1 for square pixels (the ordinary case); an anamorphic clip —
+    // HandBrake's "automatic anamorphic" output, DV, some broadcast masters —
+    // stores fewer or more columns than it displays. videoWidth/videoHeight stay
+    // the STORED pixel counts either way, so frame pixels are addressed exactly;
+    // the picture is shown videoWidth × pixelAspectRatio wide.
+    this.pixelAspectRatio = 1;
     this.numFrames = 0;
     this.duration = 0;               // seconds (sum of real frame durations)
     // True when a trimming edit list excluded samples from the display tables
@@ -657,13 +664,18 @@ export class ContainerIndex extends EventTarget {
     // Display geometry. Phone clips are commonly coded landscape with a 90°
     // track rotation matrix; a <video> tag applies it but VideoDecoder does
     // not, so VideoEngine's presentation (and any consumer annotating over the
-    // video) must. videoWidth/videoHeight are the upright *display* dimensions
-    // — axes swapped relative to the coded frame when rotation is 90/270 — and
-    // mean the same thing in both engines.
+    // video) must. videoWidth/videoHeight are the upright stored-pixel
+    // dimensions — axes swapped relative to the coded frame when rotation is
+    // 90/270 — and mean the same thing in both engines. They count stored
+    // pixels even for an anamorphic clip; pixelAspectRatio says how to show them.
     this.rotation = this._trackRotation(videoTrack);
     const swapAxes = this.rotation === 90 || this.rotation === 270;
     this.videoWidth = swapAxes ? videoTrack.video.height : videoTrack.video.width;
     this.videoHeight = swapAxes ? videoTrack.video.width : videoTrack.video.height;
+    // The sample entry's pixel shape is in coded orientation; a pixel turned on
+    // its side is as much taller than wide as it was wider than tall.
+    const codedPixelAspectRatio = this._samplePixelAspectRatio(file, videoTrack.id);
+    this.pixelAspectRatio = swapAxes ? 1 / codedPixelAspectRatio : codedPixelAspectRatio;
     this.containerFormat = 'isobmff';
     const editWindow = this._editListWindow(videoTrack);
 
@@ -860,6 +872,7 @@ export class ContainerIndex extends EventTarget {
     this.containerFormat = 'ogg';
     this.videoWidth = table.videoWidth;
     this.videoHeight = table.videoHeight;
+    this.pixelAspectRatio = table.pixelAspectRatio || 1;
     // Ogg carries no display rotation matrix (and the <video> element applies
     // none either, so the two agree).
     this.rotation = 0;
@@ -980,6 +993,7 @@ export class ContainerIndex extends EventTarget {
       this.containerFormat = 'matroska';
       this.videoWidth = track.videoWidth;
       this.videoHeight = track.videoHeight;
+      this.pixelAspectRatio = track.pixelAspectRatio || 1;
       // Matroska carries no display rotation matrix (the element applies none
       // either, so the two agree).
       this.rotation = 0;
@@ -1048,6 +1062,7 @@ export class ContainerIndex extends EventTarget {
       declaredDuration: table.declaredDuration,
       videoWidth: table.videoWidth,
       videoHeight: table.videoHeight,
+      pixelAspectRatio: table.pixelAspectRatio,
     });
     extend(table.frames.slice(table.certifiedFrameCount));
     placeFinalFrame();
@@ -1134,6 +1149,19 @@ export class ContainerIndex extends EventTarget {
       }
     }
     return undefined;   // VP8/VP9/AV1 may legitimately carry no description
+  }
+
+  // Width ÷ height of one coded pixel, from the sample entry's `pasp` box
+  // (hSpacing:vSpacing), or 1 when there is none. The box is where MP4/MOV
+  // writers — ffmpeg, HandBrake, cameras — put an anamorphic clip's pixel
+  // shape, and what a <video> element honors. A box with a zero in it states
+  // nothing, so it reads as square rather than as a degenerate ratio.
+  _samplePixelAspectRatio(file, trackId) {
+    const trak = file.getTrackById(trackId);
+    const entry = trak && trak.mdia && trak.mdia.minf.stbl.stsd.entries[0];
+    const pasp = entry && entry.pasp;
+    if (!pasp || !(pasp.hSpacing > 0) || !(pasp.vSpacing > 0)) return 1;
+    return pasp.hSpacing / pasp.vSpacing;
   }
 
   // The track's display rotation in degrees (0/90/180/270), read from the

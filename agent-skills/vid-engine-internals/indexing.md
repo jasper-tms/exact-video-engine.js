@@ -129,6 +129,33 @@ decoder handed one would fail or decode half a picture.
 marker (WebCodecs registers none), meaning exactly "each frame is a whole
 JPEG image".
 
+## Pixel shape (anamorphic clips)
+
+Every index also records `pixelAspectRatio`: width ÷ height of one upright
+stored pixel, 1 unless the clip is anamorphic. `videoWidth`/`videoHeight`
+always count *stored* pixels, so a coordinate names one real pixel of the
+file; the pixel shape says how wide to show them. Per container:
+
+- **MP4/MOV**: the sample entry's `pasp` box (`hSpacing / vSpacing`), which is
+  where ffmpeg, HandBrake and cameras write it. Absent, or with a zero in it,
+  means square. The codec bitstream's own aspect-ratio field (H.264/HEVC VUI)
+  is *not* read as a fallback. Every muxer seen so far writes `pasp` whenever
+  the bitstream has a shape, so a clip carrying it only in the bitstream is
+  unmet, not unhandled on purpose.
+- **WebM/MKV**: `(DisplayWidth ÷ DisplayHeight) ÷ (PixelWidth ÷ PixelHeight)`,
+  each display field defaulting to its pixel counterpart. DisplayUnit 4
+  ("unknown") states no shape. PixelCrop is not applied, matching the engine
+  presenting the whole stored frame.
+- **Ogg/Theora**: the identification header's `PARN:PARD`; zero means square.
+- **AVI**: always 1 (its `vprp` chunk is not read).
+
+A 90°/270° rotation turns the pixel with the picture, so the upright ratio is
+the reciprocal of the coded one. A `<video>` element's `videoWidth` and
+`videoHeight` already fold the shape in, and browsers disagree on which axis
+they rescale: Chromium and Firefox report a 320×180 clip of 1:2 pixels as
+320×360, WebKit as 160×180. That is why `NativeVideoEngine` answers
+dimensions from the index, not the element.
+
 ## The index cache
 
 A full-file indexing pass (Matroska, fragmented MP4, Ogg) is paid once per

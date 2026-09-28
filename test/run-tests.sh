@@ -22,7 +22,8 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-mjpeg.avi ] \
         || [ ! -f test/clips/counter-mjpeg.mov ] \
         || [ ! -f test/clips/corrupt-pure-garbage.bin ] \
-        || [ ! -f test/clips/hd-long.mp4 ]; then
+        || [ ! -f test/clips/hd-long.mp4 ] \
+        || [ ! -f test/clips/anamorphic.webm ]; then
     bash test/make-test-clips.sh
 fi
 # The Ogg fixtures need an ffmpeg with libtheora, which not every machine has;
@@ -77,6 +78,7 @@ status=0
 for browser in chromium webkit firefox; do
     echo "=== correctness core: $browser ==="
     TEST_BROWSER="$browser" node test/rotation-test.mjs || status=1
+    TEST_BROWSER="$browser" node test/pixel-aspect-test.mjs || status=1
     TEST_BROWSER="$browser" node test/frame-index-test.mjs || status=1
     TEST_BROWSER="$browser" node test/display-test.mjs || status=1
     TEST_BROWSER="$browser" node test/offscreen-test.mjs || status=1

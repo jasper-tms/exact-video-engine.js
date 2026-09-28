@@ -521,7 +521,10 @@ function awaitPriorityReadsQuiet() {
 //    carry timestamps alone, which would pin a cached clip to the <video> tier
 //    forever while a freshly built index of the same file plays through
 //    WebCodecs. A miss and a rebuild is the honest answer.
-const INDEX_CACHE_SCHEMA_VERSION = 2;
+// 3: indexes gained pixelAspectRatio. A version 2 entry for an anamorphic clip
+//    has no record of its pixel shape, and hydrating it would quietly present
+//    the clip stretched until the entry happened to be evicted.
+const INDEX_CACHE_SCHEMA_VERSION = 3;
 
 const DATABASE_NAME = 'exact-video-engine-index-cache';
 const DATABASE_VERSION = 1;
@@ -766,6 +769,7 @@ function serializeContainerIndex(index) {
     rotation: index.rotation,
     videoWidth: index.videoWidth,
     videoHeight: index.videoHeight,
+    pixelAspectRatio: index.pixelAspectRatio,
     numFrames: index.numFrames,
     duration: index.duration,
     trimmedByEditList: index.trimmedByEditList,
@@ -801,6 +805,7 @@ function hydrateContainerIndex(index, payload) {
   index.rotation = payload.rotation;
   index.videoWidth = payload.videoWidth;
   index.videoHeight = payload.videoHeight;
+  index.pixelAspectRatio = payload.pixelAspectRatio;
   index.numFrames = payload.numFrames;
   index.duration = payload.duration;
   index.trimmedByEditList = !!payload.trimmedByEditList;
@@ -1575,6 +1580,9 @@ const EBML_ID = {
   video: 0xE0,
   pixelWidth: 0xB0,
   pixelHeight: 0xBA,
+  displayWidth: 0x54B0,
+  displayHeight: 0x54BA,
+  displayUnit: 0x54B2,
   codecId: 0x86,
   codecPrivate: 0x63A2,
   cluster: 0x1F43B675,
@@ -1793,6 +1801,7 @@ function formatProgress(progress) {
 //     timescale,              // ticks per second (1000 for the default 1 ms scale)
 //     defaultFrameDuration,   // seconds, from DefaultDuration (0 if absent)
 //     videoWidth, videoHeight,
+//     pixelAspectRatio,       // width ÷ height of one stored pixel (1 = square)
 //     codecId,                // Matroska CodecID, e.g. 'V_VP9'
 //     decoderConfig }         // WebCodecs configuration, or null for a codec we
 //                             //   cannot configure (the clip then plays through
@@ -1826,6 +1835,7 @@ async function readMatroskaFrameTable(reader, options = {}) {
     defaultFrameDuration: 0,
     videoWidth: 0,
     videoHeight: 0,
+    pixelAspectRatio: 1,
     codecId: '',
     codecPrivate: null,
     clusterTimestamp: 0,
@@ -1938,6 +1948,7 @@ async function readMatroskaFrameTable(reader, options = {}) {
       declaredDuration: state.declaredDurationTicks * state.timestampScaleSeconds,
       videoWidth: state.videoWidth,
       videoHeight: state.videoHeight,
+      pixelAspectRatio: state.pixelAspectRatio,
       codecId: state.codecId,
     });
   };
@@ -2037,6 +2048,7 @@ async function readMatroskaFrameTable(reader, options = {}) {
     declaredDuration: state.declaredDurationTicks * state.timestampScaleSeconds,
     videoWidth: state.videoWidth,
     videoHeight: state.videoHeight,
+    pixelAspectRatio: state.pixelAspectRatio,
     codecId: state.codecId,
     decoderConfig,
     // How many frames went out through onFramesCertified. The rest are in
@@ -2160,11 +2172,32 @@ async function readMatroskaTracks(cursor, end, state) {
   }
 }
 
+// DisplayUnit 4 is "unknown": the DisplayWidth/DisplayHeight pair then states
+// no shape at all. Units 0 (pixels), 1 (centimeters), 2 (inches) and 3 (a bare
+// aspect ratio) all make DisplayWidth ÷ DisplayHeight the picture's shape.
+const MATROSKA_DISPLAY_UNIT_UNKNOWN = 4;
+
+// Width ÷ height of one stored pixel, from a track's Video element. Matroska
+// says it indirectly: PixelWidth × PixelHeight is what is stored and
+// DisplayWidth × DisplayHeight the shape to show it at, each display field
+// defaulting to its pixel counterpart when absent (so a track that states
+// neither is square). PixelCrop is not applied — the engine presents the whole
+// stored frame — so the ratio is taken against the uncropped pixel counts.
+function matroskaPixelAspectRatio(
+  pixelWidth, pixelHeight, displayWidth, displayHeight, displayUnit = 0) {
+  if (!(pixelWidth > 0) || !(pixelHeight > 0)) return 1;
+  if (displayUnit === MATROSKA_DISPLAY_UNIT_UNKNOWN) return 1;
+  const shownWidth = displayWidth > 0 ? displayWidth : pixelWidth;
+  const shownHeight = displayHeight > 0 ? displayHeight : pixelHeight;
+  return (shownWidth / shownHeight) / (pixelWidth / pixelHeight);
+}
+
 // Take the first video track, and only if it is a video track: a WebM whose
 // first TrackEntry is audio must not have its audio packets counted as frames.
 async function readMatroskaTrackEntry(cursor, end, state) {
   let trackNumber = null, trackType = null;
   let defaultDuration = 0, width = 0, height = 0;
+  let displayWidth = 0, displayHeight = 0, displayUnit = 0;
   let codecId = '', codecPrivate = null;
 
   while (cursor.position < end && !cursor.atEnd) {
@@ -2188,6 +2221,9 @@ async function readMatroskaTrackEntry(cursor, end, state) {
         const videoContentStart = cursor.position;
         if (videoId === EBML_ID.pixelWidth) width = await readEbmlUnsigned(cursor, videoSize);
         else if (videoId === EBML_ID.pixelHeight) height = await readEbmlUnsigned(cursor, videoSize);
+        else if (videoId === EBML_ID.displayWidth) displayWidth = await readEbmlUnsigned(cursor, videoSize);
+        else if (videoId === EBML_ID.displayHeight) displayHeight = await readEbmlUnsigned(cursor, videoSize);
+        else if (videoId === EBML_ID.displayUnit) displayUnit = await readEbmlUnsigned(cursor, videoSize);
         cursor.position = videoContentStart + videoSize;
       }
     }
@@ -2199,6 +2235,8 @@ async function readMatroskaTrackEntry(cursor, end, state) {
   state.defaultFrameDuration = defaultDuration;
   state.videoWidth = width;
   state.videoHeight = height;
+  state.pixelAspectRatio = matroskaPixelAspectRatio(
+    width, height, displayWidth, displayHeight, displayUnit);
   state.codecId = codecId;
   state.codecPrivate = codecPrivate;
   // Read once, here, because it has to be known before the first block is
@@ -2649,8 +2687,12 @@ function parseTheoraIdentificationHeader(bytes) {
   // timeline does not care where the picture sits, only how big it is.
   const frameRateNumerator = readBigEndian(bytes, 22, 4);      // FRN
   const frameRateDenominator = readBigEndian(bytes, 26, 4);    // FRD
-  // bytes[30..32] PARN, bytes[33..35] PARD (pixel aspect ratio), bytes[36] CS
-  // (colorspace), bytes[37..39] NOMBR (nominal bitrate) — none affect timing.
+  // PARN:PARD is the pixel aspect ratio, width to height of one pixel. Either
+  // being zero means the encoder did not say, which Theora defines as square.
+  const pixelAspectNumerator = readBigEndian(bytes, 30, 3);    // PARN (24-bit)
+  const pixelAspectDenominator = readBigEndian(bytes, 33, 3);  // PARD (24-bit)
+  // bytes[36] CS (colorspace), bytes[37..39] NOMBR (nominal bitrate) — neither
+  // affects timing or geometry.
 
   // The last two bytes pack four fields, read most-significant-bit first across
   // the 16-bit big-endian value: QUAL(6) KFGSHIFT(5) PF(2) Res(3). Only the
@@ -2673,6 +2715,8 @@ function parseTheoraIdentificationHeader(bytes) {
     // frame size only when a header leaves the picture dimensions at zero.
     videoWidth: pictureWidth || frameWidthMacroblocks * 16,
     videoHeight: pictureHeight || frameHeightMacroblocks * 16,
+    pixelAspectRatio: (pixelAspectNumerator > 0 && pixelAspectDenominator > 0)
+      ? pixelAspectNumerator / pixelAspectDenominator : 1,
   };
 }
 
@@ -2708,7 +2752,7 @@ function granuleToFrameCount(granulePosition, keyframeGranuleShift, versionRevis
 //   options.chunkBytes           refill/progress granularity (default 1 MB)
 //
 // Returns {presentationTimes (seconds, presentation order, first frame at t = 0),
-// defaultFrameDuration (seconds), videoWidth, videoHeight}. Throws
+// defaultFrameDuration (seconds), videoWidth, videoHeight, pixelAspectRatio}. Throws
 // IndexBudgetExceededError when it runs out of budget, and a plain Error when the
 // file is not a single-Theora-stream Ogg we can trust.
 async function readOggFrameTable(reader, options = {}) {
@@ -2809,7 +2853,8 @@ async function readOggFrameTable(reader, options = {}) {
       + `${state.lastGranuleFrameCount} frames, packets say ${videoFrames}`);
   }
 
-  const { frameRateNumerator, frameRateDenominator, videoWidth, videoHeight } = state.header;
+  const { frameRateNumerator, frameRateDenominator, videoWidth, videoHeight,
+    pixelAspectRatio } = state.header;
   const frameDurationSeconds = frameRateDenominator / frameRateNumerator;
   // presentationTimes[n] = n * FRD / FRN. Built from the real per-frame packet
   // count above, not assumed from a declared rate — Theora's constant frame
@@ -2826,6 +2871,7 @@ async function readOggFrameTable(reader, options = {}) {
     defaultFrameDuration: frameDurationSeconds,
     videoWidth,
     videoHeight,
+    pixelAspectRatio,
   };
 }
 
@@ -3976,8 +4022,15 @@ class ContainerIndex extends EventTarget {
     // for containers whose samples are already length-prefixed (ISOBMFF).
     this.samplesAreAnnexB = false;
     this.rotation = 0;               // 0/90/180/270
-    this.videoWidth = 0;             // upright display dimensions (rotation applied)
+    this.videoWidth = 0;             // upright stored-pixel dimensions (rotation applied)
     this.videoHeight = 0;
+    // Width ÷ height of one upright stored pixel as the container says it should
+    // be shown. 1 for square pixels (the ordinary case); an anamorphic clip —
+    // HandBrake's "automatic anamorphic" output, DV, some broadcast masters —
+    // stores fewer or more columns than it displays. videoWidth/videoHeight stay
+    // the STORED pixel counts either way, so frame pixels are addressed exactly;
+    // the picture is shown videoWidth × pixelAspectRatio wide.
+    this.pixelAspectRatio = 1;
     this.numFrames = 0;
     this.duration = 0;               // seconds (sum of real frame durations)
     // True when a trimming edit list excluded samples from the display tables
@@ -4289,13 +4342,18 @@ class ContainerIndex extends EventTarget {
     // Display geometry. Phone clips are commonly coded landscape with a 90°
     // track rotation matrix; a <video> tag applies it but VideoDecoder does
     // not, so VideoEngine's presentation (and any consumer annotating over the
-    // video) must. videoWidth/videoHeight are the upright *display* dimensions
-    // — axes swapped relative to the coded frame when rotation is 90/270 — and
-    // mean the same thing in both engines.
+    // video) must. videoWidth/videoHeight are the upright stored-pixel
+    // dimensions — axes swapped relative to the coded frame when rotation is
+    // 90/270 — and mean the same thing in both engines. They count stored
+    // pixels even for an anamorphic clip; pixelAspectRatio says how to show them.
     this.rotation = this._trackRotation(videoTrack);
     const swapAxes = this.rotation === 90 || this.rotation === 270;
     this.videoWidth = swapAxes ? videoTrack.video.height : videoTrack.video.width;
     this.videoHeight = swapAxes ? videoTrack.video.width : videoTrack.video.height;
+    // The sample entry's pixel shape is in coded orientation; a pixel turned on
+    // its side is as much taller than wide as it was wider than tall.
+    const codedPixelAspectRatio = this._samplePixelAspectRatio(file, videoTrack.id);
+    this.pixelAspectRatio = swapAxes ? 1 / codedPixelAspectRatio : codedPixelAspectRatio;
     this.containerFormat = 'isobmff';
     const editWindow = this._editListWindow(videoTrack);
 
@@ -4492,6 +4550,7 @@ class ContainerIndex extends EventTarget {
     this.containerFormat = 'ogg';
     this.videoWidth = table.videoWidth;
     this.videoHeight = table.videoHeight;
+    this.pixelAspectRatio = table.pixelAspectRatio || 1;
     // Ogg carries no display rotation matrix (and the <video> element applies
     // none either, so the two agree).
     this.rotation = 0;
@@ -4612,6 +4671,7 @@ class ContainerIndex extends EventTarget {
       this.containerFormat = 'matroska';
       this.videoWidth = track.videoWidth;
       this.videoHeight = track.videoHeight;
+      this.pixelAspectRatio = track.pixelAspectRatio || 1;
       // Matroska carries no display rotation matrix (the element applies none
       // either, so the two agree).
       this.rotation = 0;
@@ -4680,6 +4740,7 @@ class ContainerIndex extends EventTarget {
       declaredDuration: table.declaredDuration,
       videoWidth: table.videoWidth,
       videoHeight: table.videoHeight,
+      pixelAspectRatio: table.pixelAspectRatio,
     });
     extend(table.frames.slice(table.certifiedFrameCount));
     placeFinalFrame();
@@ -4766,6 +4827,19 @@ class ContainerIndex extends EventTarget {
       }
     }
     return undefined;   // VP8/VP9/AV1 may legitimately carry no description
+  }
+
+  // Width ÷ height of one coded pixel, from the sample entry's `pasp` box
+  // (hSpacing:vSpacing), or 1 when there is none. The box is where MP4/MOV
+  // writers — ffmpeg, HandBrake, cameras — put an anamorphic clip's pixel
+  // shape, and what a <video> element honors. A box with a zero in it states
+  // nothing, so it reads as square rather than as a degenerate ratio.
+  _samplePixelAspectRatio(file, trackId) {
+    const trak = file.getTrackById(trackId);
+    const entry = trak && trak.mdia && trak.mdia.minf.stbl.stsd.entries[0];
+    const pasp = entry && entry.pasp;
+    if (!pasp || !(pasp.hSpacing > 0) || !(pasp.vSpacing > 0)) return 1;
+    return pasp.hSpacing / pasp.vSpacing;
   }
 
   // The track's display rotation in degrees (0/90/180/270), read from the
@@ -5127,6 +5201,14 @@ class VideoEngine extends EventTarget {
   // displaying exact pixel values (an annotation tool matching source pixels
   // 1:1, say) wants the opposite: pass false to keep every presented frame an
   // exact, uninterpolated blow-up of the decoded one.
+  //
+  // options.applyPixelAspectRatio: true by default — an anamorphic clip (see
+  // pixelAspectRatio) is letterboxed at the shape it is meant to be SEEN at,
+  // as a <video> element shows it. A host that composites the canvas into its
+  // own stored-pixel rectangle and applies the pixel shape itself (an
+  // annotation tool whose coordinates index stored pixels, say) passes false,
+  // and the canvas is letterboxed at the stored-pixel shape instead, so a pane
+  // sized videoWidth × videoHeight is filled one stored pixel per pane pixel.
   constructor(presentationCanvas, options = {}) {
     super();
     this.canvas = presentationCanvas;
@@ -5164,10 +5246,13 @@ class VideoEngine extends EventTarget {
     // Upright display geometry, taken from the container index: the track's
     // rotation metadata (0/90/180/270) and the dimensions consumers should
     // letterbox and annotate against (coded axes swapped when rotation is
-    // 90/270).
+    // 90/270). The dimensions count stored pixels; pixelAspectRatio (width ÷
+    // height of one upright stored pixel, 1 unless the clip is anamorphic) says
+    // what shape to show them at.
     this.rotation = 0;
     this.videoWidth = 0;
     this.videoHeight = 0;
+    this.pixelAspectRatio = 1;
 
     // Decode-order sample table, aliased from the index (the decode driver
     // reads these on every tick).
@@ -5203,6 +5288,7 @@ class VideoEngine extends EventTarget {
     // presentation canvas and the decoder's own frame pool also draw against.
     this._cacheBytes = Math.max(8 << 20, options.cacheBytes ?? (96 << 20));
     this._imageSmoothingEnabled = options.imageSmoothingEnabled ?? true;
+    this._applyPixelAspectRatio = options.applyPixelAspectRatio ?? true;
     // Filled in by _sizeWindows() from _cacheBytes and the clip's frame size.
     this._windowBack = this._wantedWindowBack;
     this._windowAhead = this._wantedWindowAhead;
@@ -5538,6 +5624,7 @@ class VideoEngine extends EventTarget {
     this.rotation = index.rotation;
     this.videoWidth = index.videoWidth;
     this.videoHeight = index.videoHeight;
+    this.pixelAspectRatio = index.pixelAspectRatio || 1;
     this._readIndexTables();
     this._sizeWindows();
 
@@ -5788,9 +5875,16 @@ class VideoEngine extends EventTarget {
     // Downscale oversized frames (e.g. 4K) when caching — display only. Same
     // arithmetic _sizeWindows() budgeted against, so what lands in the cache is
     // the size it was told to expect.
+    //
+    // Sized from the STORED pixels (the visible rectangle), not displayWidth:
+    // a decoder may fold an anamorphic stream's pixel shape into displayWidth,
+    // and createImageBitmap would then resample every column into a stretched
+    // bitmap. Cached bitmaps hold stored pixels one for one; the pixel shape is
+    // applied once, at presentation (_drawBitmap).
+    const storedWidth = frame.visibleRect ? frame.visibleRect.width : frame.displayWidth;
+    const storedHeight = frame.visibleRect ? frame.visibleRect.height : frame.displayHeight;
     let options;
-    const [width, height] =
-      this._cachedBitmapSize(frame.displayWidth, frame.displayHeight);
+    const [width, height] = this._cachedBitmapSize(storedWidth, storedHeight);
     if (width !== frame.displayWidth || height !== frame.displayHeight) {
       options = { resizeWidth: width, resizeHeight: height, resizeQuality: 'medium' };
     }
@@ -6584,7 +6678,9 @@ class VideoEngine extends EventTarget {
     // contain), centered, preserving the source aspect — so a host aligning
     // other elements to the video can compute the same rectangle. The track's
     // display rotation is applied here: cached bitmaps stay in coded
-    // orientation, and the upright (display) aspect drives the letterbox.
+    // orientation, and the upright (display) aspect drives the letterbox. So is
+    // an anamorphic clip's pixel shape, unless the host asked to be handed
+    // stored pixels (applyPixelAspectRatio: false).
     const cw = this.canvas.width, ch = this.canvas.height, ctx = this.context;
     if (!cw || !ch) return;   // pane not laid out yet; resizeCanvas will repaint
     ctx.clearRect(0, 0, cw, ch);
@@ -6596,7 +6692,8 @@ class VideoEngine extends EventTarget {
     const swapAxes = rotation === 90 || rotation === 270;
     const displayW = swapAxes ? bitmap.height : bitmap.width;
     const displayH = swapAxes ? bitmap.width : bitmap.height;
-    const sourceAspect = displayW / displayH, paneAspect = cw / ch;
+    const pixelAspectRatio = this._applyPixelAspectRatio ? (this.pixelAspectRatio || 1) : 1;
+    const sourceAspect = displayW * pixelAspectRatio / displayH, paneAspect = cw / ch;
     let drawWidth, drawHeight;
     if (paneAspect > sourceAspect) { drawHeight = ch; drawWidth = ch * sourceAspect; }
     else { drawWidth = cw; drawHeight = cw / sourceAspect; }
@@ -6870,14 +6967,24 @@ class NativeVideoEngine extends EventTarget {
     return this.duration;
   }
 
-  // Upright display dimensions. The element applies the track's rotation
-  // itself, so these already account for it — the same meaning VideoEngine's
-  // videoWidth/videoHeight carry.
+  // Upright stored-pixel dimensions — the same meaning VideoEngine's
+  // videoWidth/videoHeight carry. Read from the index first: the element's own
+  // videoWidth/videoHeight already account for rotation, but ALSO for an
+  // anamorphic clip's pixel shape (a 1472-wide clip of 0.54-wide pixels reports
+  // 801), which would make the same file's coordinates depend on the tier that
+  // happened to play it. The element is only the fallback for a load without
+  // an index.
   get videoWidth() {
-    return this.video.videoWidth || (this._index ? this._index.videoWidth : 0);
+    return (this._index ? this._index.videoWidth : 0) || this.video.videoWidth;
   }
   get videoHeight() {
-    return this.video.videoHeight || (this._index ? this._index.videoHeight : 0);
+    return (this._index ? this._index.videoHeight : 0) || this.video.videoHeight;
+  }
+
+  // Width ÷ height of one upright stored pixel (1 unless the clip is
+  // anamorphic). The element already shows the clip at this shape.
+  get pixelAspectRatio() {
+    return (this._index && this._index.pixelAspectRatio) || 1;
   }
 
   get duration() {
@@ -7586,6 +7693,12 @@ async function createBestEngine(source, options = {}) {
     // control (the browser resamples its own decoded frames, not us), so this
     // is a no-op on that tier. See the VideoEngine constructor.
     imageSmoothingEnabled,
+    // Passed through to VideoEngine: false letterboxes an anamorphic clip at its
+    // stored-pixel shape rather than its display shape. The <video> element
+    // always shows the display shape, so this is a no-op on that tier; a host
+    // drawing that element into a rectangle of its own choosing gets whatever
+    // shape it draws it at. See the VideoEngine constructor.
+    applyPixelAspectRatio,
     // Passed through to VideoEngine: how far ahead the decode must reach before
     // playback resumes from a buffering hold (seconds; 0 disables the hold). The
     // <video> element buffers on its own clock, so this is a no-op on that tier.
@@ -7746,7 +7859,8 @@ async function createBestEngine(source, options = {}) {
       && canvas && index && index.supportsWebCodecs && decoderIsAvailable) {
     webCodecsWasTried = true;
     const engine = new VideoEngine(canvas,
-      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled, rebufferSeconds });
+      { windowAhead, windowBack, cacheBytes, imageSmoothingEnabled,
+        applyPixelAspectRatio, rebufferSeconds });
     try {
       await engine.load(source, { index });
       return engine;

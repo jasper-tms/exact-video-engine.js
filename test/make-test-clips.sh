@@ -55,6 +55,20 @@ for degrees in 90 180 270; do
         -c copy "clips/rot${degrees}.mp4"
 done
 
+# Anamorphic clips: the same marker picture stored 320x180 but flagged with a
+# 1:2 pixel shape, so it is meant to be SEEN at 160x180. The MP4 carries it in
+# a `pasp` box, the WebM in DisplayWidth/DisplayHeight -- the two container
+# spellings pixel-aspect-test.mjs checks the engine reads. The rotated remux
+# pins that the pixel shape turns with the picture: upright it is 180x320
+# stored pixels, each twice as wide as tall, shown at 360x320.
+ffmpeg -y -loglevel error -f lavfi \
+    -i "color=c=blue:s=320x180:d=1:r=30,drawbox=x=0:y=0:w=160:h=90:color=red:t=fill,setsar=1/2" \
+    -pix_fmt yuv420p -c:v libx264 -g 10 clips/anamorphic.mp4
+ffmpeg -y -loglevel error -display_rotation 90 -i clips/anamorphic.mp4 \
+    -c copy clips/anamorphic-rot90.mp4
+ffmpeg -y -loglevel error -i clips/anamorphic.mp4 \
+    -pix_fmt yuv420p -c:v libvpx-vp9 -g 10 clips/anamorphic.webm
+
 # Near-lossless (-qp 1) rather than lossless (-qp 0), and 8-bit 4:2:0 High
 # profile with no B-frames, because this fixture is decoded three ways in the
 # test suite and two of them are fussy about how it is coded:
