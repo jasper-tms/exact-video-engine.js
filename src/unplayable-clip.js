@@ -56,6 +56,11 @@
 //                               the two want opposite advice, and guessing wrong
 //                               sends someone to re-encode a file whose codec was
 //                               never the problem.
+//   'source-not-readable'       the browser could not read the File's bytes at
+//                               all: it was moved or deleted (sourceErrorName
+//                               'NotFoundError'), or the operating system blocked
+//                               the read (a link into a protected folder, most
+//                               often). Nothing about the clip itself is known.
 export const UNPLAYABLE_REASONS = [
   'container-not-indexable',
   'codec-not-decodable',
@@ -63,12 +68,14 @@ export const UNPLAYABLE_REASONS = [
   'no-fallback-element',
   'no-presented-frame-clock',
   'timeline-unmappable',
+  'source-not-readable',
 ];
 
 export class UnplayableClipError extends Error {
   // `detail` carries whichever of these are known: reason, codec, codecName,
   // containerFormat, numFrames, triedWebCodecs, webCodecsMessage,
-  // nativeErrorCode, nativeErrorMessage, suggestion. Unknown fields are left
+  // nativeErrorCode, nativeErrorMessage, suggestion, sourceErrorName,
+  // sourceErrorMessage. Unknown fields are left
   // absent rather than set to null, so `'codec' in error` means what it says.
   constructor(message, detail = {}) {
     super(message);

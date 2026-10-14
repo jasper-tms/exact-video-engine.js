@@ -164,6 +164,11 @@
 //                               the two want opposite advice, and guessing wrong
 //                               sends someone to re-encode a file whose codec was
 //                               never the problem.
+//   'source-not-readable'       the browser could not read the File's bytes at
+//                               all: it was moved or deleted (sourceErrorName
+//                               'NotFoundError'), or the operating system blocked
+//                               the read (a link into a protected folder, most
+//                               often). Nothing about the clip itself is known.
 const UNPLAYABLE_REASONS = [
   'container-not-indexable',
   'codec-not-decodable',
@@ -171,12 +176,14 @@ const UNPLAYABLE_REASONS = [
   'no-fallback-element',
   'no-presented-frame-clock',
   'timeline-unmappable',
+  'source-not-readable',
 ];
 
 class UnplayableClipError extends Error {
   // `detail` carries whichever of these are known: reason, codec, codecName,
   // containerFormat, numFrames, triedWebCodecs, webCodecsMessage,
-  // nativeErrorCode, nativeErrorMessage, suggestion. Unknown fields are left
+  // nativeErrorCode, nativeErrorMessage, suggestion, sourceErrorName,
+  // sourceErrorMessage. Unknown fields are left
   // absent rather than set to null, so `'codec' in error` means what it says.
   constructor(message, detail = {}) {
     super(message);
@@ -7750,6 +7757,12 @@ async function createBestEngine(source, options = {}) {
     minimumIndexedFramesBeforePlayback = 30,
   } = options;
 
+  // A File the browser cannot read fails every later step too, and the failure
+  // would surface as an unindexable container — advice about formats for a file
+  // whose format was never looked at. One byte up front tells the two apart, and
+  // covers a cached index too, whose hydration never touches the file.
+  if (typeof source !== 'string') await refuseUnreadableSource(source);
+
   let index = (providedIndex !== undefined) ? providedIndex : null;
   // The build error, kept so the refusal below can name what actually went wrong
   // (an unsupported container, mp4box.js absent, or the WebM pass timing out).
@@ -7946,6 +7959,29 @@ async function webCodecsRejectsCodec(decoderConfig) {
     return support.supported !== true;
   } catch {
     return false;   // a config it could not even evaluate proves nothing
+  }
+}
+
+// Throw if the browser will not hand over this File's bytes. A moved or deleted
+// file throws NotFoundError. Anything else (NotReadableError, mostly) means the
+// operating system blocked the read — on macOS, typically a symlink or alias
+// whose target sits in a protected folder such as Dropbox's, since dropping the
+// link grants access to the link and not to what it points at.
+async function refuseUnreadableSource(source) {
+  try {
+    await source.slice(0, 1).arrayBuffer();
+  } catch (error) {
+    const sourceErrorName = (error && error.name) || undefined;
+    const message = (sourceErrorName === 'NotFoundError')
+      ? 'createBestEngine: this file could not be found. It may have been moved, '
+        + 'renamed, or deleted.'
+      : 'createBestEngine: the browser was blocked from reading this file. If it\'s '
+        + 'a link or a shortcut, try loading the original file instead.';
+    throw new UnplayableClipError(message, {
+      reason: 'source-not-readable',
+      sourceErrorName,
+      sourceErrorMessage: (error && error.message) || String(error),
+    });
   }
 }
 

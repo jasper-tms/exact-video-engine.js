@@ -123,6 +123,9 @@ try {
 - `codec-not-decodable` — the container indexed fine but nothing in this
   browser can decode the codec (for example MPEG-4 Part 2 outside Safari, or
   an AVI codec WebCodecs rejects — AVI has no native `<video>` fallback).
+- `decode-failed` — the container indexed and the codec is decodable here,
+  but decoding failed anyway (damaged or truncated frame data). Do not offer a
+  re-encode for this one.
 - `no-fallback-element` — the clip needed the native path but no `<video>`
   element was provided.
 - `no-presented-frame-clock` — the clip must play natively but the browser
@@ -130,10 +133,16 @@ try {
 - `timeline-unmappable` — the container's table disagrees with what the
   element actually presents (a trimming edit list the browser mis-times, a
   truncated file), caught at load.
+- `source-not-readable` — the browser could not read the File at all:
+  `sourceErrorName` is `NotFoundError` if it was moved or deleted, and
+  otherwise (usually `NotReadableError`) the operating system blocked the
+  read, typically for a symlink or alias into a protected folder. The message
+  says which and tells the user what to try.
 
 Alongside `reason`, whichever of these are known: `codec`, `codecName`,
 `containerFormat`, `numFrames`, `triedWebCodecs`, `webCodecsMessage`,
-`nativeErrorCode`, `nativeErrorMessage`, and `suggestion`. A field that is not
+`nativeErrorCode`, `nativeErrorMessage`, `suggestion`, `sourceErrorName`, and
+`sourceErrorMessage`. A field that is not
 known is absent rather than null, so `'codec' in error` means what it says.
 `error.message` is composed by the library and is the same for the same file
 in every browser — show it; log `nativeErrorMessage` (the browser's own text)

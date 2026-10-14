@@ -90,6 +90,30 @@ const CASES = [
     },
   },
 
+  // --- Unreadable source ----------------------------------------------------
+  // A File the browser will not read must be refused as unreadable, not as an
+  // unindexable container: the format advice that reason carries is wrong for
+  // a file whose bytes were never seen. A blocked read and a missing file want
+  // different advice, so the two are pinned separately.
+  {
+    name: 'File whose reads are blocked is refused as unreadable',
+    file: 'counter-cfr.webm', mode: 'auto', query: '&unreadable=NotReadableError',
+    expect: {
+      refused: true, errorMatches: /blocked from reading/i,
+      reason: 'source-not-readable', errorName: 'UnplayableClipError',
+      sourceErrorName: 'NotReadableError',
+    },
+  },
+  {
+    name: 'File deleted after it was picked is refused as unreadable',
+    file: 'counter-cfr.webm', mode: 'auto', query: '&unreadable=NotFoundError',
+    expect: {
+      refused: true, errorMatches: /could not be found/i,
+      reason: 'source-not-readable', errorName: 'UnplayableClipError',
+      sourceErrorName: 'NotFoundError',
+    },
+  },
+
   // --- Soft failure on malformed input -------------------------------------
   // Each of these must settle in bounded time, raise no page error, and end
   // either loaded (graceful fallback) or with a human-readable error. The exact
@@ -128,14 +152,14 @@ const CASES = [
 const browser = await launchBrowser();
 let failures = 0;
 
-async function loadCase(file, mode, indexTimeoutMilliseconds) {
+async function loadCase(file, mode, indexTimeoutMilliseconds, query = '') {
   const page = await browser.newPage();
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(e.message));
   const startedAt = Date.now();
   const timeoutQuery = (indexTimeoutMilliseconds !== undefined)
     ? `&indexTimeoutMs=${indexTimeoutMilliseconds}` : '';
-  await page.goto(`${serverBase}/test/test-robustness.html?file=${file}&mode=${mode}${timeoutQuery}`);
+  await page.goto(`${serverBase}/test/test-robustness.html?file=${file}&mode=${mode}${timeoutQuery}${query}`);
   const settled = await page
     .waitForFunction(() => window.__result || window.__err, { timeout: SETTLE_BUDGET_MILLISECONDS })
     .then(() => true).catch(() => false);
@@ -156,21 +180,21 @@ async function loadCase(file, mode, indexTimeoutMilliseconds) {
 // signature — expected an exact index, got the declared-rate fallback — so a real
 // regression (wrong frames, a hang, a page error) still fails every attempt.
 const MAX_ATTEMPTS = 4;
-async function loadCaseExpectingIndex(file, mode, indexTimeoutMilliseconds, wantsExactIndex) {
-  let loaded = await loadCase(file, mode, indexTimeoutMilliseconds);
+async function loadCaseExpectingIndex(file, mode, indexTimeoutMilliseconds, query, wantsExactIndex) {
+  let loaded = await loadCase(file, mode, indexTimeoutMilliseconds, query);
   let attempts = 1;
   while (wantsExactIndex && attempts < MAX_ATTEMPTS
       && loaded.result
       && (loaded.result.frameIndexIsExact === false || loaded.result.error)) {
     attempts += 1;
-    loaded = await loadCase(file, mode, indexTimeoutMilliseconds);
+    loaded = await loadCase(file, mode, indexTimeoutMilliseconds, query);
   }
   return loaded;
 }
 
-for (const { name, file, mode, indexTimeoutMilliseconds, expect } of CASES) {
+for (const { name, file, mode, indexTimeoutMilliseconds, query, expect } of CASES) {
   const { result, err, settled, elapsed, pageErrors } =
-    await loadCaseExpectingIndex(file, mode, indexTimeoutMilliseconds,
+    await loadCaseExpectingIndex(file, mode, indexTimeoutMilliseconds, query,
       expect.frameIndexIsExact === true);
 
   const problems = [];
@@ -191,6 +215,10 @@ for (const { name, file, mode, indexTimeoutMilliseconds, expect } of CASES) {
     }
     if (expect.reason && result.errorReason !== expect.reason) {
       problems.push(`error reason "${result.errorReason}", wanted "${expect.reason}"`);
+    }
+    if (expect.sourceErrorName && result.errorSourceErrorName !== expect.sourceErrorName) {
+      problems.push(`source error name "${result.errorSourceErrorName}", `
+        + `wanted "${expect.sourceErrorName}"`);
     }
     // A message that must NOT say something. This exists because of a real bug:
     // the first version of the composed refusal blamed the codec for every

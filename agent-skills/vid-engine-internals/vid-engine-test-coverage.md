@@ -171,7 +171,10 @@ suffixes real files carry, `avc1.42E01E` and `avc3.64001f` alike.
 
 Robustness pins that a WebM given no indexing time is refused with a clear
 error, not approximated — and that the refusal arrives machine-readable
-(`errorName`, `reason`), not merely readable. The index cache test pins that
+(`errorName`, `reason`), not merely readable. It also pins that a File whose
+reads reject (`NotReadableError`, `NotFoundError`, simulated with a `Blob`
+subclass) is refused as `source-not-readable`, never as an unindexable
+container. The index cache test pins that
 a cache hit returns identical tables while any doubtful identity (changed
 `lastModified`, an identity-less `Blob`, a wrong schema version) is a miss
 and a rebuild.

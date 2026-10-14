@@ -35,7 +35,20 @@ async function run() {
 
   // A Blob, so the engine reads exactly these bytes and does not depend on the
   // test server's Range handling for a deliberately malformed file.
-  const source = await (await fetch(file)).blob();
+  let source = await (await fetch(file)).blob();
+  // ?unreadable=<DOMException name> stands in for a File the browser may not
+  // read (a symlink into a protected folder, a file deleted after it was
+  // picked): every read of it rejects the way Chromium's does.
+  const unreadableErrorName = params.get('unreadable');
+  if (unreadableErrorName) {
+    class UnreadableBlob extends Blob {
+      slice() {
+        return { arrayBuffer: () => Promise.reject(new DOMException(
+          'The requested file could not be read.', unreadableErrorName)) };
+      }
+    }
+    source = new UnreadableBlob([source]);
+  }
 
   const startedAt = performance.now();
   const result = {
@@ -86,6 +99,7 @@ async function run() {
     result.errorName = err && err.name;
     result.errorReason = err && err.reason;
     result.errorCodec = err && err.codec;
+    result.errorSourceErrorName = err && err.sourceErrorName;
   } finally {
     if (engine && engine.destroy) { try { engine.destroy(); } catch (e) {} }
   }

@@ -21,6 +21,12 @@ skill).
 
 ## Index or refuse
 
+Before any of this, `createBestEngine` reads one byte of a File or Blob
+source. If the browser will not hand it over (moved or deleted, or a read the
+operating system blocked, such as a symlink into a protected folder), the clip
+is refused as `source-not-readable` before indexing, so a cached index cannot
+mask it and the failure is never mistaken for an unindexable container.
+
 One rule: every clip we agree to analyze has a real per-frame
 presentation-timestamp table, read from the container without decoding a
 frame. `createBestEngine` throws — with an error message a host can show —
@@ -60,11 +66,13 @@ Every refusal throws an `UnplayableClipError` (`src/unplayable-clip.js`): an
 `Error` (so existing `catch (error) { show(error.message) }` code keeps
 working) carrying machine-readable fields. `reason` is one of the exported
 `UNPLAYABLE_REASONS`: `container-not-indexable`, `codec-not-decodable`,
-`no-fallback-element`, `no-presented-frame-clock`, `timeline-unmappable`.
+`decode-failed`, `no-fallback-element`, `no-presented-frame-clock`,
+`timeline-unmappable`, `source-not-readable`.
 Alongside it, whichever are known: `codec`, `codecName` (via
 `describeCodec()`, exported for hosts writing their own wording),
 `containerFormat`, `numFrames`, `triedWebCodecs`, `webCodecsMessage`,
-`nativeErrorCode`, `nativeErrorMessage`, and `suggestion`. A field that is not
+`nativeErrorCode`, `nativeErrorMessage`, `suggestion`, `sourceErrorName`, and
+`sourceErrorMessage`. A field that is not
 known is absent rather than null, so `'codec' in error` means what it says.
 
 Two rules about how the message is built:
