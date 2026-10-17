@@ -306,6 +306,43 @@ function isTenBitHevc(codecString) {
 function webCodecsMayFailMidStream(codecString, browserEngine) {
   return browserEngine === 'webkit' && isTenBitHevc(codecString);
 }
+
+// Is this codec string H.264 (avc1, or avc3 with in-band parameter sets)?
+function isH264(codecString) {
+  return /^avc[13]\./i.test(codecString || '');
+}
+
+// Must an H.264 decode run on this browser engine begin at an IDR frame, rather
+// than at any keyframe the container marks? An open-GOP H.264 stream (x264's
+// --open-gop, many broadcast and disc encodes) marks non-IDR I frames as
+// keyframes: recovery points, which the spec lets a decoder start from. Blink's
+// decoder (hardware and software alike) does not: the P frames after such an I
+// frame carry reference-list and memory-management commands that name pictures
+// from the previous group, and it fails fatally on them, where WebKit and Gecko
+// ignore them and decode correctly. Its <video> element fails the same seek too,
+// so there is no tier to route to; the only exact answer there is to decode
+// forward from the nearest IDR frame, however far back it is.
+function h264RunsMustStartAtIdr(browserEngine) {
+  return browserEngine === 'blink';
+}
+
+// Does this H.264 access unit, in length-prefixed (AVCC) form, hold an IDR
+// picture? Decided by its first slice NAL unit (type 5 IDR, 1 to 4 non-IDR),
+// skipping the access unit delimiters, parameter sets and SEI that may precede
+// it. An access unit with no slice at all claims nothing, so it counts as IDR,
+// which leaves the engine starting runs where it always did.
+function h264AccessUnitIsIdr(bytes, lengthSize) {
+  let position = 0;
+  while (position + lengthSize < bytes.length) {
+    let nalLength = 0;
+    for (let b = 0; b < lengthSize; b++) nalLength = nalLength * 256 + bytes[position + b];
+    const nalType = bytes[position + lengthSize] & 0x1F;
+    if (nalType === 5) return true;
+    if (nalType >= 1 && nalType <= 4) return false;
+    position += lengthSize + nalLength;
+  }
+  return true;
+}
 // Random-access byte readers used to feed mp4box (the moov index) and to fetch
 // encoded samples per GOP on demand — only the bytes actually needed are read.
 // URLs go over HTTP Range (the server must answer 206); local Files use
@@ -5115,6 +5152,11 @@ const DECODER_PIPELINE_SLACK = 8;
 // prefetched behind it (_prefetchDepth) — 16 MB.
 const MAX_BLOCK = 1 << 22;   // 4 MB
 const MIN_BLOCK = 1 << 18;   // 256 KB
+// How many frames back from its target a decode run may have to start before
+// the engine warns, once, that seeking this clip will be slow. Only reached
+// where runs must begin at an IDR frame and the clip has few (see
+// h264RunsMustStartAtIdr); several seconds of frames at typical rates.
+const DISTANT_RUN_START_FRAMES = 300;
 // How long a paused playhead must sit still before the viewer counts as having
 // LANDED somewhere rather than scrubbing through it (see update).
 const SETTLE_MILLISECONDS = 500;
@@ -5244,6 +5286,16 @@ class VideoEngine extends EventTarget {
     // configured in AVCC mode — will accept them. False for ISOBMFF, whose
     // samples are already AVCC. Set from the index in _adoptIndex.
     this._annexBSamples = false;
+    // True when a decode run may begin only at an IDR frame, not at any keyframe
+    // (H.264 on Blink; see h264RunsMustStartAtIdr). Keyframes are then
+    // classified lazily, by the decode driver, the first time a run would start
+    // at one: those checked, and of those, the ones that are not IDR, which
+    // _decodeRunStartFor steps back over. Kept on the engine rather than in the
+    // index's keyframe table, which the index cache shares. Set in _adoptIndex.
+    this._runsMustStartAtIdr = false;
+    this._keyframesCheckedForIdr = new Set();
+    this._keyframesThatCannotStartRun = new Set();
+    this._warnedAboutDistantRunStart = false;
     // True once the VideoDecoder has reported an unrecoverable error (see
     // _decoderFailed) or the source's bytes can no longer be read (see
     // _sourceReadFailed); cleared by load()/_teardown().
@@ -5627,6 +5679,11 @@ class VideoEngine extends EventTarget {
     this._reorderDepth = Math.max(MINIMUM_REORDER_DEPTH,
       this._declaredReorderDepth + DECODER_PIPELINE_SLACK);
     this._annexBSamples = !!index.samplesAreAnnexB;
+    this._runsMustStartAtIdr = !!index.decoderConfig && isH264(index.decoderConfig.codec)
+      && h264RunsMustStartAtIdr(detectBrowserEngine());
+    this._keyframesCheckedForIdr = new Set();
+    this._keyframesThatCannotStartRun = new Set();
+    this._warnedAboutDistantRunStart = false;
     this._timescale = index.timescale;
     this.rotation = index.rotation;
     this.videoWidth = index.videoWidth;
@@ -5795,6 +5852,42 @@ class VideoEngine extends EventTarget {
     return ans;
   }
 
+  // The keyframe a decode run must start from for sample decodeIndex to come
+  // out of the decoder. Usually the nearest keyframe before it in decode order,
+  // but not in an open-GOP stream (every iPhone HEVC clip): there, each keyframe
+  // after the first is a recovery point (an HEVC CRA, or an H.264 non-IDR I
+  // frame) followed in decode order by "leading" frames that DISPLAY before it
+  // and predict from the previous GOP. A run started at that keyframe has no
+  // previous GOP, so the decoder drops those frames by design, and the target
+  // never surfaces (the driver retries, then holds the frame forever). A frame
+  // that displays earlier than its keyframe is such a leading frame, so start one
+  // GOP further back, where its references get decoded on the way.
+  //
+  // Where a run must begin at an IDR frame (see _runsMustStartAtIdr), keyframes
+  // the decode driver has found are not IDR are stepped back over too. Until it
+  // has looked at a keyframe this answers as if it were IDR, which only the
+  // driver acts on, and it looks before starting any run there; the synchronous
+  // callers (_keepRanges, _prefetchLoopOrigin) at worst keep or warm the wrong
+  // range once.
+  _decodeRunStartFor(decodeIndex) {
+    const targetTime = this._samples[decodeIndex].cts;
+    let keyframe = this._keyframeForDecode(decodeIndex);
+    while (keyframe > 0 && (targetTime < this._samples[keyframe].cts
+        || this._keyframesThatCannotStartRun.has(keyframe))) {
+      keyframe = this._keyframeForDecode(keyframe - 1);
+    }
+    return keyframe;
+  }
+
+  // Whether sample decodeIndex is a leading frame of the keyframe the current
+  // decode run started from: in that keyframe's group, but displayed before it.
+  _isLeadingFrameOfRunKeyframe(decodeIndex) {
+    const runKeyframe = this._runKeyframe;
+    return decodeIndex > runKeyframe
+      && this._samples[decodeIndex].cts < this._samples[runKeyframe].cts
+      && this._keyframeForDecode(decodeIndex) === runKeyframe;
+  }
+
   // The frames worth keeping sit around the playhead AND around whatever frame
   // the decode driver is currently steering toward. Those are usually the same
   // number: a seek moves the playhead and the target together, and playback
@@ -5816,13 +5909,13 @@ class VideoEngine extends EventTarget {
   // Display index of the keyframe that begins displayIndex's GOP: the frame a
   // backward step can retreat to without crossing into the previous GOP, and so
   // without forcing a re-decode. The keyframe is known in DECODE order
-  // (_keyframeForDecode); its display index is recovered through the same
+  // (_decodeRunStartFor); its display index is recovered through the same
   // timestamp→display map the decoder output uses (microsToDisplay is keyed by
   // round(cts * 1e6 / timescale), matching the chunk timestamps we feed).
   _keyframeDisplayFor(displayIndex) {
     const decodeIndex = this._displayToDecode[displayIndex];
     if (decodeIndex === undefined) return displayIndex;
-    const keyframeSample = this._samples[this._keyframeForDecode(decodeIndex)];
+    const keyframeSample = this._samples[this._decodeRunStartFor(decodeIndex)];
     const keyframeDisplay = this._microsToDisplay.get(
       Math.round(keyframeSample.cts * 1e6 / this._timescale));
     return keyframeDisplay === undefined ? displayIndex : keyframeDisplay;
@@ -5981,7 +6074,7 @@ class VideoEngine extends EventTarget {
       while (this._videoDecoder) {
         const target = this._target;
         const targetDecode = this._displayToDecode[target];
-        const keyframe = this._keyframeForDecode(targetDecode);
+        const keyframe = this._decodeRunStartFor(targetDecode);
         // Read-ahead goal in decode-index terms: enough to also produce the
         // frames ahead of the target (so playback doesn't stall every frame).
         // A decoder releases a frame only once the samples that may reorder
@@ -6013,6 +6106,37 @@ class VideoEngine extends EventTarget {
         if (haveTarget && target === this._restartTarget) {
           this._restartTarget = -1;
           this._restartCount = 0;
+        }
+
+        // Before the first run that would start at a keyframe where runs must
+        // begin at an IDR frame, read that keyframe (its bytes are needed to
+        // decode it anyway) and look. One that is not IDR is recorded, and the
+        // loop recomputes, stepping back over it to an earlier keyframe.
+        if (this._runKeyframe !== keyframe && this._runsMustStartAtIdr && keyframe > 0
+            && !this._keyframesCheckedForIdr.has(keyframe)) {
+          const sample = this._samples[keyframe];
+          await this._ensureBytes(sample.offset, sample.size, sample.size);
+          if (!this._videoDecoder) continue;
+          const bytes = this._annexBSamples
+            ? convertAnnexBToAvcc(this._sliceSample(keyframe)) : this._sliceSample(keyframe);
+          this._keyframesCheckedForIdr.add(keyframe);
+          if (!h264AccessUnitIsIdr(bytes, this._avccLengthSize())) {
+            this._keyframesThatCannotStartRun.add(keyframe);
+          }
+          continue;
+        }
+        // Warn only once a keyframe has been stepped over: a long CLOSED group of
+        // pictures puts its run start just as far back, through no fault of the
+        // browser, and has nothing to say about it.
+        if (this._runsMustStartAtIdr && !this._warnedAboutDistantRunStart
+            && this._keyframesThatCannotStartRun.size > 0
+            && targetDecode - keyframe > DISTANT_RUN_START_FRAMES) {
+          this._warnedAboutDistantRunStart = true;
+          console.warn(`VideoEngine: this browser can begin decoding this H.264 clip `
+            + `only at an IDR frame, and some of its keyframes are not IDR frames (an `
+            + `open-GOP stream), so reaching frame ${target} means decoding the `
+            + `${targetDecode - keyframe} frames before it. Seeking will be slow; `
+            + `re-encoding with closed GOPs, or opening it in Safari or Firefox, avoids this.`);
         }
 
         // Hard restart when the target lives in a different GOP than the current
@@ -6049,6 +6173,13 @@ class VideoEngine extends EventTarget {
           if (this._videoDecoder.decodeQueueSize > 4) { await this._sleep(0); continue; }
           const k = this._fedThrough + 1;
           const s = this._samples[k];
+          // The run's own keyframe's leading frames (see _decodeRunStartFor)
+          // predict from a group this run never decoded. An HEVC decoder drops
+          // them quietly, but WebKit's and Firefox's H.264 decoders die on them,
+          // fatally. Skip them, as the HEVC decoder would: nothing displayed after
+          // the keyframe depends on them, and a target among them starts its run
+          // a group back.
+          if (this._isLeadingFrameOfRunKeyframe(k)) { this._fedThrough = k; continue; }
           // While the viewer is waiting to LAND on a frame -- the first frame of
           // the clip, a paused seek or step, the first read after a seek during
           // playback -- every byte fetched beyond the ones that frame depends on
@@ -6328,7 +6459,7 @@ class VideoEngine extends EventTarget {
     if (this._cache.has(originFrame)) return;
     const decodeIndex = this._displayToDecode[originFrame];
     if (decodeIndex === undefined) return;
-    const sample = this._samples[this._keyframeForDecode(decodeIndex)];
+    const sample = this._samples[this._decodeRunStartFor(decodeIndex)];
     if (!sample) return;
     // Already in the read-ahead buffer, or already armed for this origin.
     if (this._bufferHolding(sample.offset, sample.size)) return;
@@ -6374,6 +6505,17 @@ class VideoEngine extends EventTarget {
       return stitched;
     }
     return null;
+  }
+  // Bytes in each NAL unit's length prefix: the avcC description's
+  // lengthSizeMinusOne + 1, or 4 for samples converted from Annex B (which
+  // convertAnnexBToAvcc always writes with 4-byte lengths).
+  _avccLengthSize() {
+    const description = this._decoderConfig && this._decoderConfig.description;
+    if (this._annexBSamples || !description) return 4;
+    const bytes = ArrayBuffer.isView(description)
+      ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+      : new Uint8Array(description);
+    return (bytes[4] & 0x03) + 1;
   }
   _sliceSample(k) {
     const s = this._samples[k];

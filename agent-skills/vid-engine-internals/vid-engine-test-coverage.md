@@ -135,6 +135,28 @@ is never reported presented there. Neither is fixable from this side — pausing
 across the wrap seek, and aiming at the frame's start rather than its midpoint,
 were both tried and only fix Firefox — and WebKit lands exactly on both counts.
 
+## Open GOP
+
+Pins that a COLD seek lands on every frame of an open-GOP clip, on the
+WebCodecs tier of all three browsers. `counter-open-gop.mp4` is two x264
+`--open-gop` encodes joined end to end (x264 writes an IDR frame only at the
+start of an encode), so it has IDR frames at display frames 0 and 10, a non-IDR
+recovery point at 20, and frame 19 as that recovery point's leading frame:
+after it in decode order, before it on screen, predicting from the group before.
+
+The page builds a fresh engine per frame and seeks straight to it, because a
+walk in order (as the frame-index test does) decodes the leading frame on the
+way and never sees the failure. It checks three things, each of which broke
+before v2.9.2: a run for a leading frame starts a group back (the run at its
+own keyframe cannot produce it, and the driver used to hold forever); the
+run's own keyframe's leading frames are not fed (WebKit's and Firefox's H.264
+decoders die on them, fatally); and on Chromium, whose H.264 decoder cannot
+start at a recovery point at all, a cold seek to 25 begins at the IDR frame at
+10, not at the recovery point at 20 and not all the way back at 0. The page
+also reads the leading frames out of the engine's own sample table, so a
+re-encode that loses the open-GOP shape fails loudly instead of passing
+without testing anything.
+
 ## Matroska table (plain Node)
 
 Checks the half of the index a browser walk cannot see: that every frame's

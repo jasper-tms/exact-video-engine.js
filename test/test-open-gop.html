@@ -1,0 +1,119 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>exact-video-engine open-GOP seek test</title>
+<script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script src="/exact-video-engine.js"></script>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, monospace; background: #12141a;
+         color: #e8eaf0; margin: 16px; }
+  /* Native counter size, like test-frame-index.html, so the bars are not
+     resampled onto other columns and visibleFrame reads them exactly. */
+  #pane { width: 150px; height: 90px; background: #000; }
+  #pane canvas { width: 100%; height: 100%; display: block; }
+  pre { white-space: pre-wrap; }
+</style>
+<div id="pane"><canvas></canvas></div>
+<pre id="report">loading…</pre>
+<script>
+// Can a COLD seek land on every frame of an open-GOP clip? For each frame this
+// page builds a fresh engine and seeks straight to that frame, so nothing about
+// it is already decoded or cached — the way a person typing a frame number into
+// a host's frame box reaches it. Walking the frames in order (as
+// test-frame-index.html does) would not catch the failure: a run that started
+// one group back has already decoded the leading frames by the time it gets
+// there.
+//
+// Query parameters, all optional:
+//   file=counter-open-gop.mp4   clip under test/clips
+//   waitMilliseconds=5000       how long a frame may take to appear before it
+//                               counts as never decoded
+//   prefer=                     passed to createBestEngine (unset: let the
+//                               ladder choose, as a host would)
+const params = new URLSearchParams(location.search);
+const CLIP = params.get('file') || 'counter-open-gop.mp4';
+const WAIT_MILLISECONDS = Number(params.get('waitMilliseconds') || 5000);
+const PREFER = params.get('prefer');
+
+// One 5 px bar per frame across 150 px, so the bar's position is the frame
+// number (identical to test-frame-index.html's reader).
+const BARS_ACROSS = 30;
+function visibleFrame(canvas) {
+  const width = canvas.width, height = canvas.height;
+  const row = canvas.getContext('2d')
+    .getImageData(0, Math.floor(height * 3 / 4), width, 1).data;
+  let sum = 0, count = 0;
+  for (let x = 0; x < width; x++) {
+    if (row[x * 4] > 128) { sum += x; count += 1; }
+  }
+  if (!count) return -1;
+  return Math.floor((sum / count) / (width / BARS_ACROSS));
+}
+
+const probe = document.createElement('canvas');
+probe.width = 150; probe.height = 90;
+const probeContext = probe.getContext('2d');
+
+// The display frames that come after their keyframe in decode order but show
+// before it, read from the engine's own sample table, so the driver can confirm
+// the fixture still has the shape under test rather than passing on a clip with
+// no leading frames at all.
+function displayOf(engine, sample) {
+  return engine._microsToDisplay.get(Math.round(sample.cts * 1e6 / engine._timescale));
+}
+function leadingFramesOf(engine) {
+  const samples = engine._samples, keyframes = engine._keyframeDecodeIndices;
+  const leading = [];
+  let keyframe = -1;
+  samples.forEach((sample, decodeIndex) => {
+    if (keyframes.includes(decodeIndex)) keyframe = decodeIndex;
+    else if (keyframe >= 0 && sample.cts < samples[keyframe].cts) leading.push(displayOf(engine, sample));
+  });
+  return leading.sort((a, b) => a - b);
+}
+
+async function run() {
+  const canvas = document.querySelector('canvas');
+  const clipUrl = new URL('clips/' + CLIP, location.href).href;
+  const rows = [];
+  let frameCount = null, tier = null, leadingFrames = null;
+  for (let frame = 0; frameCount === null || frame < frameCount; frame++) {
+    const engine = await createBestEngine(clipUrl, {
+      canvas,
+      video: document.createElement('video'),
+      ...(PREFER ? { prefer: PREFER } : {}),
+      imageSmoothingEnabled: false,
+    });
+    frameCount = engine.numFrames;
+    tier = engine.tier;
+    // Only the WebCodecs engine keeps a sample table to read them from.
+    if (leadingFrames === null && engine._samples) leadingFrames = leadingFramesOf(engine);
+    engine.loop = false;
+    engine.seekToFrame(frame);
+    // A frame the decoder never produces leaves ensureFrame waiting (the driver
+    // holds rather than rejecting), so bound the wait ourselves.
+    const decoded = await Promise.race([
+      engine.ensureFrame(frame).then(() => true, () => false),
+      new Promise((resolve) => setTimeout(() => resolve(false), WAIT_MILLISECONDS)),
+    ]);
+    engine.update(performance.now());
+    probeContext.drawImage(engine.tier === 'webcodecs' ? canvas : engine.video,
+      0, 0, probe.width, probe.height);
+    // The display frame of the keyframe the decode run began at, so the driver
+    // can check a run steps back no further than it must.
+    const runStartFrame = engine._samples && engine._runKeyframe >= 0
+      ? displayOf(engine, engine._samples[engine._runKeyframe]) : null;
+    rows.push({ frame, decoded, presentedFrame: engine.presentedFrame, runStartFrame,
+                visible: decoded ? visibleFrame(probe) : -1 });
+    engine.destroy();
+  }
+  return { tier, frameCount, leadingFrames, rows };
+}
+
+run().then((result) => {
+  window.__result = result;
+  document.getElementById('report').textContent = JSON.stringify(result, null, 1);
+}, (error) => {
+  window.__err = String(error && error.stack || error);
+  document.getElementById('report').textContent = window.__err;
+});
+</script>

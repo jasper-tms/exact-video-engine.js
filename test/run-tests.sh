@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.."
 
 if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-single-gop.mp4 ] \
+        || [ ! -f test/clips/counter-open-gop.mp4 ] \
         || [ ! -f test/clips/counter-vfr.webm ] || [ ! -f test/clips/startup.mp4 ] \
         || [ ! -f test/clips/midsize.mp4 ] || [ ! -f test/clips/hd.mp4 ] \
         || [ ! -f test/clips/counter-trimming-elst.mp4 ] \
@@ -84,6 +85,7 @@ for browser in chromium webkit firefox; do
     TEST_BROWSER="$browser" node test/offscreen-test.mjs || status=1
     TEST_BROWSER="$browser" node test/presented-frame-test.mjs || status=1
     TEST_BROWSER="$browser" node test/loop-region-test.mjs || status=1
+    TEST_BROWSER="$browser" node test/open-gop-test.mjs || status=1
 done
 
 # Chromium-only. These lean on a Chrome DevTools Protocol session (startup's

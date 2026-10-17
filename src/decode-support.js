@@ -73,3 +73,40 @@ export function isTenBitHevc(codecString) {
 export function webCodecsMayFailMidStream(codecString, browserEngine) {
   return browserEngine === 'webkit' && isTenBitHevc(codecString);
 }
+
+// Is this codec string H.264 (avc1, or avc3 with in-band parameter sets)?
+export function isH264(codecString) {
+  return /^avc[13]\./i.test(codecString || '');
+}
+
+// Must an H.264 decode run on this browser engine begin at an IDR frame, rather
+// than at any keyframe the container marks? An open-GOP H.264 stream (x264's
+// --open-gop, many broadcast and disc encodes) marks non-IDR I frames as
+// keyframes: recovery points, which the spec lets a decoder start from. Blink's
+// decoder (hardware and software alike) does not: the P frames after such an I
+// frame carry reference-list and memory-management commands that name pictures
+// from the previous group, and it fails fatally on them, where WebKit and Gecko
+// ignore them and decode correctly. Its <video> element fails the same seek too,
+// so there is no tier to route to; the only exact answer there is to decode
+// forward from the nearest IDR frame, however far back it is.
+export function h264RunsMustStartAtIdr(browserEngine) {
+  return browserEngine === 'blink';
+}
+
+// Does this H.264 access unit, in length-prefixed (AVCC) form, hold an IDR
+// picture? Decided by its first slice NAL unit (type 5 IDR, 1 to 4 non-IDR),
+// skipping the access unit delimiters, parameter sets and SEI that may precede
+// it. An access unit with no slice at all claims nothing, so it counts as IDR,
+// which leaves the engine starting runs where it always did.
+export function h264AccessUnitIsIdr(bytes, lengthSize) {
+  let position = 0;
+  while (position + lengthSize < bytes.length) {
+    let nalLength = 0;
+    for (let b = 0; b < lengthSize; b++) nalLength = nalLength * 256 + bytes[position + b];
+    const nalType = bytes[position + lengthSize] & 0x1F;
+    if (nalType === 5) return true;
+    if (nalType >= 1 && nalType <= 4) return false;
+    position += lengthSize + nalLength;
+  }
+  return true;
+}

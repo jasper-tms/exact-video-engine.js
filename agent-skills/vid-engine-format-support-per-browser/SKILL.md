@@ -158,6 +158,38 @@ two-classes section above has the one alternative not yet ruled out). The same
 phone plays the same file perfectly through `<video>` (AVFoundation), so the
 hardware is fine and only the WebCodecs plumbing is not.
 
+## Open-GOP streams: where a decode run may start
+
+In an open-GOP stream (every iPhone HEVC clip; x264 `--open-gop`; many broadcast
+and disc encodes) each keyframe after the first is a recovery point — an HEVC
+CRA, or an H.264 non-IDR I frame — followed in decode order by "leading" frames
+that display before it and predict from the previous group. Starting a run at
+the recovery point can never produce those frames, so `_decodeRunStartFor`
+starts a leading frame's run a group back, and the driver does not feed a run's
+own keyframe's leading frames. What each decoder does when started at a
+recovery point (tested 2026-10, raw `VideoDecoder`, engine v2.9.1 → fixes after):
+
+| Started at a recovery point | Chromium / Chrome (macOS, hardware and `prefer-software`) | WebKit (Playwright) | Firefox |
+|---|---|---|---|
+| HEVC CRA (real iPhone 10-bit clip) | works; drops the RASL leading frames itself | not testable (no HEVC in Playwright WebKit) | not testable |
+| H.264 non-IDR I, leading frames **fed** | dies (`EncodingError`) | dies (`Decoder failure`) | dies |
+| H.264 non-IDR I, leading frames **skipped** | **still dies** at the first P frame | works | works |
+
+Chromium's H.264 failure is not about prediction: x264's first P frame after
+the recovery point carries reference-list edits and memory-management commands
+naming pictures from the previous group, which WebKit and Gecko ignore and
+Chromium rejects. Its `<video>` element fails the same cold seeks, so there is
+no tier to route to. `h264RunsMustStartAtIdr('blink')` therefore makes H.264
+runs on Blink start only at IDR frames, classified lazily from each keyframe's
+first slice NAL. x264 writes an IDR only at the start of an encode, so on Chrome
+a cold seek deep into such a clip decodes from the clip's start (the engine
+warns once in the console when that run is over 300 frames).
+
+Before the fix, the symptom was a frame number that changed while the picture
+froze on the previous frame (`VideoEngine: cannot decode frame N; holding`) on
+every browser, and on Chrome a fatal decoder error for any cold seek past the
+first group of an open-GOP H.264 clip.
+
 ## Motion JPEG does not use a VideoDecoder at all
 
 No browser engine ships an MJPEG `VideoDecoder`, and none is asked for. Since

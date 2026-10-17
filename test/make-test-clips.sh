@@ -108,6 +108,35 @@ ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
     -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 3 -g 1000 \
     -keyint_min 1000 -sc_threshold 0 clips/counter-single-gop.mp4
 
+# The same 30 counter frames as an OPEN group of pictures, the shape every iPhone
+# HEVC clip has: each keyframe after the first is a recovery point (here an H.264
+# non-IDR I frame) followed in decode order by a "leading" B frame that displays
+# BEFORE it and predicts from the previous group. A decode run started at a
+# recovery point cannot produce its leading frames, so seeking straight to one
+# must start the run a group back; and Blink cannot start an H.264 run at a
+# recovery point at all, only at an IDR frame. open-gop-test.mjs pins both.
+#
+# Two encodes joined end to end, frames 0-9 and 10-29, because x264's open-GOP
+# mode writes an IDR frame only at the start of an encode (even a forced keyframe
+# comes out as a recovery point). So the clip has IDR frames at 0 and 10, a
+# recovery point at 20, and frame 19 leading it: Blink's cold seek to 25 must
+# step back to the IDR at 10, not past it to 0. H.264 rather than HEVC because
+# Playwright's Chromium has no HEVC decoder; the structure, not the codec, is
+# what is under test. -b_strategy 0 keeps x264 from choosing its B-frame layout
+# per clip, so the leading frame stays where it is.
+open_gop_parts=$(mktemp -d)
+for range in 0:10 10:30; do
+    ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
+        -vf "trim=start_frame=${range%%:*}:end_frame=${range##*:},setpts=PTS-STARTPTS" \
+        -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 1 -bf 3 -b_strategy 0 \
+        -g 10 -keyint_min 10 -sc_threshold 0 -x264-params open-gop=1 \
+        "$open_gop_parts/part-${range%%:*}.mp4"
+    echo "file '$open_gop_parts/part-${range%%:*}.mp4'" >> "$open_gop_parts/parts.txt"
+done
+ffmpeg -y -loglevel error -f concat -safe 0 -i "$open_gop_parts/parts.txt" -c copy \
+    clips/counter-open-gop.mp4
+rm -r "$open_gop_parts"
+
 # settb pins the timebase to milliseconds so the setpts expression below is in
 # whole ms and needs no rounding; without it the encoder re-times against the
 # source's 1/15360 timebase and the intended gaps come out wrong.
