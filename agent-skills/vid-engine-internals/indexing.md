@@ -129,6 +129,41 @@ decoder handed one would fail or decode half a picture.
 marker (WebCodecs registers none), meaning exactly "each frame is a whole
 JPEG image".
 
+## GIF
+
+GIF (`src/gif.js`) is the second WebCodecs-only container, for AVI's reason:
+no `<video>` element plays one. Its index is AVI-shaped (a full sample table
+plus a `decoderConfig`), but it is built like the Ogg scan — a sequential
+full-file pass, since GIF keeps no central index — stepping over each image's
+length-prefixed data sub-blocks without decompressing them. A frame's sample
+spans its Graphic Control Extension through the end of its image data; the
+logical screen descriptor and global colour table travel as
+`decoderConfig.description`. The full-file pass takes the same budget,
+progress, and index-cache treatment as the others.
+
+**Timing** is exact by construction: the timescale is 100 (delays are
+hundredths of a second) and each composition time is a running sum of delays.
+A delay under 2 hundredths becomes 10, which is what Chromium, Firefox, WebKit
+and ffmpeg all show; the two constants sit at the top of `src/gif.js`.
+
+**Decoding** cannot hand frames to the browser one at a time as Motion JPEG
+does: most GIF frames are patches over the canvas the previous frames left,
+with transparency and a disposal method (leave, clear to transparent, restore
+what was under it). `GifCompositor` replays that history in JavaScript and
+`GifFrameDecoder` wraps it in the `VideoDecoder` shape. It is stateful, and
+relies on the driver resetting it before every run.
+
+**Keyframes** are the frames a run may start from, decided from the control
+extensions alone: frame 0; a frame after a whole-canvas frame that cleared
+itself; and a whole-canvas frame declaring no transparency, unless it restores
+to previous afterwards. ffmpeg-style optimized GIFs (patches with transparency)
+therefore usually have only frame 0, and a cold seek decodes from the start —
+cheap at GIF sizes. A truncated GIF keeps its complete frames; a GIF with none
+is refused.
+
+`isAnimatedGif(source)` reads only as far as a second frame, for a host
+choosing between opening a `.gif` as a picture or a clip.
+
 ## Pixel shape (anamorphic clips)
 
 Every index also records `pixelAspectRatio`: width ÷ height of one upright
@@ -148,6 +183,8 @@ file; the pixel shape says how wide to show them. Per container:
   presenting the whole stored frame.
 - **Ogg/Theora**: the identification header's `PARN:PARD`; zero means square.
 - **AVI**: always 1 (its `vprp` chunk is not read).
+- **GIF**: always 1. The logical screen's aspect byte is ignored, as every
+  browser ignores it.
 
 A 90°/270° rotation turns the pixel with the picture, so the upright ratio is
 the reciprocal of the coded one. A `<video>` element's `videoWidth` and

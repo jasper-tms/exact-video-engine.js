@@ -2,6 +2,7 @@ import { ContainerIndex } from './container-index.js';
 import { convertAnnexBToAvcc } from './avi.js';
 import { beginPriorityRead, endPriorityRead } from './read-priority-gate.js';
 import { ImageFrameDecoder, isImageFrameCodec, canDecodeImageFrames } from './image-frame-decoder.js';
+import { GifFrameDecoder, isGifCodec, canDecodeGifFrames } from './gif.js';
 import { UnplayableClipError } from './unplayable-clip.js';
 import { UrlRangeReader } from './range-readers.js';
 import { decoderConfigFrameReorderDepth } from './frame-reorder-bound.js';
@@ -519,9 +520,11 @@ export class VideoEngine extends EventTarget {
 
       // A Motion JPEG clip has no VideoDecoder to ask — its frames are whole
       // still images and ImageFrameDecoder reaches the browser's JPEG decoder
-      // instead — so the question to ask is whether THAT is available.
-      if (isImageFrameCodec(this._decoderConfig.codec)) {
-        if (!canDecodeImageFrames()) {
+      // instead — so the question to ask is whether THAT is available. A GIF
+      // likewise decodes in this library's own JavaScript (GifFrameDecoder).
+      const codec = this._decoderConfig.codec;
+      if (isImageFrameCodec(codec) || isGifCodec(codec)) {
+        if (isImageFrameCodec(codec) ? !canDecodeImageFrames() : !canDecodeGifFrames()) {
           throw new UnplayableClipError('this browser cannot decode image frames: '
             + this._decoderConfig.codec,
             { reason: 'codec-not-decodable', codec: this._decoderConfig.codec,
@@ -699,8 +702,9 @@ export class VideoEngine extends EventTarget {
   // callback. Which frames to decode, and when, is the same problem whether a
   // frame arrives from a VideoDecoder or from the browser's JPEG decoder.
   _configureDecoder() {
-    const Decoder = isImageFrameCodec(this._decoderConfig.codec)
-      ? ImageFrameDecoder : VideoDecoder;
+    const codec = this._decoderConfig.codec;
+    const Decoder = isImageFrameCodec(codec) ? ImageFrameDecoder
+      : isGifCodec(codec) ? GifFrameDecoder : VideoDecoder;
     this._videoDecoder = new Decoder({
       output: (frame) => this._absorb(frame),
       error: (e) => this._decoderFailed(e),

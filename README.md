@@ -27,7 +27,8 @@ audio. So `NativeVideoEngine` plays through a real `<video>` element and
 exposes the same members — and stays frame-exact anyway. Every clip this
 library plays is first indexed into a table of per-frame presentation
 timestamps, read straight out of the container without decoding anything
-(MP4/MOV, WebM/MKV, fragmented MP4, Ogg, and AVI are all supported). Given that
+(MP4/MOV, WebM/MKV, fragmented MP4, Ogg, AVI, and animated GIF are all
+supported). Given that
 table, the native path binary-searches `requestVideoFrameCallback`'s
 `mediaTime` — the presented frame's exact timestamp — into an exact frame
 index, even on variable-frame-rate clips where the usual constant-rate guess
@@ -53,7 +54,7 @@ numbers.
 
 ```html
 <!-- mp4box.js must be loaded first to index MP4s (it provides the MP4Box and
-     DataStream globals). WebM/MKV, Ogg and AVI indexing are built in. -->
+     DataStream globals). WebM/MKV, Ogg, AVI and GIF indexing are built in. -->
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch. -->
 <script src="https://cdn.jsdelivr.net/gh/jasper-tms/exact-video-engine.js@v2.9.2/exact-video-engine.js"></script>

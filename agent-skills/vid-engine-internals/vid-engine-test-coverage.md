@@ -99,6 +99,15 @@ index's exactness falsifiable:
 - `counter-mjpeg.avi` and `counter-mjpeg.mov` are those frames as Motion
   JPEG, which decodes through the browser's JPEG decoder rather than a
   `VideoDecoder`. Two containers, because the path belongs to neither.
+- `counter-vfr.gif` and `counter-full-frames.gif` are those frames as GIF,
+  decoded by the library's own JavaScript. The first is ffmpeg's default
+  output — every frame after the first a transparent-backed patch, frame 0 the
+  only keyframe — so a frame is right only if all compositing before it was;
+  the second makes every frame a keyframe. `gif-table-test.mjs` covers in plain
+  Node what ffmpeg never writes (interlacing, restore-to-previous, local colour
+  tables, zero delays, truncation) with GIFs it builds itself, and decodes every
+  fixture from each keyframe to prove the keyframe flags: a wrong one shows only
+  on a cold seek, which a forward walk never makes.
 - `counter-mp4v.mp4` is those frames as MPEG-4 Part 2, the one case whose
   expectation is inverted: only WebKit decodes this codec, so it asserts a
   frame-exact walk there and a clean *refusal* on Chromium and Firefox. Both

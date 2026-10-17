@@ -3,6 +3,7 @@ import { VideoEngine } from './video-engine.js';
 import { NativeVideoEngine } from './native-video-engine.js';
 import { detectBrowserEngine, webCodecsMayFailMidStream } from './decode-support.js';
 import { isImageFrameCodec, canDecodeImageFrames } from './image-frame-decoder.js';
+import { isGifCodec, canDecodeGifFrames } from './gif.js';
 import { UnplayableClipError, describeCodec, namePlusCodecString, reEncodeSuggestion } from './unplayable-clip.js';
 
 // ==================================================================
@@ -189,9 +190,10 @@ export async function createBestEngine(source, options = {}) {
   // A Motion JPEG clip decodes through the browser's JPEG decoder rather than a
   // VideoDecoder (see src/image-frame-decoder.js), so it is the wrong thing to
   // feature-detect for one — and the right thing is available in browsers where
-  // WebCodecs decoding is not.
-  const decoderIsAvailable = isImageFrameCodec(codec)
-    ? canDecodeImageFrames() : typeof VideoDecoder !== 'undefined';
+  // WebCodecs decoding is not. The same goes for a GIF, which decodes in this
+  // library's own JavaScript (see src/gif.js).
+  const decoderIsAvailable = isImageFrameCodec(codec) ? canDecodeImageFrames()
+    : isGifCodec(codec) ? canDecodeGifFrames() : typeof VideoDecoder !== 'undefined';
 
   // Why the WebCodecs tier did not take the clip, kept for the refusal below.
   // If the <video> element then fails too, this is half the story of why the
@@ -289,9 +291,11 @@ export async function createBestEngine(source, options = {}) {
 // answers this on its way past, but `prefer: 'native'` and a host with no canvas
 // both skip it, and a refusal should not be less informative for those callers.
 // A browser with no VideoDecoder at all cannot answer, which is honestly
-// "unknown" rather than "supported".
+// "unknown" rather than "supported". Motion JPEG and GIF never go near a
+// VideoDecoder, so its answer about them (always no) is no evidence at all.
 async function webCodecsRejectsCodec(decoderConfig) {
   if (!decoderConfig || typeof VideoDecoder === 'undefined') return false;
+  if (isImageFrameCodec(decoderConfig.codec) || isGifCodec(decoderConfig.codec)) return false;
   try {
     const support = await VideoDecoder.isConfigSupported(decoderConfig);
     return support.supported !== true;

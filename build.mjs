@@ -41,6 +41,7 @@ const MODULE_ORDER = [
   'src/matroska.js',
   'src/ogg.js',
   'src/avi.js',
+  'src/gif.js',
   'src/container-index.js',
   'src/video-engine.js',
   'src/native-video-engine.js',

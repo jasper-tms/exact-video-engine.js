@@ -260,6 +260,18 @@ const CASES = [
   { file: 'counter-mjpeg.mov', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
     tier: 'webcodecs' },
 
+  // GIF, decoded by the library's own JavaScript (src/gif.js) since no browser
+  // has a GIF VideoDecoder and no <video> element plays one. counter-vfr.gif is
+  // the hard shape: every frame after the first is a transparent-backed patch,
+  // so a frame is right only if every frame before it was composited right, and
+  // frame 0 is the only keyframe. counter-full-frames.gif makes every frame a
+  // keyframe, so seeks start their runs at the target itself. Same decoder on
+  // every engine, so no per-browser override.
+  { file: 'counter-vfr.gif', mode: 'webcodecs', firstBar: 0, exact: true, indexExact: true,
+    tier: 'webcodecs' },
+  { file: 'counter-full-frames.gif', mode: 'webcodecs', firstBar: 0, exact: true,
+    indexExact: true, tier: 'webcodecs' },
+
   // MPEG-4 Part 2 in an MP4 (`mp4v`) — OpenCV's VideoWriter default, and the
   // one fixture whose expectation is inverted: the reference browsers refuse it
   // and only WebKit plays it. No browser's WebCodecs decodes MPEG-4 Part 2, and

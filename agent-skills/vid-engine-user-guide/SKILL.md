@@ -23,7 +23,7 @@ with a clear error.** There is no approximate mode.
 
 ```html
 <!-- mp4box.js must be loaded first to index MP4s (it provides the MP4Box and
-     DataStream globals). WebM/MKV, Ogg and AVI indexing are built in. -->
+     DataStream globals). WebM/MKV, Ogg, AVI and GIF indexing are built in. -->
 <script src="https://unpkg.com/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
 <!-- Pin an exact release tag; never reference a branch (jsDelivr caches
      branch refs for hours, so @main changes behavior unpredictably). -->
@@ -43,7 +43,7 @@ npm install exact-video-engine.js mp4box
 ```js
 // mp4box is a PEER dependency, and installing it is necessary but not
 // sufficient: this engine reads it off the global scope, so put it there
-// before indexing any MP4 or MOV. WebM/MKV, AVI and Ogg need none of this.
+// before indexing any MP4 or MOV. WebM/MKV, AVI, Ogg and GIF need none of this.
 import * as MP4Box from 'mp4box';
 globalThis.MP4Box = MP4Box;
 globalThis.DataStream = MP4Box.DataStream;
@@ -117,7 +117,7 @@ try {
 
 `reason` is one of `UNPLAYABLE_REASONS`:
 
-- `container-not-indexable` — not MP4/MOV, WebM/MKV, Ogg, or AVI (HLS/MPEG-TS,
+- `container-not-indexable` — not MP4/MOV, WebM/MKV, Ogg, AVI, or GIF (HLS/MPEG-TS,
   live streams, raw elementary streams), or an indexing pass that ran out of
   its budget before naming a single frame.
 - `codec-not-decodable` — the container indexed fine but nothing in this
@@ -181,7 +181,7 @@ Both engines expose the following.
 | `waitingForIndex` | True while playback is pinned at the last indexed frame waiting for the index to catch up. A stall on the indexer, not the end of the clip, so `loop` does not fire. |
 | `rebuffering` | True while playback is buffering — the picture held on the last frame, `playing` still true, resuming on its own once enough is buffered ahead. Bind a spinner to it. On `VideoEngine` the engine holds its own clock (see `rebufferSeconds`); on `NativeVideoEngine` it observes the `<video>` element's own buffering. Distinct from `waitingForIndex` (pinned on the indexer) and `paused` (the host stopped playback). |
 | events `indexextended` / `indexcomplete` / `indextruncated` | The index published more frames, finished, or stopped early. `indextruncated` also emits a fatal `errormessage`. |
-| `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when the index carries no decoder configuration (Ogg, or a Matroska codec the engine does not configure). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. `mjpeg` is this library's own marker for Motion JPEG clips (WebCodecs registers no string for it). |
+| `codecString` | The clip's codec string as the container declares it (e.g. `hvc1.2.4.L123.b0`), or null when the index carries no decoder configuration (Ogg, or a Matroska codec the engine does not configure). Lets a host predict format trouble — flagging 10-bit profiles for server-side conversion, say. `mjpeg` and `gif` are this library's own markers for Motion JPEG and GIF clips (WebCodecs registers no string for either). |
 | `failed` | True once the engine can no longer stand behind its output: an unrecoverable `VideoDecoder` error (`VideoEngine`), the container index caught disagreeing with the presented frames during playback (`NativeVideoEngine`), or the source's bytes no longer readable (either engine; see "When the source disappears"). Each also emits a fatal `errormessage`. |
 | `destroy()` | Release resources when done (decoders are a limited browser resource). |
 | `resizeCanvas()` | Re-size the canvas backing store to its parent and repaint (`VideoEngine`); a no-op on `NativeVideoEngine`, where CSS `object-fit` handles it. `update()` already does this every tick, so you rarely need to call it — a pane that gains its size *after* the clip loads is handled without you having to get the timing right. |
@@ -447,11 +447,32 @@ engine.addEventListener('errormessage', ({ detail }) => {
 });
 ```
 
+## Animated GIFs
+
+A GIF opens like any other clip: `createBestEngine` indexes it, and it plays
+on the WebCodecs engine (`tier: 'webcodecs'`, `codecString` `gif`). No
+browser has a GIF `VideoDecoder` and no `<video>` element plays a GIF, so the
+library decodes it in its own JavaScript — on every browser, Safari included,
+with no fallback tier. Each frame lasts its own stored delay, except that a
+delay under 2 hundredths of a second is shown for 10 hundredths, as every
+browser shows it. Frame numbers never depend on delays.
+
+A host that also opens still images can ask, before choosing which way to
+open a `.gif`, whether it has more than one frame:
+
+```js
+if (await isAnimatedGif(file)) openAsVideo(file);   // reads only to frame 2
+else openAsImage(file);
+```
+
+It answers `false` for a single-frame GIF, for a file that is not a GIF, and
+for one it cannot read.
+
 ## Building an index without an engine
 
 `ContainerIndex.fromSource(source, {timeoutMilliseconds, maxBytes})` builds
 the frame table on its own, for hosts that want the timestamps without an
-engine. It sniffs MP4 vs Matroska vs Ogg vs AVI from the bytes, and reports
+engine. It sniffs MP4 vs Matroska vs Ogg vs AVI vs GIF from the bytes, and reports
 which it found in `containerFormat` and whether the result is rich enough to
 decode from in `supportsWebCodecs`. A prebuilt index can be handed to either
 engine via `load(source, {index})`.

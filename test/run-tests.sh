@@ -22,6 +22,8 @@ if [ ! -f test/clips/rot270.mp4 ] || [ ! -f test/clips/counter-vfr.mp4 ] \
         || [ ! -f test/clips/counter-hevc.mkv ] \
         || [ ! -f test/clips/counter-mjpeg.avi ] \
         || [ ! -f test/clips/counter-mjpeg.mov ] \
+        || [ ! -f test/clips/counter-vfr.gif ] \
+        || [ ! -f test/clips/counter-full-frames.gif ] \
         || [ ! -f test/clips/corrupt-pure-garbage.bin ] \
         || [ ! -f test/clips/hd-long.mp4 ] \
         || [ ! -f test/clips/anamorphic.webm ]; then
@@ -34,7 +36,7 @@ fi
 # Node-only unit tests: no browser, no server. These run in plain Node directly
 # against the src/ modules, up front and cheaply. The Matroska, Ogg and AVI
 # parsers (their tables, their derived codec strings, and the WebM indexing
-# progress reports), the known-bad-codec routing decision, and the
+# progress reports), the GIF scan and its JavaScript decoder, the known-bad-codec routing decision, and the
 # trimming-edit-list arithmetic are all pure enough to check without a browser —
 # and the tables are where a browser walk is blind, since a subtly wrong sample
 # table can still decode into right-looking frames.
@@ -47,6 +49,7 @@ node test/mp4v-sample-entry-test.mjs || node_status=1
 node test/unplayable-clip-test.mjs || node_status=1
 node test/ogg-table-test.mjs || node_status=1
 node test/avi-table-test.mjs || node_status=1
+node test/gif-table-test.mjs || node_status=1
 node test/progressive-index-test.mjs || node_status=1
 node test/frame-reorder-bound-test.mjs || node_status=1
 node test/rebuffer-logic-test.mjs || node_status=1

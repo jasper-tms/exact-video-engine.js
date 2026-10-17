@@ -18,7 +18,7 @@ presentation timestamp, read from the container without decoding anything.
 Source layout, one module per concern: `src/range-readers.js` (random-access
 byte reading), `src/container-index.js` (the table; MP4 via mp4box),
 `src/matroska.js`, `src/ogg.js`, `src/avi.js` (the built-in container scans),
-`src/image-frame-decoder.js` (Motion JPEG), `src/frame-reorder-bound.js` and
+`src/image-frame-decoder.js` (Motion JPEG), `src/gif.js` (GIF scan and decoder), `src/frame-reorder-bound.js` and
 `src/certified-prefix.js` (progressive indexing), `src/index-cache.js`
 (IndexedDB), `src/video-engine.js`, `src/native-video-engine.js`,
 `src/create-best-engine.js` (the ladder), `src/decode-support.js`,
@@ -28,9 +28,9 @@ these — edit `src/`, never the root file (see DEVELOPING.md at the repo root).
 Open the topic file for the subject you are working on:
 
 - **[indexing.md](indexing.md)** — how each container format (MP4, fragmented
-  MP4, WebM/MKV, Ogg, AVI) is turned into the frame table; codec-string
-  derivation; the rescued `jpeg` and `mp4v` sample entries; Motion JPEG
-  decoding; the IndexedDB index cache and its identity rules.
+  MP4, WebM/MKV, Ogg, AVI, GIF) is turned into the frame table; codec-string
+  derivation; the rescued `jpeg` and `mp4v` sample entries; Motion JPEG and
+  GIF decoding; the IndexedDB index cache and its identity rules.
 - **[decode-ladder.md](decode-ladder.md)** — how `createBestEngine` chooses an
   engine, the full refusal taxonomy behind "index or refuse", how
   `UnplayableClipError` messages are composed, and the 10-bit-HEVC-on-WebKit

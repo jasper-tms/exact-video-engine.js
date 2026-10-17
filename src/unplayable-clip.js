@@ -99,6 +99,7 @@ const CODEC_NAMES = {
   av01: 'AV1',
   mp4v: 'MPEG-4 Part 2',
   mjpeg: 'Motion JPEG',
+  gif: 'GIF',
   theora: 'Theora',
 };
 

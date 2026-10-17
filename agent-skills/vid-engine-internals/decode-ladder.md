@@ -5,7 +5,7 @@ available for a given clip and browser:
 
 | | Index from | Presentation | Frame index |
 | --- | --- | --- | --- |
-| 1. WebCodecs (`VideoEngine`) | container (MP4, WebM/MKV, or AVI) | engine-owned canvas | exact |
+| 1. WebCodecs (`VideoEngine`) | container (MP4, WebM/MKV, AVI, or GIF) | engine-owned canvas | exact |
 | 2. `<video>` + index (`NativeVideoEngine`) | container (MP4, WebM/MKV, or Ogg) | browser | exact |
 
 Tier 2 is the one that usually does not exist in other libraries. It covers
@@ -34,7 +34,7 @@ rather than play a clip it would have to guess about:
 
 - **A container we cannot parse** (HLS/MPEG-TS or other segmented delivery,
   live streams, raw elementary streams — anything not MP4/MOV, WebM/MKV, Ogg,
-  or AVI). No table can exist. An AVI whose *codec* this browser cannot decode
+  AVI, or GIF). No table can exist. An AVI whose *codec* this browser cannot decode
   is refused here too: AVI has no native fallback, so an index it cannot
   decode from is useless.
 - **An indexing pass that ran out of its budget** (`indexTimeoutMilliseconds`

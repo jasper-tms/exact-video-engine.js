@@ -90,10 +90,10 @@
 //
 // Classic (non-module) script whose host-facing globals are UrlRangeReader,
 // FileRangeReader, ContainerIndex, VideoEngine, NativeVideoEngine,
-// createBestEngine, and formatProgress (see createBestEngine's onProgress), so
-// both module and non-module host pages can use it.
+// createBestEngine, formatProgress (see createBestEngine's onProgress), and
+// isAnimatedGif, so both module and non-module host pages can use it.
 // mp4box.js (the `MP4Box` / `DataStream` globals) should be loaded first to
-// index MP4s; WebM and Ogg indexing are built in and need nothing. Without
+// index MP4s; WebM, Ogg, AVI and GIF indexing are built in and need nothing. Without
 // mp4box an MP4 cannot be indexed and is refused, while WebM and Ogg still get
 // tier 2.
 //

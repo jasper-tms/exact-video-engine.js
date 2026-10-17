@@ -3,6 +3,7 @@ import { deriveIndexCacheKey, loadCachedIndexPayload, storeCachedIndexPayload, s
 import { readMatroskaFrameTable, IndexBudgetExceededError } from './matroska.js';
 import { readOggFrameTable } from './ogg.js';
 import { readAviFrameTable } from './avi.js';
+import { readGifFrameTable, startsWithGifSignature } from './gif.js';
 import { decoderConfigFrameReorderDepth } from './frame-reorder-bound.js';
 import { longestCertifiedRun, DeclaredReorderWatermark } from './certified-prefix.js';
 import { MOTION_JPEG_CODEC } from './image-frame-decoder.js';
@@ -25,7 +26,7 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 // decodes a frame, so it works in browsers that have no WebCodecs at all, which
 // is exactly what makes the <video> fallback frame-exact rather than fps-guessing.
 //
-// Four containers, four ways in, one table out.
+// Five containers, five ways in, one table out.
 //
 //   * ISOBMFF (mp4/m4v/mov) goes through mp4box. A classic single-`moov` file is
 //     the cheap case: a few range reads hand back a full sample table (times,
@@ -57,9 +58,15 @@ const CACHE_MINIMUM_BUILD_MILLISECONDS = 500;
 //     SPS/PPS, from which the AVCC decoder configuration is built).
 //     An AVI whose codec WebCodecs cannot decode yields no decoderConfig and is
 //     refused cleanly, since it has no native fallback to land on.
+//   * GIF goes through readGifFrameTable, and is AVI's shape for AVI's reason: a
+//     full sample table plus a decoderConfig, because no <video> element plays a
+//     GIF and so WebCodecs is the only tier. Like WebM and Ogg it keeps no
+//     central index, so building the table is a sequential pass over the whole
+//     file (every image's data is stepped over, never decompressed). Its frames
+//     decode through GifFrameDecoder, in JavaScript, not a VideoDecoder.
 //
 // `supportsWebCodecs` is how the ladder in createBestEngine tells a decodable
-// index (ISOBMFF, AVI, and Matroska with a codec we can configure) from a
+// index (ISOBMFF, AVI, GIF, and Matroska with a codec we can configure) from a
 // native-only one (Ogg, and Matroska carrying something more exotic).
 //
 // Anything else (HLS and other segmented delivery, raw elementary streams) still
@@ -324,7 +331,7 @@ export class ContainerIndex extends EventTarget {
     super();
     this.reader = reader;
     this.timescale = 1;
-    this.containerFormat = null;     // 'isobmff' | 'matroska' | 'ogg' | 'avi'
+    this.containerFormat = null;     // 'isobmff' | 'matroska' | 'ogg' | 'avi' | 'gif'
 
     // Decode-order sample table (no frame bytes): {offset, size, isSync, cts,
     // duration}. The byte ranges the decoder will later fetch on demand.
@@ -438,6 +445,7 @@ export class ContainerIndex extends EventTarget {
       if (await ContainerIndex._isMatroska(reader)) await index._demuxMatroska(reader, options);
       else if (await ContainerIndex._isOgg(reader)) await index._demuxOgg(reader, options);
       else if (await ContainerIndex._isAvi(reader)) await index._demuxAvi(reader, options);
+      else if (await ContainerIndex._isGif(reader)) await index._demuxGif(reader, options);
       else await index._demuxIsobmff(reader, options);
     } catch (err) {
       // One failure is not survivable, and it is the one that says so: a frame
@@ -543,6 +551,12 @@ export class ContainerIndex extends EventTarget {
       && magic[2] === 0x46 && magic[3] === 0x46    // "RIFF"
       && magic[8] === 0x41 && magic[9] === 0x56
       && magic[10] === 0x49 && magic[11] === 0x20; // "AVI "
+  }
+
+  // GIF opens with "GIF87a" or "GIF89a".
+  static async _isGif(reader) {
+    if (reader.size < 6) return false;
+    return startsWithGifSignature(new Uint8Array(await reader.read(0, 5)));
   }
 
   // Largest display frame whose presentation time is <= t (binary search over
@@ -1132,6 +1146,35 @@ export class ContainerIndex extends EventTarget {
     }
     this.samplesAreAnnexB = !!table.samplesAreAnnexB;
 
+    this._buildTables(samples, null);
+  }
+
+  // GIF: a full sample table and a decoderConfig, as for AVI and for the same
+  // reason — no <video> element plays a GIF, so WebCodecs is the only tier (see
+  // src/gif.js). Frames are stored in the order they are shown and each lasts its
+  // own delay, so composition times are running sums of the delays in a
+  // timescale of 100 (GIF delays are hundredths of a second): exact by
+  // construction, and variable frame rate costs nothing.
+  async _demuxGif(reader, options) {
+    const table = await readGifFrameTable(reader, options);
+    this.containerFormat = 'gif';
+    let compositionTime = 0;
+    const samples = table.frames.map((frame) => {
+      const sample = {
+        offset: frame.offset,
+        size: frame.size,
+        is_sync: frame.isSync,
+        cts: compositionTime,
+        duration: frame.delayCentiseconds,
+        timescale: 100,
+      };
+      compositionTime += frame.delayCentiseconds;
+      return sample;
+    });
+    this.rotation = 0;
+    this.videoWidth = table.videoWidth;
+    this.videoHeight = table.videoHeight;
+    this.decoderConfig = { ...table.decoderConfig, optimizeForLatency: true };
     this._buildTables(samples, null);
   }
 

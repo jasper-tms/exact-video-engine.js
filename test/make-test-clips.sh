@@ -530,3 +530,30 @@ ffmpeg -y -loglevel error -i clips/counter-cfr.mp4 \
 
 echo "Wrote Matroska codec fixtures:"
 ls clips/counter-vfr.mkv clips/counter-vp8.webm clips/counter-av1.webm clips/counter-hevc.mkv
+
+# ==================================================================
+# GIF fixtures. No <video> element plays a GIF, so these reach only the WebCodecs
+# engine, decoded by the library's own JavaScript (src/gif.js). The two differ in
+# the property that matters most to a GIF decoder: whether frames stand alone.
+#
+# 1. counter-vfr.gif is ffmpeg's default output, which is what most GIFs look
+#    like: after frame 0, each frame is only the rectangle that changed, with
+#    unchanged pixels transparent (-gifflags +offsetting+transdiff), so a frame
+#    can be drawn only on top of the ones before it and frame 0 is the clip's
+#    only keyframe. Made from counter-vfr.mp4, so its delays vary (3, 4 and 7
+#    hundredths of a second): no assumed rate maps it.
+# 2. counter-full-frames.gif writes every frame whole and opaque, so every frame
+#    is a keyframe and a seek decodes one frame rather than the clip so far — the
+#    other branch of the keyframe rule.
+#
+# palettegen/paletteuse with no dithering keep the bar a hard black/white step
+# for visibleFrame(), as the codec choices above do for the video clips.
+ffmpeg -y -loglevel error -i clips/counter-vfr.mp4 \
+    -vf "split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=none" \
+    -fps_mode passthrough clips/counter-vfr.gif
+ffmpeg -y -loglevel error "${COUNTER_FRAMES[@]}" \
+    -vf "split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=none" \
+    -gifflags -offsetting-transdiff clips/counter-full-frames.gif
+
+echo "Wrote GIF fixtures:"
+ls clips/counter-vfr.gif clips/counter-full-frames.gif

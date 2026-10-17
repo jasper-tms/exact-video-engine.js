@@ -217,6 +217,24 @@ and both the AVI FourCC check and the ISOBMFF sample-entry check exclude them
 deliberately. `engine.codecString` is `mjpeg` for clips on this path; WebCodecs
 registers no codec string for Motion JPEG, so that marker is this library's own.
 
+## GIF does not use a VideoDecoder either
+
+No browser ships a GIF `VideoDecoder`, and no `<video>` element plays a GIF, so
+since v2.10 `src/gif.js` decodes GIF in JavaScript — the LZW decompression and
+the frame-over-frame compositing (transparency, the three disposal methods,
+interlacing, local colour tables) — and hands the decode driver an RGBA
+`VideoFrame` per frame. Like the Motion JPEG decoder it presents the
+`VideoDecoder` interface, so the clip reports `tier: 'webcodecs'`. The only
+platform feature it needs is the `VideoFrame` constructor taking an RGBA buffer.
+
+| Format | WebKit/iOS | Chromium desktop | Firefox | Native `<video>` |
+|---|---|---|---|---|
+| **GIF** (patch frames with transparency, one keyframe) | works | works | works | none exists |
+| **GIF** (every frame whole and opaque) | works | works | works | none exists |
+
+Tested 2026-10-17 (engine v2.10 development), the 150x90 counter clip as both
+GIF shapes, all 30 frames exact on all three Playwright engines.
+
 ## Practical guidance
 
 - **Proactive routing (current):** `createBestEngine` now recognizes the confirmed

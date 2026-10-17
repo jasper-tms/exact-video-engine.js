@@ -54,6 +54,11 @@ export {
 // WebCodecs registers no codec string for Motion JPEG, so this marker is ours.
 export { MOTION_JPEG_CODEC } from './src/image-frame-decoder.js';
 
+// The same for a GIF, which this library decodes itself — and, for a host that
+// opens still images too, whether a .gif is a clip (more than one frame) or a
+// picture, answered without indexing the whole file.
+export { GIF_CODEC, isAnimatedGif } from './src/gif.js';
+
 // Why a clip could not be played, in a form a host can branch on rather than
 // regular-expression out of a sentence. `createBestEngine` throws an
 // UnplayableClipError for every load-time refusal; `reason` is one of
